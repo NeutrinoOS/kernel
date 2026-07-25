@@ -4,6 +4,7 @@
 
 #include "descriptors.hpp"
 #include "keyboard_scancode.hpp"
+#include "../auth/password_hash.hpp"
 #include "../crt/syscall.hpp"
 #include "../helpers/console.hpp"
 
@@ -176,6 +177,115 @@ size_t read_line(uint32_t keyboard,
     }
     out[len] = '\0';
     return len;
+}
+
+void zero_memory(void* ptr, size_t size) {
+    auto* bytes = static_cast<volatile uint8_t*>(ptr);
+    for (size_t i = 0; i < size; ++i) {
+        bytes[i] = 0;
+    }
+}
+
+bool read_secret_line(uint32_t keyboard,
+                      long console,
+                      char* out,
+                      size_t out_cap) {
+    if (out == nullptr || out_cap == 0) {
+        return false;
+    }
+    size_t len = 0;
+    out[0] = '\0';
+    while (true) {
+        char c = read_char_blocking(keyboard);
+        if (c == '\n' || c == '\r') {
+            descriptor_write(static_cast<uint32_t>(console), "\n", 1);
+            out[len] = '\0';
+            return true;
+        }
+        if (c == '\b' || c == 0x7F) {
+            if (len > 0) {
+                --len;
+                out[len] = '\0';
+            }
+            continue;
+        }
+        if (c < 0x20 || c > 0x7E || len + 1 >= out_cap) {
+            continue;
+        }
+        out[len++] = c;
+        out[len] = '\0';
+    }
+}
+
+bool provision_root_password(uint32_t keyboard, long console) {
+    void* root = user_find("root");
+    if (root == nullptr) {
+        userspace::write_line(console,
+                              "Unable to find the live root account.");
+        return false;
+    }
+
+    char password[96]{};
+    char confirmation[96]{};
+    while (true) {
+        drain_keyboard(keyboard);
+        userspace::write(console, "Set installed root password: ");
+        if (!read_secret_line(keyboard,
+                              console,
+                              password,
+                              sizeof(password))) {
+            zero_memory(password, sizeof(password));
+            return false;
+        }
+        if (password[0] == '\0') {
+            userspace::write_line(console, "Password cannot be empty.");
+            continue;
+        }
+
+        userspace::write(console, "Confirm root password: ");
+        if (!read_secret_line(keyboard,
+                              console,
+                              confirmation,
+                              sizeof(confirmation))) {
+            zero_memory(password, sizeof(password));
+            zero_memory(confirmation, sizeof(confirmation));
+            return false;
+        }
+        if (strcmp(password, confirmation) == 0) {
+            break;
+        }
+        zero_memory(password, sizeof(password));
+        zero_memory(confirmation, sizeof(confirmation));
+        userspace::write_line(console, "Passwords do not match. Try again.");
+    }
+
+    uint8_t salt[auth::kPasswordSaltSize]{};
+    uint8_t hash[auth::kPasswordHashSize]{};
+    if (!auth::make_salt("root", salt)) {
+        userspace::write_line(console,
+                              "Secure random source unavailable.");
+        zero_memory(password, sizeof(password));
+        zero_memory(confirmation, sizeof(confirmation));
+        return false;
+    }
+    auth::pbkdf2_sha256(password,
+                        salt,
+                        sizeof(salt),
+                        auth::kPasswordIterations,
+                        hash);
+    zero_memory(password, sizeof(password));
+    zero_memory(confirmation, sizeof(confirmation));
+
+    long result =
+        user_set_password(root, salt, hash, auth::kPasswordIterations);
+    zero_memory(salt, sizeof(salt));
+    zero_memory(hash, sizeof(hash));
+    if (result < 0) {
+        userspace::write_line(console,
+                              "Failed to save the root password.");
+        return false;
+    }
+    return true;
 }
 
 bool prompt_yes_no_line(uint32_t keyboard, long console, const char* prompt) {
@@ -1808,7 +1918,7 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
     return ok;
 }
 
-bool remove_installer_from_mounted_target(const Device& dst) {
+bool finalize_cloned_target(const Device& dst, long console) {
     long target = descriptor_open(
         kDescBlock,
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dst.name)),
@@ -1822,17 +1932,38 @@ bool remove_installer_from_mounted_target(const Device& dst) {
     if (!mounted) {
         return false;
     }
-    char path[96];
-    path[0] = '/';
-    path[1] = '\0';
-    strlcpy(path + 1, dst.name, sizeof(path) - 1);
-    size_t len = strlen(path);
-    if (len + 1 < sizeof(path)) {
-        path[len++] = '/';
-        path[len] = '\0';
+
+    char target_root[96];
+    target_root[0] = '/';
+    target_root[1] = '\0';
+    strlcpy(target_root + 1, dst.name, sizeof(target_root) - 1);
+
+    char user_store_path[160];
+    if (!append_path(target_root,
+                     "system/users.ntd",
+                     user_store_path,
+                     sizeof(user_store_path))) {
+        return false;
     }
-    strlcpy(path + len, kInstallerPath, sizeof(path) - len);
-    return file_remove(path) == 0;
+    if (file_remove(user_store_path) != 0 ||
+        !copy_file_path("/system/users.ntd",
+                        user_store_path,
+                        console,
+                        nullptr)) {
+        userspace::write_line(
+            console,
+            "Failed to provision credentials on cloned target.");
+        return false;
+    }
+
+    char installer_path[160];
+    if (!append_path(target_root,
+                     kInstallerPath,
+                     installer_path,
+                     sizeof(installer_path))) {
+        return false;
+    }
+    return file_remove(installer_path) == 0;
 }
 
 InstallFs choose_filesystem(uint32_t keyboard, long console) {
@@ -1928,6 +2059,14 @@ int main(uint64_t, uint64_t) {
 
         InstallFs fs = choose_filesystem(static_cast<uint32_t>(keyboard),
                                          console);
+        userspace::write_line(console, "");
+        if (!provision_root_password(static_cast<uint32_t>(keyboard),
+                                     console)) {
+            userspace::write_line(
+                console,
+                "Installation cancelled: root password was not set.");
+            continue;
+        }
         bool ok = false;
         if (fs == InstallFs::Neufs) {
             ok = install_neufs(devices[source_index], targets[choice], console);
@@ -1942,7 +2081,7 @@ int main(uint64_t, uint64_t) {
                             targets[choice],
                             console);
             if (ok) {
-                (void)remove_installer_from_mounted_target(targets[choice]);
+                ok = finalize_cloned_target(targets[choice], console);
             }
         }
         if (!ok) {
