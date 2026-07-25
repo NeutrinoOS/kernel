@@ -548,6 +548,7 @@ void reschedule_impl(syscall::SyscallFrame& frame, bool run_kernel_tasks) {
         current_state = process::load_state(*current_proc);
     }
     bool terminated = current_state == process::State::Terminated;
+    bool suspending = current_state == process::State::Suspending;
 
     if (!terminated) {
         cpu::save_fpu_state(current_proc->fpu_state);
@@ -560,6 +561,13 @@ void reschedule_impl(syscall::SyscallFrame& frame, bool run_kernel_tasks) {
         current_proc->user_ip = frame.user_rip;
         current_proc->user_sp = frame.user_rsp;
         current_proc->fs_base = cpu::read_fs_base();
+        if (suspending) {
+            process::State expected = process::State::Suspending;
+            (void)process::compare_exchange_state(
+                *current_proc,
+                expected,
+                process::State::Suspended);
+        }
     } else {
         current_proc->has_context = false;
     }

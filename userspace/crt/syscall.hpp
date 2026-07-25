@@ -66,6 +66,30 @@ enum class SystemCall : long {
     RandomGet            = 56,
     FileGetAcl           = 57,
     FileSetAcl           = 58,
+    MapFilePrivate       = 59,
+    ThreadCreate         = 60,
+    ThreadExit           = 61,
+    ThreadJoin           = 62,
+    FutexWait            = 63,
+    FutexWake            = 64,
+    ThreadId             = 65,
+    ProcessId            = 66,
+    ThreadSetTls         = 67,
+    ThreadGetTls         = 68,
+    ProcessEventSend     = 69,
+    ProcessEventReceive  = 70,
+    ProcessControl       = 71,
+    ProcessWaitChild     = 72,
+    ProcessSetGroup      = 73,
+    ProcessGetGroup      = 74,
+    ProcessCreateSession = 75,
+    ProcessGetSession    = 76,
+    ProcessSetForeground = 77,
+    ProcessGetForeground = 78,
+    ProcessSetLimits     = 79,
+    ProcessGetLimits     = 80,
+    ProcessGetUsage      = 81,
+    ProcessTrace         = 82,
 };
 
 enum : uint32_t {
@@ -117,6 +141,72 @@ struct ProcessSpawnConfig {
 
 static_assert(sizeof(ProcessSpawnConfig) == 32,
               "ProcessSpawnConfig size mismatch");
+
+enum : uint32_t {
+    PROCESS_CONTROL_KILL = 1,
+    PROCESS_CONTROL_SUSPEND = 2,
+    PROCESS_CONTROL_RESUME = 3,
+    PROCESS_EVENT_NONBLOCK = 1u << 0,
+    PROCESS_WAIT_NONBLOCK = 1u << 0,
+    PROCESS_TRACE_ATTACH = 1,
+    PROCESS_TRACE_DETACH = 2,
+    PROCESS_TRACE_READ_MEMORY = 3,
+    PROCESS_TRACE_WRITE_MEMORY = 4,
+    PROCESS_TRACE_GET_REGISTERS = 5,
+    PROCESS_TRACE_STOPPED = 6,
+};
+
+struct ProcessEvent {
+    uint32_t type;
+    uint32_t sender_process_id;
+    uint64_t value;
+};
+
+struct ProcessLimits {
+    uint32_t max_threads;
+    uint32_t max_descriptors;
+    uint32_t max_file_handles;
+    uint32_t max_directory_handles;
+    uint64_t max_virtual_bytes;
+    uint64_t max_cpu_ticks;
+};
+
+struct ProcessUsage {
+    uint32_t threads;
+    uint32_t descriptors;
+    uint32_t file_handles;
+    uint32_t directory_handles;
+    uint64_t virtual_bytes;
+    uint64_t resident_bytes;
+    uint64_t cpu_ticks;
+};
+
+struct ProcessTraceRegisters {
+    uint64_t rax;
+    uint64_t rbx;
+    uint64_t rcx;
+    uint64_t rdx;
+    uint64_t rsi;
+    uint64_t rdi;
+    uint64_t rbp;
+    uint64_t r8;
+    uint64_t r9;
+    uint64_t r10;
+    uint64_t r11;
+    uint64_t r12;
+    uint64_t r13;
+    uint64_t r14;
+    uint64_t r15;
+    uint64_t user_rsp;
+    uint64_t user_rip;
+    uint64_t user_rflags;
+};
+
+static_assert(sizeof(ProcessEvent) == 16, "process event size mismatch");
+static_assert(sizeof(ProcessLimits) == 32, "process limits size mismatch");
+static_assert(sizeof(ProcessUsage) == 40, "process usage size mismatch");
+static_assert(sizeof(ProcessTraceRegisters) == 144,
+              "trace register size mismatch");
 
 struct UserInfo {
     uint64_t id_machine;
@@ -291,6 +381,207 @@ static inline long unmap(void* addr, size_t length) {
     return raw_syscall2(SystemCall::Unmap,
                         static_cast<long>(reinterpret_cast<uintptr_t>(addr)),
                         static_cast<long>(length));
+}
+
+static inline void* map_file_private(uint32_t handle,
+                                     uint64_t file_offset,
+                                     size_t length,
+                                     uint64_t flags = 0) {
+    long ret = raw_syscall4(SystemCall::MapFilePrivate,
+                            static_cast<long>(handle),
+                            static_cast<long>(file_offset),
+                            static_cast<long>(length),
+                            static_cast<long>(flags));
+    if (ret < 0) {
+        return nullptr;
+    }
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(ret));
+}
+
+using ThreadEntry = void (*)(void*);
+
+static inline long thread_create(ThreadEntry entry,
+                                 void* argument,
+                                 size_t stack_size = 0) {
+    return raw_syscall3(
+        SystemCall::ThreadCreate,
+        static_cast<long>(reinterpret_cast<uintptr_t>(entry)),
+        static_cast<long>(reinterpret_cast<uintptr_t>(argument)),
+        static_cast<long>(stack_size));
+}
+
+static inline long thread_create_tls(ThreadEntry entry,
+                                     void* argument,
+                                     void* tls_base,
+                                     size_t stack_size = 0) {
+    return raw_syscall4(
+        SystemCall::ThreadCreate,
+        static_cast<long>(reinterpret_cast<uintptr_t>(entry)),
+        static_cast<long>(reinterpret_cast<uintptr_t>(argument)),
+        static_cast<long>(stack_size),
+        static_cast<long>(reinterpret_cast<uintptr_t>(tls_base)));
+}
+
+[[noreturn]] static inline void thread_exit(uint16_t code = 0) {
+    raw_syscall1(SystemCall::ThreadExit, static_cast<long>(code));
+    __builtin_unreachable();
+}
+
+static inline long thread_join(uint32_t thread_id) {
+    return raw_syscall1(SystemCall::ThreadJoin,
+                        static_cast<long>(thread_id));
+}
+
+static inline long futex_wait(uint32_t* address, uint32_t expected) {
+    return raw_syscall2(
+        SystemCall::FutexWait,
+        static_cast<long>(reinterpret_cast<uintptr_t>(address)),
+        static_cast<long>(expected));
+}
+
+static inline long futex_wake(uint32_t* address, size_t max_count = 1) {
+    return raw_syscall2(
+        SystemCall::FutexWake,
+        static_cast<long>(reinterpret_cast<uintptr_t>(address)),
+        static_cast<long>(max_count));
+}
+
+static inline uint32_t thread_id() {
+    return static_cast<uint32_t>(raw_syscall0(SystemCall::ThreadId));
+}
+
+static inline uint32_t process_id() {
+    return static_cast<uint32_t>(raw_syscall0(SystemCall::ProcessId));
+}
+
+static inline long thread_set_tls(void* base) {
+    return raw_syscall1(
+        SystemCall::ThreadSetTls,
+        static_cast<long>(reinterpret_cast<uintptr_t>(base)));
+}
+
+static inline void* thread_get_tls() {
+    long value = raw_syscall0(SystemCall::ThreadGetTls);
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(value));
+}
+
+static inline long process_event_send(uint32_t process,
+                                      uint32_t type,
+                                      uint64_t value = 0) {
+    return raw_syscall3(SystemCall::ProcessEventSend,
+                        static_cast<long>(process),
+                        static_cast<long>(type),
+                        static_cast<long>(value));
+}
+
+static inline long process_event_receive(ProcessEvent* event,
+                                         bool nonblocking = false) {
+    if (event == nullptr) {
+        return -1;
+    }
+    long result = raw_syscall2(
+        SystemCall::ProcessEventReceive,
+        reinterpret_cast<long>(event),
+        nonblocking ? static_cast<long>(PROCESS_EVENT_NONBLOCK) : 0);
+    if (result == 1 && !nonblocking) {
+        result = raw_syscall2(
+            SystemCall::ProcessEventReceive,
+            reinterpret_cast<long>(event),
+            static_cast<long>(PROCESS_EVENT_NONBLOCK));
+    }
+    return result;
+}
+
+static inline long process_control(uint32_t process,
+                                   uint32_t action,
+                                   uint16_t exit_code = 0) {
+    return raw_syscall3(SystemCall::ProcessControl,
+                        static_cast<long>(process),
+                        static_cast<long>(action),
+                        static_cast<long>(exit_code));
+}
+
+// Returns (pid << 16) | exit_code, -2 in nonblocking mode when children live,
+// or -1 when no matching child exists.
+static inline long process_wait_child(uint32_t process = 0,
+                                      bool nonblocking = false) {
+    return raw_syscall2(
+        SystemCall::ProcessWaitChild,
+        static_cast<long>(process),
+        nonblocking ? static_cast<long>(PROCESS_WAIT_NONBLOCK) : 0);
+}
+
+static inline long process_set_group(uint32_t process, uint32_t group) {
+    return raw_syscall2(SystemCall::ProcessSetGroup,
+                        static_cast<long>(process),
+                        static_cast<long>(group));
+}
+
+static inline long process_get_group(uint32_t process = 0) {
+    return raw_syscall1(SystemCall::ProcessGetGroup,
+                        static_cast<long>(process));
+}
+
+static inline long process_create_session() {
+    return raw_syscall0(SystemCall::ProcessCreateSession);
+}
+
+static inline long process_get_session(uint32_t process = 0) {
+    return raw_syscall1(SystemCall::ProcessGetSession,
+                        static_cast<long>(process));
+}
+
+static inline long process_set_foreground(uint32_t group) {
+    return raw_syscall1(SystemCall::ProcessSetForeground,
+                        static_cast<long>(group));
+}
+
+static inline long process_get_foreground() {
+    return raw_syscall0(SystemCall::ProcessGetForeground);
+}
+
+static inline long process_set_limits(uint32_t process,
+                                      const ProcessLimits* limits) {
+    return limits == nullptr
+               ? -1
+               : raw_syscall2(
+                     SystemCall::ProcessSetLimits,
+                     static_cast<long>(process),
+                     reinterpret_cast<long>(limits));
+}
+
+static inline long process_get_limits(uint32_t process,
+                                      ProcessLimits* limits) {
+    return limits == nullptr
+               ? -1
+               : raw_syscall2(
+                     SystemCall::ProcessGetLimits,
+                     static_cast<long>(process),
+                     reinterpret_cast<long>(limits));
+}
+
+static inline long process_get_usage(uint32_t process,
+                                     ProcessUsage* usage) {
+    return usage == nullptr
+               ? -1
+               : raw_syscall2(
+                     SystemCall::ProcessGetUsage,
+                     static_cast<long>(process),
+                     reinterpret_cast<long>(usage));
+}
+
+static inline long process_trace(uint32_t process,
+                                 uint32_t operation,
+                                 uint64_t address = 0,
+                                 void* buffer = nullptr,
+                                 size_t length = 0) {
+    return raw_syscall5(
+        SystemCall::ProcessTrace,
+        static_cast<long>(process),
+        static_cast<long>(operation),
+        static_cast<long>(address),
+        reinterpret_cast<long>(buffer),
+        static_cast<long>(length));
 }
 
 static inline long change_slot(uint32_t slot) {

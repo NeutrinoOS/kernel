@@ -37,9 +37,58 @@ plus the linker-name copy `libbearssl.so` under `userspace/library`. The
 userspace install target copies staged shared libraries into `/library` on
 the target filesystem, adjacent to `/binary` for package payloads and runtime
 lookup. Current programs still link BearSSL statically until Neutrino grows
-the runtime loader path for `DT_NEEDED` dependencies.
+broader coverage for shared-library relocation and runtime conventions.
 
 The userspace build is configured such that individual programs can optionally link against that .a, but BearSSL is probably not required for normal kernel or userspace builds unless a program explicitly depends on it.
+
+## Virtual memory
+
+Neutrino tracks executable images, private loader allocations, guarded user
+stacks, anonymous mappings, shared memory, framebuffer/device mappings, and
+private file mappings as per-address-space VM areas.
+
+Anonymous mappings are demand-zero: physical pages are allocated only when
+userspace first accesses them or a syscall copies through them. Private file
+mappings use syscall ABI 1.5 and `map_file_private()`. File offsets must be
+page-aligned. Read-only pages can be shared through the bounded kernel page
+cache; writable private mappings copy an individual page on its first write.
+The current cache holds at most 256 pages and file mappings larger than that
+limit fail cleanly rather than falling back to unbounded allocation.
+
+`top` reports resident memory in KiB from the same VM-area accounting used by
+the kernel.
+
+## Threads and process control
+
+Syscall ABI 1.6 added native execution threads. `thread_create()` starts an
+independently scheduled context with its own guarded user stack, kernel stack,
+register/FPU state, and thread ID while sharing its process address space.
+Threads can terminate independently with `thread_exit()` and remain joinable
+until `thread_join()` collects their exit status. `thread_id()` and
+`process_id()` expose the two identity levels, and `top` distinguishes threads
+from process leaders.
+
+`futex_wait()` and `futex_wake()` provide process-private blocking on aligned
+32-bit userspace words, allowing uncontended synchronization to stay entirely
+in userspace. Process exit terminates the complete thread group and address
+spaces remain alive until their final thread is reclaimed.
+
+The process model has two independently reference-counted ownership
+objects. Threads share both their address space and a process-resource object
+containing descriptors, file and directory handles, capabilities, console
+identity, and current directory. Table operations, shared file offsets, CWD
+updates, and credential changes are serialized across the thread group; the
+resources are closed only after its final thread is reclaimed.
+
+Syscall ABI 1.7 completes the native process-control layer. It adds per-thread
+TLS base management and TLS-aware thread creation; bounded asynchronous event
+queues; process-group kill, suspend, and resume; arbitrary-child waiting with
+zombie collection; process groups, sessions, and foreground terminal groups;
+enforced thread, descriptor, handle, address-space, and CPU-time limits with
+usage accounting; and a capability-gated tracer that can stop a process,
+inspect or modify its memory, and read a stopped thread's registers. External
+control requires the `ProcessControl` capability, while cross-process
+observation continues to require `Monitor`.
 
 ## Debug heartbeat
 

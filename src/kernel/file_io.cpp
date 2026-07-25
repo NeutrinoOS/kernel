@@ -10,6 +10,7 @@
 #include "capabilities.hpp"
 #include "path_util.hpp"
 #include "string_util.hpp"
+#include "sync.hpp"
 #include "vm.hpp"
 
 namespace {
@@ -19,6 +20,28 @@ namespace {
 constexpr size_t kFileIoBounceSize = 32768;
 alignas(4096) uint8_t g_file_io_bounce[kFileIoBounceSize];
 volatile int g_file_io_bounce_lock = 0;
+
+class PrincipalSnapshot {
+public:
+    explicit PrincipalSnapshot(const process::Process& proc) {
+        sync::LockGuard guard(proc.resources->lock);
+        principal_ = proc.resources->principal;
+        valid_ = principal_ == nullptr ||
+                 capabilities::principal_add_ref(principal_);
+    }
+    ~PrincipalSnapshot() {
+        if (principal_ != nullptr && valid_) {
+            capabilities::principal_release(principal_);
+        }
+    }
+    bool valid() const { return valid_; }
+    capabilities::Principal* get() const {
+        return valid_ ? principal_ : nullptr;
+    }
+private:
+    capabilities::Principal* principal_{nullptr};
+    bool valid_{false};
+};
 
 void lock_file_io_bounce() {
     while (__atomic_test_and_set(&g_file_io_bounce_lock, __ATOMIC_ACQUIRE)) {
@@ -34,8 +57,8 @@ process::FileHandle* get_file_handle(process::Process& proc, uint32_t handle) {
     if (handle >= process::kMaxFileHandles) {
         return nullptr;
     }
-    process::FileHandle& entry = proc.file_handles[handle];
-    return entry.in_use ? &entry : nullptr;
+    process::FileHandle& entry = proc.resources->file_handles[handle];
+    return __atomic_load_n(&entry.in_use, __ATOMIC_ACQUIRE) ? &entry : nullptr;
 }
 
 process::DirectoryHandle* get_directory_handle(process::Process& proc,
@@ -43,17 +66,27 @@ process::DirectoryHandle* get_directory_handle(process::Process& proc,
     if (handle >= process::kMaxDirectoryHandles) {
         return nullptr;
     }
-    process::DirectoryHandle& entry = proc.directory_handles[handle];
-    return entry.in_use ? &entry : nullptr;
+    process::DirectoryHandle& entry =
+        proc.resources->directory_handles[handle];
+    return __atomic_load_n(&entry.in_use, __ATOMIC_ACQUIRE) ? &entry : nullptr;
 }
 
 int32_t allocate_file_handle(process::Process& proc) {
-    for (uint32_t i = 0; i < process::kMaxFileHandles; ++i) {
-        if (!proc.file_handles[i].in_use) {
-            proc.file_handles[i].in_use = true;
-            proc.file_handles[i].can_write = false;
-            proc.file_handles[i].handle = {};
-            proc.file_handles[i].position = 0;
+    sync::LockGuard guard(proc.resources->lock);
+    uint32_t limit = proc.resources->limits.max_file_handles;
+    if (limit > process::kMaxFileHandles) {
+        limit = process::kMaxFileHandles;
+    }
+    for (uint32_t i = 0; i < limit; ++i) {
+        sync::LockGuard slot_guard(proc.resources->file_locks[i]);
+        process::FileHandle& handle = proc.resources->file_handles[i];
+        if (!__atomic_load_n(&handle.in_use, __ATOMIC_ACQUIRE) &&
+            !handle.reserved) {
+            handle.reserved = true;
+            proc.resources->file_handles[i].can_write = false;
+            proc.resources->file_handles[i].handle = {};
+            proc.resources->file_handles[i].position = 0;
+            proc.resources->file_handles[i].path[0] = '\0';
             return static_cast<int32_t>(i);
         }
     }
@@ -61,15 +94,44 @@ int32_t allocate_file_handle(process::Process& proc) {
 }
 
 int32_t allocate_directory_handle(process::Process& proc) {
-    for (uint32_t i = 0; i < process::kMaxDirectoryHandles; ++i) {
-        if (!proc.directory_handles[i].in_use) {
-            proc.directory_handles[i].in_use = true;
-            proc.directory_handles[i].handle = {};
-            proc.directory_handles[i].path[0] = '\0';
+    sync::LockGuard guard(proc.resources->lock);
+    uint32_t limit = proc.resources->limits.max_directory_handles;
+    if (limit > process::kMaxDirectoryHandles) {
+        limit = process::kMaxDirectoryHandles;
+    }
+    for (uint32_t i = 0; i < limit; ++i) {
+        sync::LockGuard slot_guard(proc.resources->directory_locks[i]);
+        process::DirectoryHandle& handle =
+            proc.resources->directory_handles[i];
+        if (!__atomic_load_n(&handle.in_use, __ATOMIC_ACQUIRE) &&
+            !handle.reserved) {
+            handle.reserved = true;
+            proc.resources->directory_handles[i].handle = {};
+            proc.resources->directory_handles[i].path[0] = '\0';
             return static_cast<int32_t>(i);
         }
     }
     return -1;
+}
+
+void release_file_reservation(process::Process& proc, size_t slot) {
+    sync::LockGuard guard(proc.resources->lock);
+    proc.resources->file_handles[slot].reserved = false;
+}
+
+void publish_file_handle(process::Process& proc, size_t slot) {
+    sync::LockGuard guard(proc.resources->lock);
+    process::FileHandle& handle = proc.resources->file_handles[slot];
+    handle.reserved = false;
+    __atomic_store_n(&handle.in_use, true, __ATOMIC_RELEASE);
+}
+
+void publish_directory_handle(process::Process& proc, size_t slot) {
+    sync::LockGuard guard(proc.resources->lock);
+    process::DirectoryHandle& handle =
+        proc.resources->directory_handles[slot];
+    handle.reserved = false;
+    __atomic_store_n(&handle.in_use, true, __ATOMIC_RELEASE);
 }
 
 bool copy_path(process::Process& proc,
@@ -87,7 +149,12 @@ bool copy_path(process::Process& proc,
         temp[0] == '\0') {
         return false;
     }
-    return path_util::build_absolute_path(proc.cwd, temp, out);
+    char cwd[sizeof(proc.resources->cwd)];
+    {
+        sync::LockGuard guard(proc.resources->lock);
+        string_util::copy(cwd, sizeof(cwd), proc.resources->cwd);
+    }
+    return path_util::build_absolute_path(cwd, temp, out);
 }
 
 bool build_child_path(process::Process& proc,
@@ -125,9 +192,13 @@ vfs::AclValue permission_value(const vfs::AclEntry& entry,
 bool acl_allows(const process::Process& proc,
                 const char* path,
                 vfs::AclPermission permission) {
-    if (proc.principal == nullptr ||
+    PrincipalSnapshot principal(proc);
+    if (!principal.valid()) {
+        return false;
+    }
+    if (principal.get() == nullptr ||
         capabilities::principal_allows(
-            *proc.principal,
+            *principal.get(),
             capabilities::CapabilityKind::SecurityManage)) {
         return true;
     }
@@ -146,7 +217,7 @@ bool acl_allows(const process::Process& proc,
 
     uint64_t machine_id = 0;
     uint64_t local_id = 0;
-    if (!capabilities::principal_user_id(proc.principal,
+    if (!capabilities::principal_user_id(principal.get(),
                                          machine_id,
                                          local_id)) {
         return false;
@@ -163,10 +234,10 @@ bool acl_allows(const process::Process& proc,
     return false;
 }
 
-bool acl_check_required(const process::Process& proc) {
-    return proc.principal != nullptr &&
+bool acl_check_required(capabilities::Principal* principal) {
+    return principal != nullptr &&
            !capabilities::principal_allows(
-               *proc.principal,
+               *principal,
                capabilities::CapabilityKind::SecurityManage);
 }
 
@@ -177,14 +248,14 @@ struct AclDecision {
     bool edit;
 };
 
-AclDecision acl_snapshot_decision(const process::Process& proc,
+AclDecision acl_snapshot_decision(capabilities::Principal* principal,
                                   const vfs::AclSnapshot& acl) {
     if (!acl.supported || acl.count == 0) {
         return {true, true, true, true};
     }
     uint64_t machine_id = 0;
     uint64_t local_id = 0;
-    if (!capabilities::principal_user_id(proc.principal,
+    if (!capabilities::principal_user_id(principal,
                                          machine_id,
                                          local_id)) {
         return {};
@@ -241,29 +312,36 @@ int32_t open_file(process::Process& proc, const char* path) {
 
     vfs::FileHandle vfs_handle{};
     vfs::AclSnapshot acl{};
-    bool check_acl = acl_check_required(proc);
+    PrincipalSnapshot principal(proc);
+    if (!principal.valid()) {
+        release_file_reservation(proc, static_cast<size_t>(slot));
+        return -1;
+    }
+    bool check_acl = acl_check_required(principal.get());
     if (!vfs::open_file(local_path,
                         vfs_handle,
                         check_acl ? &acl : nullptr)) {
         vfs::close_file(vfs_handle);
-        proc.file_handles[static_cast<size_t>(slot)].in_use = false;
-        proc.file_handles[static_cast<size_t>(slot)].handle = {};
+        proc.resources->file_handles[static_cast<size_t>(slot)].handle = {};
+        release_file_reservation(proc, static_cast<size_t>(slot));
         return -1;
     }
     AclDecision decision = check_acl
-                               ? acl_snapshot_decision(proc, acl)
+                               ? acl_snapshot_decision(principal.get(), acl)
                                : AclDecision{true, true, true, true};
     if (!decision.read) {
         vfs::close_file(vfs_handle);
-        proc.file_handles[static_cast<size_t>(slot)].in_use = false;
-        proc.file_handles[static_cast<size_t>(slot)].handle = {};
+        proc.resources->file_handles[static_cast<size_t>(slot)].handle = {};
+        release_file_reservation(proc, static_cast<size_t>(slot));
         return -1;
     }
 
-    process::FileHandle& handle = proc.file_handles[static_cast<size_t>(slot)];
+    process::FileHandle& handle = proc.resources->file_handles[static_cast<size_t>(slot)];
     handle.handle = vfs_handle;
     handle.can_write = decision.write;
     handle.position = 0;
+    string_util::copy(handle.path, sizeof(handle.path), local_path);
+    publish_file_handle(proc, static_cast<size_t>(slot));
     return slot;
 }
 
@@ -288,32 +366,43 @@ int32_t create_file(process::Process& proc, const char* path) {
 
     vfs::FileHandle vfs_handle{};
     if (!vfs::create_file(local_path, vfs_handle)) {
-        proc.file_handles[static_cast<size_t>(slot)].in_use = false;
-        proc.file_handles[static_cast<size_t>(slot)].handle = {};
+        proc.resources->file_handles[static_cast<size_t>(slot)].handle = {};
+        release_file_reservation(proc, static_cast<size_t>(slot));
         return -1;
     }
 
-    process::FileHandle& handle = proc.file_handles[static_cast<size_t>(slot)];
+    process::FileHandle& handle = proc.resources->file_handles[static_cast<size_t>(slot)];
     handle.handle = vfs_handle;
     handle.can_write = true;
     handle.position = 0;
+    string_util::copy(handle.path, sizeof(handle.path), local_path);
+    publish_file_handle(proc, static_cast<size_t>(slot));
     return slot;
 }
 
 bool close_file(process::Process& proc, uint32_t handle) {
+    if (handle >= process::kMaxFileHandles) {
+        return false;
+    }
+    sync::LockGuard guard(proc.resources->file_locks[handle]);
     process::FileHandle* entry = get_file_handle(proc, handle);
     if (entry == nullptr) {
         return false;
     }
     vfs::close_file(entry->handle);
-    entry->in_use = false;
+    __atomic_store_n(&entry->in_use, false, __ATOMIC_RELEASE);
     entry->can_write = false;
     entry->handle = {};
     entry->position = 0;
+    entry->path[0] = '\0';
     return true;
 }
 
 bool sync_file(process::Process& proc, uint32_t handle) {
+    if (handle >= process::kMaxFileHandles) {
+        return false;
+    }
+    sync::LockGuard guard(proc.resources->file_locks[handle]);
     process::FileHandle* entry = get_file_handle(proc, handle);
     if (entry == nullptr) {
         return false;
@@ -323,6 +412,10 @@ bool sync_file(process::Process& proc, uint32_t handle) {
 
 int64_t read_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
                   uint64_t length) {
+    if (handle >= process::kMaxFileHandles) {
+        return -1;
+    }
+    sync::LockGuard guard(proc.resources->file_locks[handle]);
     process::FileHandle* entry = get_file_handle(proc, handle);
     if (entry == nullptr) {
         return -1;
@@ -379,6 +472,10 @@ int64_t read_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
 
 int64_t write_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
                    uint64_t length) {
+    if (handle >= process::kMaxFileHandles) {
+        return -1;
+    }
+    sync::LockGuard guard(proc.resources->file_locks[handle]);
     process::FileHandle* entry = get_file_handle(proc, handle);
     if (entry == nullptr) {
         return -1;
@@ -438,6 +535,27 @@ int64_t write_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
     return static_cast<int64_t>(total_written);
 }
 
+uint64_t map_file_private(process::Process& proc,
+                          uint32_t handle,
+                          uint64_t file_offset,
+                          size_t length,
+                          uint64_t flags) {
+    if (handle >= process::kMaxFileHandles) {
+        return 0;
+    }
+    sync::LockGuard guard(proc.resources->file_locks[handle]);
+    process::FileHandle* entry = get_file_handle(proc, handle);
+    if (entry == nullptr || entry->path[0] == '\0') {
+        return 0;
+    }
+    return vm::map_file_private(proc.cr3,
+                                entry->path,
+                                entry->handle,
+                                file_offset,
+                                length,
+                                flags);
+}
+
 int32_t open_directory(process::Process& proc, const char* path) {
     char local_path[path_util::kMaxPathLength];
     if (!copy_path(proc, path, local_path)) {
@@ -445,14 +563,18 @@ int32_t open_directory(process::Process& proc, const char* path) {
     }
     vfs::DirectoryHandle vfs_handle{};
     vfs::AclSnapshot acl{};
-    bool check_acl = acl_check_required(proc);
+    PrincipalSnapshot principal(proc);
+    if (!principal.valid()) {
+        return -1;
+    }
+    bool check_acl = acl_check_required(principal.get());
     if (!vfs::open_directory(local_path,
                              vfs_handle,
                              check_acl ? &acl : nullptr)) {
         vfs::close_directory(vfs_handle);
         return -1;
     }
-    if (check_acl && !acl_snapshot_decision(proc, acl).read) {
+    if (check_acl && !acl_snapshot_decision(principal.get(), acl).read) {
         vfs::close_directory(vfs_handle);
         return -1;
     }
@@ -467,9 +589,10 @@ int32_t open_directory(process::Process& proc, const char* path) {
     }
 
     process::DirectoryHandle& handle =
-        proc.directory_handles[static_cast<size_t>(slot)];
+        proc.resources->directory_handles[static_cast<size_t>(slot)];
     handle.handle = vfs_handle;
     string_util::copy(handle.path, sizeof(handle.path), local_path);
+    publish_directory_handle(proc, static_cast<size_t>(slot));
     return slot;
 }
 
@@ -493,33 +616,48 @@ int32_t open_directory_root(process::Process& proc) {
     }
 
     process::DirectoryHandle& handle =
-        proc.directory_handles[static_cast<size_t>(slot)];
+        proc.resources->directory_handles[static_cast<size_t>(slot)];
     handle.handle = vfs_handle;
     string_util::copy(handle.path, sizeof(handle.path), local_path);
+    publish_directory_handle(proc, static_cast<size_t>(slot));
     return slot;
 }
 
 int32_t open_directory_at(process::Process& proc,
                           uint32_t dir_handle,
                           const char* name) {
-    process::DirectoryHandle* parent = get_directory_handle(proc, dir_handle);
-    if (parent == nullptr) {
+    if (dir_handle >= process::kMaxDirectoryHandles) {
         return -1;
     }
+    char base_path[path_util::kMaxPathLength];
+    {
+        sync::LockGuard parent_guard(
+            proc.resources->directory_locks[dir_handle]);
+        process::DirectoryHandle* parent =
+            get_directory_handle(proc, dir_handle);
+        if (parent == nullptr) {
+            return -1;
+        }
+        string_util::copy(base_path, sizeof(base_path), parent->path);
+    }
     char local_path[path_util::kMaxPathLength];
-    if (!build_child_path(proc, parent->path, name, local_path)) {
+    if (!build_child_path(proc, base_path, name, local_path)) {
         return -1;
     }
     vfs::DirectoryHandle vfs_handle{};
     vfs::AclSnapshot acl{};
-    bool check_acl = acl_check_required(proc);
+    PrincipalSnapshot principal(proc);
+    if (!principal.valid()) {
+        return -1;
+    }
+    bool check_acl = acl_check_required(principal.get());
     if (!vfs::open_directory(local_path,
                              vfs_handle,
                              check_acl ? &acl : nullptr)) {
         vfs::close_directory(vfs_handle);
         return -1;
     }
-    if (check_acl && !acl_snapshot_decision(proc, acl).read) {
+    if (check_acl && !acl_snapshot_decision(principal.get(), acl).read) {
         vfs::close_directory(vfs_handle);
         return -1;
     }
@@ -534,9 +672,10 @@ int32_t open_directory_at(process::Process& proc,
     }
 
     process::DirectoryHandle& handle =
-        proc.directory_handles[static_cast<size_t>(slot)];
+        proc.resources->directory_handles[static_cast<size_t>(slot)];
     handle.handle = vfs_handle;
     string_util::copy(handle.path, sizeof(handle.path), local_path);
+    publish_directory_handle(proc, static_cast<size_t>(slot));
     return slot;
 }
 
@@ -574,12 +713,22 @@ bool remove_directory(process::Process& proc, const char* path) {
 int32_t open_file_at(process::Process& proc,
                      uint32_t dir_handle,
                      const char* name) {
-    process::DirectoryHandle* parent = get_directory_handle(proc, dir_handle);
-    if (parent == nullptr) {
+    if (dir_handle >= process::kMaxDirectoryHandles) {
         return -1;
     }
+    char base_path[path_util::kMaxPathLength];
+    {
+        sync::LockGuard parent_guard(
+            proc.resources->directory_locks[dir_handle]);
+        process::DirectoryHandle* parent =
+            get_directory_handle(proc, dir_handle);
+        if (parent == nullptr) {
+            return -1;
+        }
+        string_util::copy(base_path, sizeof(base_path), parent->path);
+    }
     char local_path[path_util::kMaxPathLength];
-    if (!build_child_path(proc, parent->path, name, local_path)) {
+    if (!build_child_path(proc, base_path, name, local_path)) {
         return -1;
     }
     int32_t slot = allocate_file_handle(proc);
@@ -592,41 +741,58 @@ int32_t open_file_at(process::Process& proc,
 
     vfs::FileHandle vfs_handle{};
     vfs::AclSnapshot acl{};
-    bool check_acl = acl_check_required(proc);
+    PrincipalSnapshot principal(proc);
+    if (!principal.valid()) {
+        release_file_reservation(proc, static_cast<size_t>(slot));
+        return -1;
+    }
+    bool check_acl = acl_check_required(principal.get());
     if (!vfs::open_file(local_path,
                         vfs_handle,
                         check_acl ? &acl : nullptr)) {
         vfs::close_file(vfs_handle);
-        proc.file_handles[static_cast<size_t>(slot)].in_use = false;
-        proc.file_handles[static_cast<size_t>(slot)].handle = {};
+        proc.resources->file_handles[static_cast<size_t>(slot)].handle = {};
+        release_file_reservation(proc, static_cast<size_t>(slot));
         return -1;
     }
     AclDecision decision = check_acl
-                               ? acl_snapshot_decision(proc, acl)
+                               ? acl_snapshot_decision(principal.get(), acl)
                                : AclDecision{true, true, true, true};
     if (!decision.read) {
         vfs::close_file(vfs_handle);
-        proc.file_handles[static_cast<size_t>(slot)].in_use = false;
-        proc.file_handles[static_cast<size_t>(slot)].handle = {};
+        proc.resources->file_handles[static_cast<size_t>(slot)].handle = {};
+        release_file_reservation(proc, static_cast<size_t>(slot));
         return -1;
     }
 
-    process::FileHandle& handle = proc.file_handles[static_cast<size_t>(slot)];
+    process::FileHandle& handle = proc.resources->file_handles[static_cast<size_t>(slot)];
     handle.handle = vfs_handle;
     handle.can_write = decision.write;
     handle.position = 0;
+    string_util::copy(handle.path, sizeof(handle.path), local_path);
+    publish_file_handle(proc, static_cast<size_t>(slot));
     return slot;
 }
 
 int32_t create_file_at(process::Process& proc,
                        uint32_t dir_handle,
                        const char* name) {
-    process::DirectoryHandle* parent = get_directory_handle(proc, dir_handle);
-    if (parent == nullptr) {
+    if (dir_handle >= process::kMaxDirectoryHandles) {
         return -1;
     }
+    char base_path[path_util::kMaxPathLength];
+    {
+        sync::LockGuard parent_guard(
+            proc.resources->directory_locks[dir_handle]);
+        process::DirectoryHandle* parent =
+            get_directory_handle(proc, dir_handle);
+        if (parent == nullptr) {
+            return -1;
+        }
+        string_util::copy(base_path, sizeof(base_path), parent->path);
+    }
     char local_path[path_util::kMaxPathLength];
-    if (!build_child_path(proc, parent->path, name, local_path)) {
+    if (!build_child_path(proc, base_path, name, local_path)) {
         return -1;
     }
     char parent_path_buffer[path_util::kMaxPathLength];
@@ -647,25 +813,31 @@ int32_t create_file_at(process::Process& proc,
 
     vfs::FileHandle vfs_handle{};
     if (!vfs::create_file(local_path, vfs_handle)) {
-        proc.file_handles[static_cast<size_t>(slot)].in_use = false;
-        proc.file_handles[static_cast<size_t>(slot)].handle = {};
+        proc.resources->file_handles[static_cast<size_t>(slot)].handle = {};
+        release_file_reservation(proc, static_cast<size_t>(slot));
         return -1;
     }
 
-    process::FileHandle& handle = proc.file_handles[static_cast<size_t>(slot)];
+    process::FileHandle& handle = proc.resources->file_handles[static_cast<size_t>(slot)];
     handle.handle = vfs_handle;
     handle.can_write = true;
     handle.position = 0;
+    string_util::copy(handle.path, sizeof(handle.path), local_path);
+    publish_file_handle(proc, static_cast<size_t>(slot));
     return slot;
 }
 
 bool close_directory(process::Process& proc, uint32_t handle) {
+    if (handle >= process::kMaxDirectoryHandles) {
+        return false;
+    }
+    sync::LockGuard guard(proc.resources->directory_locks[handle]);
     process::DirectoryHandle* entry = get_directory_handle(proc, handle);
     if (entry == nullptr) {
         return false;
     }
     vfs::close_directory(entry->handle);
-    entry->in_use = false;
+    __atomic_store_n(&entry->in_use, false, __ATOMIC_RELEASE);
     entry->handle = {};
     entry->path[0] = '\0';
     return true;
@@ -673,6 +845,10 @@ bool close_directory(process::Process& proc, uint32_t handle) {
 
 int64_t read_directory(process::Process& proc, uint32_t handle,
                        uint64_t user_addr) {
+    if (handle >= process::kMaxDirectoryHandles) {
+        return -1;
+    }
+    sync::LockGuard guard(proc.resources->directory_locks[handle]);
     process::DirectoryHandle* entry = get_directory_handle(proc, handle);
     if (entry == nullptr) {
         return -1;

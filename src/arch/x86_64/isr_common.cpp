@@ -134,6 +134,23 @@ extern "C" void isr_handler(InterruptFrame* regs) {
         return;
     }
 
+    if (regs->int_no == 14 && (regs->cs & 0x3) != 0) {
+        uint64_t fault_address = 0;
+        asm volatile("mov %%cr2, %0" : "=r"(fault_address));
+        process::Process* proc = process::current();
+        const bool write = (regs->err_code & (1u << 1)) != 0;
+        const bool execute = (regs->err_code & (1u << 4)) != 0;
+        const bool recoverable =
+            (regs->err_code & 0x1u) == 0 || write;
+        if (recoverable && proc != nullptr &&
+            vm::handle_page_fault(proc->cr3,
+                                  fault_address,
+                                  write,
+                                  execute)) {
+            return;
+        }
+    }
+
     log_message(LogLevel::Error, "Exception %x %s",
                 static_cast<unsigned int>(regs->int_no),
                 regs->int_no < 32 ? exception_names[regs->int_no] : "Unknown");

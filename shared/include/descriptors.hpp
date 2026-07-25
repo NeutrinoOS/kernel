@@ -343,6 +343,7 @@ struct CpuUsage {
 enum TaskStatFlag : uint32_t {
     kTaskStatFlagKernel = 1u << 0,
     kTaskStatFlagExited = 1u << 1,
+    kTaskStatFlagThread = 1u << 2,
 };
 
 enum WaitFlag : uint32_t {
@@ -363,9 +364,13 @@ struct TaskUsage {
     uint32_t state;
     uint32_t flags;
     uint32_t preferred_cpu;
-    uint32_t reserved0;
+    uint32_t process_id;
     uint64_t user_ticks;
     uint64_t kernel_ticks;
+    uint64_t virtual_bytes;
+    uint64_t resident_bytes;
+    uint64_t shared_bytes;
+    uint64_t file_bytes;
     char image_path[64];
 };
 

@@ -23,5 +23,6 @@ void free_user_page(uint64_t phys);
 uint64_t kernel_pool_base();
 uint64_t kernel_pool_size();
 size_t kernel_free_pages();
+size_t user_free_pages();
 
 }  // namespace memory

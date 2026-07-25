@@ -1,6 +1,7 @@
 #include "../descriptor.hpp"
 
 #include "../../drivers/console/console.hpp"
+#include "../../drivers/log/logging.hpp"
 #include "../../lib/mem.hpp"
 #include "../memory/physical_allocator.hpp"
 #include "../process.hpp"
@@ -14,12 +15,20 @@ namespace framebuffer_descriptor {
 
 constexpr size_t kFramebufferSlots = 6;
 constexpr size_t kPageSize = 0x1000;
+constexpr size_t kMaxFramebufferBytes = 64ull * 1024 * 1024;
+constexpr size_t kMaxFramebufferPages = kMaxFramebufferBytes / kPageSize;
+constexpr uint64_t kFramebufferBackingVirtBase = 0xFFFFE20000000000ull;
+constexpr uint64_t kFramebufferBackingSlotStride = kMaxFramebufferBytes;
+constexpr size_t kPageTableEntries = 512;
+constexpr size_t kFramebufferAllocationReserveBasePages = 8;
 
 struct FramebufferSlot {
     Framebuffer fb;
     uint8_t* buffer;
     size_t buffer_bytes;
     uint64_t physical_base;
+    uint64_t physical_pages[kMaxFramebufferPages];
+    size_t physical_page_count;
     process::Process* owner;
     process::Process* session_owner;
     uint32_t open_count;
@@ -75,6 +84,33 @@ FramebufferSlot* slot_from_entry(DescriptorEntry& entry) {
     return static_cast<FramebufferSlot*>(entry.object);
 }
 
+uint64_t slot_backing_virtual_base(const FramebufferSlot& slot) {
+    size_t index = static_cast<size_t>(&slot - g_framebuffers);
+    return kFramebufferBackingVirtBase +
+           static_cast<uint64_t>(index) * kFramebufferBackingSlotStride;
+}
+
+void release_slot_buffer(FramebufferSlot& slot) {
+    if (slot.physical_page_count == 0) {
+        return;
+    }
+    uint64_t virtual_base = slot_backing_virtual_base(slot);
+    for (size_t i = 0; i < slot.physical_page_count; ++i) {
+        uint64_t ignored = 0;
+        (void)paging_unmap_page(
+            virtual_base + static_cast<uint64_t>(i) * kPageSize,
+            ignored);
+        if (slot.physical_pages[i] != 0) {
+            memory::free_user_page(slot.physical_pages[i]);
+            slot.physical_pages[i] = 0;
+        }
+    }
+    slot.buffer = nullptr;
+    slot.buffer_bytes = 0;
+    slot.physical_base = 0;
+    slot.physical_page_count = 0;
+}
+
 bool ensure_slot_buffer(FramebufferSlot& slot) {
     if (slot.buffer != nullptr) {
         return true;
@@ -86,14 +122,76 @@ bool ensure_slot_buffer(FramebufferSlot& slot) {
         return false;
     }
     size_t pages = (g_frame_bytes + kPageSize - 1) / kPageSize;
-    uint64_t phys = memory::alloc_kernel_block_pages(pages);
-    if (phys == 0) {
+    if (pages > kMaxFramebufferPages) {
+        log_message(
+            LogLevel::Warn,
+            "Framebuffer: session backing too large slot=%zu bytes=%zu limit=%zu",
+            static_cast<size_t>(&slot - g_framebuffers),
+            g_frame_bytes,
+            kMaxFramebufferBytes);
         return false;
     }
-    auto* start = static_cast<uint8_t*>(paging_phys_to_virt(phys));
-    slot.buffer = start;
+    size_t page_table_pages =
+        (pages + kPageTableEntries - 1) / kPageTableEntries;
+    size_t reserve_pages =
+        kFramebufferAllocationReserveBasePages +
+        2 * (page_table_pages + 3);
+    size_t free_kernel_pages = memory::kernel_free_pages();
+    if (free_kernel_pages < reserve_pages) {
+        log_message(
+            LogLevel::Warn,
+            "Framebuffer: insufficient kernel page-table reserve slot=%zu free=%zu reserve=%zu",
+            static_cast<size_t>(&slot - g_framebuffers),
+            free_kernel_pages,
+            reserve_pages);
+        return false;
+    }
+    size_t free_user_pages = memory::user_free_pages();
+    if (free_user_pages < pages) {
+        log_message(
+            LogLevel::Warn,
+            "Framebuffer: insufficient user backing pages slot=%zu need=%zu free=%zu",
+            static_cast<size_t>(&slot - g_framebuffers),
+            pages,
+            free_user_pages);
+        return false;
+    }
+
+    uint64_t virtual_base = slot_backing_virtual_base(slot);
+    for (size_t i = 0; i < pages; ++i) {
+        uint64_t phys = memory::alloc_user_page();
+        if (phys == 0) {
+            log_message(
+                LogLevel::Warn,
+                "Framebuffer: backing allocation failed slot=%zu page=%zu/%zu free=%zu",
+                static_cast<size_t>(&slot - g_framebuffers),
+                i,
+                pages,
+                memory::user_free_pages());
+            slot.physical_page_count = i;
+            release_slot_buffer(slot);
+            return false;
+        }
+        slot.physical_pages[i] = phys;
+        slot.physical_page_count = i + 1;
+        if (!paging_map_page(
+                virtual_base + static_cast<uint64_t>(i) * kPageSize,
+                phys,
+                PAGE_FLAG_WRITE | PAGE_FLAG_NO_EXECUTE)) {
+            log_message(
+                LogLevel::Warn,
+                "Framebuffer: backing map failed slot=%zu page=%zu/%zu",
+                static_cast<size_t>(&slot - g_framebuffers),
+                i,
+                pages);
+            release_slot_buffer(slot);
+            return false;
+        }
+    }
+
+    slot.buffer = reinterpret_cast<uint8_t*>(virtual_base);
     slot.buffer_bytes = pages * kPageSize;
-    slot.physical_base = phys;
+    slot.physical_base = 0;
     memset(slot.buffer, 0, slot.buffer_bytes);
     slot.fb = g_hw_fb;
     slot.fb.base = slot.buffer;
@@ -205,29 +303,71 @@ bool copy_rect_to_hardware(const FramebufferSlot& slot,
 bool map_slot_into_process(process::Process& proc,
                            FramebufferSlot& slot,
                            uint64_t& out_base) {
-    if (proc.cr3 == 0 || slot.physical_base == 0 || slot.buffer_bytes == 0) {
+    if (proc.cr3 == 0 || slot.physical_page_count == 0 ||
+        slot.buffer_bytes == 0) {
         return false;
     }
-    vm::Region region = vm::reserve_user_region(proc.cr3, slot.buffer_bytes);
+    vm::Region region = vm::reserve_user_region(
+        proc.cr3,
+        slot.buffer_bytes,
+        vm::MappingKind::Device);
     if (region.base == 0 || region.length == 0) {
         return false;
     }
     uint64_t base = region.base;
     uint64_t total = region.length;
-    uint64_t physical_base = slot.physical_base;
     uint64_t flags = PAGE_FLAG_WRITE | PAGE_FLAG_USER | PAGE_FLAG_NO_EXECUTE;
     for (uint64_t offset = 0; offset < total; offset += kPageSize) {
-        uint64_t phys = physical_base + offset;
+        size_t page = static_cast<size_t>(offset / kPageSize);
+        if (page >= slot.physical_page_count) {
+            log_message(
+                LogLevel::Warn,
+                "Framebuffer: user map exceeded backing slot=%zu page=%zu/%zu",
+                static_cast<size_t>(&slot - g_framebuffers),
+                page,
+                slot.physical_page_count);
+            for (uint64_t rollback = 0; rollback < offset;
+                 rollback += kPageSize) {
+                uint64_t freed = 0;
+                (void)paging_unmap_page_cr3(
+                    proc.cr3, base + rollback, freed);
+            }
+            vm::release_external_region(proc.cr3, region);
+            return false;
+        }
+        uint64_t phys = slot.physical_pages[page];
         if (!paging_map_page_cr3(proc.cr3,
                                  base + offset,
                                  phys,
                                  flags)) {
+            log_message(
+                LogLevel::Warn,
+                "Framebuffer: user map failed slot=%zu page=%zu/%zu",
+                static_cast<size_t>(&slot - g_framebuffers),
+                page,
+                slot.physical_page_count);
             for (uint64_t rollback = 0; rollback < offset; rollback += kPageSize) {
                 uint64_t freed = 0;
                 paging_unmap_page_cr3(proc.cr3, base + rollback, freed);
             }
+            vm::release_external_region(proc.cr3, region);
             return false;
         }
+    }
+    if (!vm::mark_region_resident(proc.cr3,
+                                  region,
+                                  static_cast<size_t>(total / kPageSize))) {
+        log_message(
+            LogLevel::Warn,
+            "Framebuffer: unable to account user mapping slot=%zu pages=%zu",
+            static_cast<size_t>(&slot - g_framebuffers),
+            slot.physical_page_count);
+        for (uint64_t offset = 0; offset < total; offset += kPageSize) {
+            uint64_t ignored = 0;
+            (void)paging_unmap_page_cr3(proc.cr3, base + offset, ignored);
+        }
+        vm::release_external_region(proc.cr3, region);
+        return false;
     }
     out_base = base;
     return true;
@@ -379,10 +519,25 @@ void framebuffer_close(DescriptorEntry& entry) {
         return;
     }
     process::Process* owner = nullptr;
+    bool last_close = false;
     {
-        BlockingSelectionGuard selection_guard;
         LeaseGuard lease_guard;
         owner = slot->owner;
+        if (owner != nullptr && !is_kernel_process(*owner) &&
+            entry.subsystem_data != nullptr) {
+            uint64_t base =
+                reinterpret_cast<uint64_t>(entry.subsystem_data);
+            for (uint64_t offset = 0; offset < slot->buffer_bytes;
+                 offset += kPageSize) {
+                uint64_t ignored = 0;
+                (void)paging_unmap_page_cr3(owner->cr3,
+                                            base + offset,
+                                            ignored);
+            }
+            vm::release_external_region(
+                owner->cr3,
+                vm::Region{base, slot->buffer_bytes});
+        }
         uint32_t open_count =
             __atomic_load_n(&slot->open_count, __ATOMIC_RELAXED);
         if (open_count > 0) {
@@ -392,28 +547,26 @@ void framebuffer_close(DescriptorEntry& entry) {
                              __ATOMIC_RELEASE);
         }
         if (open_count == 0 && !slot->kernel_reserved) {
+            if (slot->owner == owner) {
+                __atomic_store_n(&slot->owner,
+                                 static_cast<process::Process*>(nullptr),
+                                 __ATOMIC_RELEASE);
+            }
+            last_close = true;
+        }
+    }
+    if (last_close && owner != nullptr && !is_kernel_process(*owner)) {
+        BlockingSelectionGuard selection_guard;
+        LeaseGuard lease_guard;
+        if (__atomic_load_n(&slot->open_count, __ATOMIC_ACQUIRE) == 0 &&
+            __atomic_load_n(&slot->owner, __ATOMIC_ACQUIRE) == nullptr) {
             uint32_t slot_index =
                 static_cast<uint32_t>(slot - g_framebuffers);
             if (__atomic_load_n(&g_active_slot, __ATOMIC_ACQUIRE) ==
                 slot_index) {
                 select_locked(0);
             }
-            if (slot->owner == owner) {
-                __atomic_store_n(&slot->owner,
-                                 static_cast<process::Process*>(nullptr),
-                                 __ATOMIC_RELEASE);
-            }
-        }
-    }
-    if (owner != nullptr && !is_kernel_process(*owner) &&
-        entry.subsystem_data != nullptr) {
-        uint64_t base = reinterpret_cast<uint64_t>(entry.subsystem_data);
-        for (uint64_t offset = 0; offset < slot->buffer_bytes;
-             offset += kPageSize) {
-            uint64_t ignored = 0;
-            (void)paging_unmap_page_cr3(owner->cr3,
-                                        base + offset,
-                                        ignored);
+            release_slot_buffer(*slot);
         }
     }
 }
@@ -688,6 +841,9 @@ bool register_graphical_session_descriptor() {
 void register_framebuffer_device(Framebuffer& framebuffer,
                                  uint64_t physical_base) {
     using namespace framebuffer_descriptor;
+    for (size_t i = 1; i < kFramebufferSlots; ++i) {
+        release_slot_buffer(g_framebuffers[i]);
+    }
     g_hw_fb = framebuffer;
     g_hw_base = framebuffer.base;
     g_hw_physical_base = physical_base;
@@ -702,6 +858,8 @@ void register_framebuffer_device(Framebuffer& framebuffer,
         slot.fb = framebuffer;
         slot.buffer = nullptr;
         slot.buffer_bytes = 0;
+        slot.physical_base = 0;
+        slot.physical_page_count = 0;
         slot.owner = nullptr;
         slot.session_owner = nullptr;
         slot.open_count = 0;

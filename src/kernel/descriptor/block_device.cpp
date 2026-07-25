@@ -224,7 +224,7 @@ DescriptorEntry* lookup_process_entry(process::Process& proc, uint32_t handle) {
     if (index >= kMaxDescriptors || generation == 0) {
         return nullptr;
     }
-    DescriptorEntry& entry = proc.descriptors.entries[index];
+    DescriptorEntry& entry = proc.resources->descriptors.entries[index];
     if (!entry.in_use || entry.generation != generation) {
         return nullptr;
     }
@@ -759,6 +759,7 @@ bool register_block_device_descriptor() {
 bool block_device_from_descriptor(process::Process& proc,
                                   uint32_t handle,
                                   fs::BlockDevice& out) {
+    sync::LockGuard guard(proc.resources->descriptor_lock);
     DescriptorEntry* entry =
         block_device_descriptor::lookup_process_entry(proc, handle);
     if (entry == nullptr ||

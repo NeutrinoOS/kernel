@@ -446,7 +446,17 @@ uint64_t kernel_pool_size() {
 }
 
 size_t kernel_free_pages() {
-    return g_kernel_buddy.free_pages();
+    lock_alloc();
+    size_t pages = g_kernel_buddy.free_pages();
+    unlock_alloc();
+    return pages;
+}
+
+size_t user_free_pages() {
+    lock_alloc();
+    size_t pages = g_user_buddy.free_pages();
+    unlock_alloc();
+    return pages;
 }
 
 }  // namespace memory

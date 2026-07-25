@@ -899,7 +899,7 @@ static void kernel_main_stage2() {
         process::Process* proc = process::allocate_init_task();
         bool init_started = false;
         if (proc != nullptr) {
-            string_util::copy(proc->cwd, sizeof(proc->cwd), boot_cwd);
+            string_util::copy(proc->resources->cwd, sizeof(proc->resources->cwd), boot_cwd);
             if (init_path_used != nullptr) {
                 string_util::copy(proc->image_path,
                                   sizeof(proc->image_path),

@@ -20,6 +20,11 @@ int64_t read_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
                   uint64_t length);
 int64_t write_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
                    uint64_t length);
+uint64_t map_file_private(process::Process& proc,
+                          uint32_t handle,
+                          uint64_t file_offset,
+                          size_t length,
+                          uint64_t flags);
 
 int32_t open_directory(process::Process& proc, const char* path);
 int32_t open_directory_root(process::Process& proc);

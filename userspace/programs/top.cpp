@@ -20,6 +20,8 @@ constexpr uint32_t kTaskStateReady = 1;
 constexpr uint32_t kTaskStateRunning = 2;
 constexpr uint32_t kTaskStateBlocked = 3;
 constexpr uint32_t kTaskStateTerminated = 4;
+constexpr uint32_t kTaskStateSuspending = 8;
+constexpr uint32_t kTaskStateSuspended = 9;
 
 struct TaskDelta {
     descriptor_defs::TaskUsage snapshot;
@@ -151,6 +153,10 @@ const char* task_state_name(uint32_t state) {
             return "block";
         case kTaskStateTerminated:
             return "term";
+        case kTaskStateSuspending:
+            return "stop?";
+        case kTaskStateSuspended:
+            return "stop";
         case kTaskStateUnused:
         default:
             return "unused";
@@ -423,8 +429,8 @@ void append_task_table(char* buffer,
                        size_t visible_limit,
                        uint32_t first_row) {
     append_line(buffer, capacity, length, "", cols, first_row);
-    append_line(buffer, capacity, length, "       pid   cpu%  state  kind    image", cols, first_row + 1);
-    append_line(buffer, capacity, length, "------------------------------------------------------------", cols, first_row + 2);
+    append_line(buffer, capacity, length, "       pid   cpu%    rss  state  kind    image", cols, first_row + 1);
+    append_line(buffer, capacity, length, "------------------------------------------------------------------", cols, first_row + 2);
 
     size_t visible = count < visible_limit ? count : visible_limit;
     for (size_t i = 0; i < visible; ++i) {
@@ -439,6 +445,12 @@ void append_task_table(char* buffer,
                                      interval_total,
                                      5);
         append_text(buffer, capacity, length, "  ");
+        append_padded_u64(buffer,
+                          capacity,
+                          length,
+                          deltas[i].snapshot.resident_bytes / 1024,
+                          5);
+        append_text(buffer, capacity, length, "K  ");
         append_padded_text(buffer,
                            capacity,
                            length,
@@ -451,7 +463,10 @@ void append_task_table(char* buffer,
                            (deltas[i].snapshot.flags &
                             descriptor_defs::kTaskStatFlagKernel)
                                ? "kernel"
-                               : "user",
+                               : ((deltas[i].snapshot.flags &
+                                   descriptor_defs::kTaskStatFlagThread)
+                                      ? "thread"
+                                      : "user"),
                            6);
         append_text(buffer, capacity, length, "  ");
         append_text(buffer, capacity, length, deltas[i].snapshot.image_path);

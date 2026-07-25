@@ -36,6 +36,7 @@ bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents);
 namespace {
 
 process::Process g_kernel_process{};
+process::ProcessResources g_kernel_resources{};
 bool g_kernel_process_initialized = false;
 process::Process* g_waiter_worker = nullptr;
 uint32_t g_waiters_pending = 0;
@@ -43,7 +44,12 @@ uint32_t g_waiters_pending = 0;
 process::Process& kernel_process() {
     if (!g_kernel_process_initialized) {
         memset(&g_kernel_process, 0, sizeof(g_kernel_process));
-        init_table(g_kernel_process.descriptors);
+        memset(&g_kernel_resources, 0, sizeof(g_kernel_resources));
+        g_kernel_resources.in_use = true;
+        g_kernel_resources.refcount = 1;
+        g_kernel_resources.limits.max_descriptors = kMaxDescriptors;
+        init_table(g_kernel_resources.descriptors);
+        g_kernel_process.resources = &g_kernel_resources;
         g_kernel_process.cr3 = paging_kernel_cr3();
         g_kernel_process.fs_base = 0;
         g_kernel_process_initialized = true;
@@ -273,7 +279,19 @@ void destroy_table(process::Process& proc, Table& table) {
 uint32_t install(process::Process& proc,
                  Table& table,
                  const Allocation& alloc) {
-    (void)proc;
+    size_t limit = proc.resources != nullptr
+                       ? proc.resources->limits.max_descriptors
+                       : kMaxDescriptors;
+    if (limit > kMaxDescriptors) {
+        limit = kMaxDescriptors;
+    }
+    size_t used = 0;
+    for (const auto& entry : table.entries) {
+        used += entry.in_use ? 1u : 0u;
+    }
+    if (used >= limit) {
+        return kInvalidHandle;
+    }
     for (size_t i = 0; i < kMaxDescriptors; ++i) {
         DescriptorEntry& entry = table.entries[i];
         if (entry.in_use) {
@@ -289,11 +307,19 @@ uint32_t install_at(process::Process& proc,
                     Table& table,
                     uint16_t index,
                     const Allocation& alloc) {
-    (void)proc;
     if (index >= kMaxDescriptors) {
         return kInvalidHandle;
     }
     DescriptorEntry& entry = table.entries[index];
+    if (!entry.in_use && proc.resources != nullptr) {
+        size_t used = 0;
+        for (const auto& candidate : table.entries) {
+            used += candidate.in_use ? 1u : 0u;
+        }
+        if (used >= proc.resources->limits.max_descriptors) {
+            return kInvalidHandle;
+        }
+    }
     if (entry.in_use) {
         if (entry.close != nullptr) {
             entry.close(entry);
@@ -689,13 +715,20 @@ void service_waiters() {
     for (size_t i = 0; i < process::kMaxProcesses; ++i) {
         process::Process* proc = process::table_entry(i);
         if (proc == nullptr ||
-            process::load_state(*proc) != process::State::Blocked ||
             proc->wait_descriptor_count == 0) {
+            continue;
+        }
+        process::State state = process::load_state(*proc);
+        if (state != process::State::Blocked &&
+            !(state == process::State::Suspended &&
+              proc->suspended_from == process::State::Blocked)) {
             continue;
         }
 
         size_t count = static_cast<size_t>(proc->wait_descriptor_count);
-        int ready = evaluate_waits(proc->descriptors,
+        sync::LockGuard descriptor_guard(
+            proc->resources->descriptor_lock);
+        int ready = evaluate_waits(proc->resources->descriptors,
                                    proc->wait_descriptors,
                                    count);
         if (ready <= 0) {
@@ -766,7 +799,8 @@ uint32_t open_kernel(uint32_t type,
                      uint64_t arg1,
                      uint64_t arg2) {
     process::Process& proc = kernel_process();
-    return open(proc, proc.descriptors, type, arg0, arg1, arg2);
+    sync::LockGuard guard(proc.resources->descriptor_lock);
+    return open(proc, proc.resources->descriptors, type, arg0, arg1, arg2);
 }
 
 int64_t read_kernel(uint32_t handle,
@@ -774,8 +808,9 @@ int64_t read_kernel(uint32_t handle,
                     uint64_t length,
                     uint64_t offset) {
     process::Process& proc = kernel_process();
+    sync::LockGuard guard(proc.resources->descriptor_lock);
     return read(proc,
-                proc.descriptors,
+                proc.resources->descriptors,
                 handle,
                 reinterpret_cast<uint64_t>(buffer),
                 length,
@@ -787,8 +822,9 @@ int64_t write_kernel(uint32_t handle,
                      uint64_t length,
                      uint64_t offset) {
     process::Process& proc = kernel_process();
+    sync::LockGuard guard(proc.resources->descriptor_lock);
     return write(proc,
-                 proc.descriptors,
+                 proc.resources->descriptors,
                  handle,
                  reinterpret_cast<uint64_t>(buffer),
                  length,
@@ -797,7 +833,8 @@ int64_t write_kernel(uint32_t handle,
 
 bool close_kernel(uint32_t handle) {
     process::Process& proc = kernel_process();
-    return close(proc, proc.descriptors, handle);
+    sync::LockGuard guard(proc.resources->descriptor_lock);
+    return close(proc, proc.resources->descriptors, handle);
 }
 
 int get_property_kernel(uint32_t handle,
@@ -805,8 +842,9 @@ int get_property_kernel(uint32_t handle,
                         void* out,
                         uint64_t size) {
     process::Process& proc = kernel_process();
+    sync::LockGuard guard(proc.resources->descriptor_lock);
     return get_property(proc,
-                        proc.descriptors,
+                        proc.resources->descriptors,
                         handle,
                         property,
                         reinterpret_cast<uint64_t>(out),
@@ -818,8 +856,9 @@ int set_property_kernel(uint32_t handle,
                         const void* in,
                         uint64_t size) {
     process::Process& proc = kernel_process();
+    sync::LockGuard guard(proc.resources->descriptor_lock);
     return set_property(proc,
-                        proc.descriptors,
+                        proc.resources->descriptors,
                         handle,
                         property,
                         reinterpret_cast<uint64_t>(in),

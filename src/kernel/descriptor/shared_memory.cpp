@@ -113,7 +113,10 @@ bool map_segment_into_process(SharedSegment& segment,
         return false;
     }
     if (mapping.region.base == 0 || mapping.region.length == 0) {
-        mapping.region = vm::reserve_user_region(proc.cr3, segment.length);
+        mapping.region = vm::reserve_user_region(
+            proc.cr3,
+            segment.length,
+            vm::MappingKind::Shared);
         if (mapping.region.base == 0 || mapping.region.length < segment.length) {
             mapping.region = vm::Region{0, 0};
             return false;
@@ -139,8 +142,24 @@ bool map_segment_into_process(SharedSegment& segment,
                     mapping.region.base + (rollback * kPageSize),
                     ignored);
             }
+            vm::release_external_region(proc.cr3, mapping.region);
+            mapping.region = vm::Region{0, 0};
             return false;
         }
+    }
+    if (!vm::mark_region_resident(proc.cr3,
+                                  mapping.region,
+                                  segment.page_count)) {
+        for (size_t i = 0; i < segment.page_count; ++i) {
+            uint64_t ignored = 0;
+            (void)paging_unmap_page_cr3(
+                proc.cr3,
+                mapping.region.base + (i * kPageSize),
+                ignored);
+        }
+        vm::release_external_region(proc.cr3, mapping.region);
+        mapping.region = vm::Region{0, 0};
+        return false;
     }
     return true;
 }
@@ -156,6 +175,7 @@ void unmap_segment_from_process(SharedSegment& segment,
         uint64_t phys = 0;
         paging_unmap_page_cr3(proc.cr3, virt, phys);
     }
+    vm::release_external_region(proc.cr3, mapping.region);
 }
 
 void release_segment_pages(SharedSegment& segment) {

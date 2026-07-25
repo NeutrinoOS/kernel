@@ -511,7 +511,7 @@ bool open_vty(process::Process& proc,
         vty = find_vty(static_cast<uint32_t>(resource_selector));
         // Existing IDs locate a VTY but do not grant access to it. Only a
         // process that inherited or explicitly attached this VTY may reopen.
-        if (vty != nullptr && proc.vty_id != vty->id) {
+        if (vty != nullptr && proc.resources->vty_id != vty->id) {
             return false;
         }
     }
@@ -520,7 +520,7 @@ bool open_vty(process::Process& proc,
     }
     if ((open_context &
          static_cast<uint64_t>(descriptor_defs::VtyOpen::Attach)) != 0) {
-        proc.vty_id = vty->id;
+        proc.resources->vty_id = vty->id;
     }
     uint64_t flags = static_cast<uint64_t>(Flag::Readable) |
                      static_cast<uint64_t>(Flag::Writable);

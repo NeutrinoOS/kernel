@@ -20,6 +20,7 @@ enum class CapabilityKind : uint16_t {
     FileSystemWrite = 7,
     ModuleLoad = 8,
     GraphicalSession = 9,
+    ProcessControl = 10,
     Count,
 };
 

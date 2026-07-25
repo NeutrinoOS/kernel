@@ -29,6 +29,16 @@ private:
     volatile bool locked_{false};
 };
 
+class LockGuard {
+public:
+    explicit LockGuard(SpinLock& lock) : lock_(lock) { lock_.lock(); }
+    ~LockGuard() { lock_.unlock(); }
+    LockGuard(const LockGuard&) = delete;
+    LockGuard& operator=(const LockGuard&) = delete;
+private:
+    SpinLock& lock_;
+};
+
 class IrqLockGuard {
 public:
     explicit IrqLockGuard(SpinLock& lock) : lock_(lock), flags_(disable_interrupts()) {
