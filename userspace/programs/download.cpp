@@ -46,6 +46,9 @@ struct TrustStore {
     br_x509_trust_anchor* anchors = nullptr;
     size_t anchor_count = 0;
     size_t anchor_capacity = 0;
+    uint8_t* data = nullptr;
+    size_t data_size = 0;
+    size_t data_capacity = 0;
 };
 
 struct Stream {
@@ -260,6 +263,9 @@ bool buffer_reserve(Buffer& buffer, size_t required) {
     if (buffer.data != nullptr && buffer.size != 0) {
         memcpy(new_data, buffer.data, buffer.size);
     }
+    if (buffer.data != nullptr) {
+        unmap(buffer.data, buffer.capacity);
+    }
     buffer.data = new_data;
     buffer.capacity = new_capacity;
     return true;
@@ -279,6 +285,13 @@ bool buffer_append(Buffer& buffer, const void* data, size_t length) {
 
 void buffer_clear(Buffer& buffer) {
     buffer.size = 0;
+}
+
+void buffer_release(Buffer& buffer) {
+    if (buffer.data != nullptr) {
+        unmap(buffer.data, buffer.capacity);
+    }
+    buffer = {};
 }
 
 const char* skip_spaces(const char* text) {
@@ -758,11 +771,15 @@ int tcp_read_some(TcpConnection& conn, uint8_t* out, size_t capacity) {
     return static_cast<int>(available);
 }
 
-void* alloc_persistent_bytes(size_t size) {
-    if (size == 0) {
-        size = 1;
+void* trust_store_alloc(TrustStore& store, size_t size) {
+    if (size == 0 || store.data == nullptr ||
+        store.data_size > store.data_capacity ||
+        size > store.data_capacity - store.data_size) {
+        return nullptr;
     }
-    return map_anonymous(size, MAP_WRITE);
+    void* result = store.data + store.data_size;
+    store.data_size += size;
+    return result;
 }
 
 bool load_file(const char* path, Buffer& out) {
@@ -812,6 +829,10 @@ bool trust_store_reserve(TrustStore& store, size_t required) {
                store.anchors,
                store.anchor_count * sizeof(br_x509_trust_anchor));
     }
+    if (store.anchors != nullptr) {
+        unmap(store.anchors,
+              store.anchor_capacity * sizeof(br_x509_trust_anchor));
+    }
     store.anchors = new_anchors;
     store.anchor_capacity = new_capacity;
     return true;
@@ -845,21 +866,26 @@ bool append_trust_anchor_from_der(TrustStore& store, const uint8_t* der, size_t 
     br_x509_decoder_init(&decoder, dn_append, &dn);
     br_x509_decoder_push(&decoder, der, der_len);
     if (br_x509_decoder_last_error(&decoder) != 0) {
+        buffer_release(dn);
         return false;
     }
 
     br_x509_pkey* key = br_x509_decoder_get_pkey(&decoder);
     if (key == nullptr || dn.size == 0) {
+        buffer_release(dn);
         return false;
     }
     if (!trust_store_reserve(store, store.anchor_count + 1)) {
+        buffer_release(dn);
         return false;
     }
 
+    size_t data_start = store.data_size;
     br_x509_trust_anchor anchor{};
     anchor.flags = br_x509_decoder_isCA(&decoder) ? BR_X509_TA_CA : 0;
-    auto* dn_copy = static_cast<unsigned char*>(alloc_persistent_bytes(dn.size));
+    auto* dn_copy = static_cast<unsigned char*>(trust_store_alloc(store, dn.size));
     if (dn_copy == nullptr) {
+        buffer_release(dn);
         return false;
     }
     memcpy(dn_copy, dn.data, dn.size);
@@ -868,9 +894,13 @@ bool append_trust_anchor_from_der(TrustStore& store, const uint8_t* der, size_t 
     anchor.pkey.key_type = key->key_type;
 
     if (key->key_type == BR_KEYTYPE_RSA) {
-        auto* n_copy = static_cast<unsigned char*>(alloc_persistent_bytes(key->key.rsa.nlen));
-        auto* e_copy = static_cast<unsigned char*>(alloc_persistent_bytes(key->key.rsa.elen));
+        auto* n_copy = static_cast<unsigned char*>(
+            trust_store_alloc(store, key->key.rsa.nlen));
+        auto* e_copy = static_cast<unsigned char*>(
+            trust_store_alloc(store, key->key.rsa.elen));
         if (n_copy == nullptr || e_copy == nullptr) {
+            store.data_size = data_start;
+            buffer_release(dn);
             return false;
         }
         memcpy(n_copy, key->key.rsa.n, key->key.rsa.nlen);
@@ -880,8 +910,11 @@ bool append_trust_anchor_from_der(TrustStore& store, const uint8_t* der, size_t 
         anchor.pkey.key.rsa.e = e_copy;
         anchor.pkey.key.rsa.elen = key->key.rsa.elen;
     } else if (key->key_type == BR_KEYTYPE_EC) {
-        auto* q_copy = static_cast<unsigned char*>(alloc_persistent_bytes(key->key.ec.qlen));
+        auto* q_copy = static_cast<unsigned char*>(
+            trust_store_alloc(store, key->key.ec.qlen));
         if (q_copy == nullptr) {
+            store.data_size = data_start;
+            buffer_release(dn);
             return false;
         }
         memcpy(q_copy, key->key.ec.q, key->key.ec.qlen);
@@ -889,10 +922,13 @@ bool append_trust_anchor_from_der(TrustStore& store, const uint8_t* der, size_t 
         anchor.pkey.key.ec.q = q_copy;
         anchor.pkey.key.ec.qlen = key->key.ec.qlen;
     } else {
+        store.data_size = data_start;
+        buffer_release(dn);
         return false;
     }
 
     store.anchors[store.anchor_count++] = anchor;
+    buffer_release(dn);
     return true;
 }
 
@@ -903,6 +939,13 @@ bool load_trust_store(TrustStore& store) {
         !load_file("config/ssl/cacert.pem", pem_bytes)) {
         return false;
     }
+    store.data = static_cast<uint8_t*>(
+        map_anonymous(pem_bytes.size, MAP_WRITE));
+    if (store.data == nullptr) {
+        buffer_release(pem_bytes);
+        return false;
+    }
+    store.data_capacity = pem_bytes.size;
 
     br_pem_decoder_context pem{};
     br_pem_decoder_init(&pem);
@@ -943,6 +986,8 @@ bool load_trust_store(TrustStore& store) {
             br_pem_decoder_setdest(&pem, nullptr, nullptr);
         }
     }
+    buffer_release(pem_ctx.der);
+    buffer_release(pem_bytes);
     return store.anchor_count != 0;
 }
 
@@ -1059,8 +1104,17 @@ bool stream_write_all(Stream& stream, const uint8_t* data, size_t length) {
     if (!stream.tls) {
         return tcp_send_all(stream.tcp, data, length);
     }
-    return br_sslio_write_all(&stream.ssl_io, data, length) == 0 &&
-           br_sslio_flush(&stream.ssl_io) == 0;
+    int write_result = br_sslio_write_all(&stream.ssl_io, data, length);
+    int flush_result =
+        write_result == 0 ? br_sslio_flush(&stream.ssl_io) : write_result;
+    if (write_result != 0 || flush_result != 0) {
+        print("download: TLS error ");
+        print_u64(static_cast<uint64_t>(
+            br_ssl_engine_last_error(&stream.ssl_client.eng)));
+        print("\n");
+        return false;
+    }
+    return true;
 }
 
 bool stream_read_line(Stream& stream, char* out, size_t out_size) {
@@ -1431,7 +1485,7 @@ bool fetch_to_file(const char* url_text,
         // A TLS handshake can take long enough to look like a stalled package
         // download. Show the initial progress state before networking starts;
         // write_response_body() replaces it with byte progress after headers.
-        if (!options.quiet && !options.compact) {
+        if (!options.quiet) {
             print("download: [                    ] 0% connecting to ");
             print(url.host);
             print("...\n");

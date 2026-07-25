@@ -1105,7 +1105,7 @@ bool update_index() {
         }
         print("neupak: updating ");
         print_line(g_repos[i].name);
-        if (!run_download(g_repos[i].indexurl, path, true)) {
+        if (!run_download(g_repos[i].indexurl, path, false)) {
             print("neupak: failed to download ");
             print_line(g_repos[i].name);
             return false;
