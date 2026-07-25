@@ -1585,8 +1585,10 @@ int main(uint64_t, uint64_t) {
             ++wait_count;
         }
 
-        if (descriptor_wait(waits, wait_count) < 0) {
-            yield();
-        }
+        (void)descriptor_wait(waits, wait_count);
+        // Reply pipes without a current writer report readable EOF.  Yield
+        // after an immediate wait result so the descriptor-wait worker can
+        // run and wake networkd for newly queued control requests.
+        yield();
     }
 }

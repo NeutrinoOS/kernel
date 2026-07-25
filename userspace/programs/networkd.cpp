@@ -952,8 +952,10 @@ int main(uint64_t, uint64_t) {
         waits[1].events = descriptor_defs::kWaitRead;
         waits[1].revents = 0;
         waits[1].reserved = 0;
-        if (descriptor_wait(waits, 2) < 0) {
-            yield();
-        }
+        (void)descriptor_wait(waits, 2);
+        // A descriptor can be immediately readable because its peer closed.
+        // Yield even in that case so kernel waiter and device-poll workers are
+        // not starved by a service loop that otherwise never blocks.
+        yield();
     }
 }
