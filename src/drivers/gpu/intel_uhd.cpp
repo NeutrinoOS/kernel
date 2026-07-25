@@ -170,6 +170,42 @@ struct DriverState {
 
 DriverState g_state{};
 uint64_t g_map_next_virt = kMapVirtBase;
+bool g_disabled = false;
+
+bool is_cmdline_separator(char ch) {
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+}
+
+bool cmdline_has_token(const char* cmdline, const char* expected) {
+    if (cmdline == nullptr || expected == nullptr || expected[0] == '\0') {
+        return false;
+    }
+    size_t expected_length = 0;
+    while (expected[expected_length] != '\0') {
+        ++expected_length;
+    }
+    const char* cursor = cmdline;
+    while (*cursor != '\0') {
+        while (is_cmdline_separator(*cursor)) {
+            ++cursor;
+        }
+        const char* token = cursor;
+        while (*cursor != '\0' && !is_cmdline_separator(*cursor)) {
+            ++cursor;
+        }
+        size_t token_length = static_cast<size_t>(cursor - token);
+        if (token_length == expected_length) {
+            size_t i = 0;
+            while (i < expected_length && token[i] == expected[i]) {
+                ++i;
+            }
+            if (i == expected_length) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 uint64_t align_down_u64(uint64_t value, uint64_t alignment) {
     return value & ~(alignment - 1);
@@ -839,7 +875,18 @@ bool init_device(const pci::PciDevice& device) {
 
 }  // namespace
 
+void configure(const char* cmdline) {
+    g_disabled =
+        cmdline_has_token(cmdline, "INTEL_UHD=OFF") ||
+        cmdline_has_token(cmdline, "INTEL_UHD.DISABLE");
+}
+
 void register_driver() {
+    if (g_disabled) {
+        log_message(LogLevel::Info,
+                    "intel-uhd: disabled by kernel command line");
+        return;
+    }
     (void)driver_registry::register_pci_driver(
         "intel-uhd",
         kPciMatches,
@@ -860,7 +907,7 @@ KERNEL_BUILTIN_MODULE(intel_uhd_module,
                       sizeof(kPciMatches) / sizeof(kPciMatches[0]));
 
 void init() {
-    if (g_state.initialized) {
+    if (g_state.initialized || g_disabled) {
         return;
     }
 

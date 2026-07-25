@@ -63,6 +63,13 @@ The flags can be combined, such as `ACPI.NO_MODE ACPI.NO_NAMESPACE_INIT`, to
 keep firmware mode unchanged while loading the namespace without executing its
 initialization methods. The selected checkpoints are written to the kernel log.
 
+## Intel UHD diagnostic flag
+
+Add `INTEL_UHD=OFF` to the kernel command line to prevent the Intel UHD driver
+from binding and adopting the firmware-configured scanout. Neutrino continues
+using the framebuffer supplied by Limine. The alternate spelling
+`INTEL_UHD.DISABLE` is also accepted.
+
 ## Live network diagnostics
 
 The live ISO includes several tools for separating driver, DHCP, routing, DNS,
