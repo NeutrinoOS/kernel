@@ -1004,9 +1004,11 @@ bool package_cache_path(const char* package, char* out, size_t out_size) {
 
 bool derive_package_url(const char* indexurl,
                         const char* package,
+                        const char* sha256,
                         char* out,
                         size_t out_size) {
-    if (indexurl == nullptr || package == nullptr || !valid_name(package)) {
+    if (indexurl == nullptr || package == nullptr || !valid_name(package) ||
+        sha256 == nullptr || !valid_sha256_hex(sha256)) {
         return false;
     }
     size_t url_len = strlen(indexurl);
@@ -1025,7 +1027,9 @@ bool derive_package_url(const char* indexurl,
         }
     }
     return userspace::text::append_text(out, out_size, len, "/package/") &&
-           userspace::text::append_text(out, out_size, len, package);
+           userspace::text::append_text(out, out_size, len, package) &&
+           userspace::text::append_text(out, out_size, len, "?sha256=") &&
+           userspace::text::append_text(out, out_size, len, sha256);
 }
 
 bool run_download(const char* url, const char* output, bool quiet) {
@@ -1077,6 +1081,7 @@ bool load_indexes(PackageSet& set) {
                 set.packages[set.count++] = g_repo_set.packages[j];
                 if (!derive_package_url(g_repos[i].indexurl,
                                         set.packages[set.count - 1].package,
+                                        set.packages[set.count - 1].sha256,
                                         set.packages[set.count - 1].package_url,
                                         sizeof(set.packages[set.count - 1].package_url))) {
                     print("neupak: unable to derive package URL for ");
@@ -2068,8 +2073,19 @@ bool queue_contains(char names[kMaxInstallQueue][kMaxName], size_t count, const 
     return false;
 }
 
+bool installed_version_matches(const InstalledDb& installed, const Package& pkg) {
+    for (size_t i = 0; i < installed.count; ++i) {
+        if (strcmp(installed.packages[i].name, pkg.name) == 0) {
+            return strcmp(installed.packages[i].version, pkg.version) == 0;
+        }
+    }
+    return false;
+}
+
 bool add_install_with_deps(PackageSet& index,
                            const char* name,
+                           const InstalledDb& installed,
+                           bool is_dependency,
                            char queue[kMaxInstallQueue][kMaxName],
                            size_t& queue_count) {
     Package* pkg = find_package(index, name);
@@ -2078,11 +2094,19 @@ bool add_install_with_deps(PackageSet& index,
         print_line(name);
         return false;
     }
+    if (is_dependency && installed_version_matches(installed, *pkg)) {
+        return true;
+    }
     if (queue_contains(queue, queue_count, name)) {
         return true;
     }
     for (size_t i = 0; i < pkg->depends.count; ++i) {
-        if (!add_install_with_deps(index, pkg->depends.values[i], queue, queue_count)) {
+        if (!add_install_with_deps(index,
+                                   pkg->depends.values[i],
+                                   installed,
+                                   true,
+                                   queue,
+                                   queue_count)) {
             return false;
         }
     }
@@ -2399,8 +2423,17 @@ bool install_package(const char* name, bool force) {
         print_line("neupak: run `neupak update-index` first");
         return false;
     }
+    if (!load_installed(g_installed)) {
+        print_line("neupak: unable to read installed database");
+        return false;
+    }
     size_t queue_count = 0;
-    if (!add_install_with_deps(g_index, name, g_install_queue, queue_count)) {
+    if (!add_install_with_deps(g_index,
+                               name,
+                               g_installed,
+                               false,
+                               g_install_queue,
+                               queue_count)) {
         return false;
     }
     for (size_t i = 0; i < queue_count; ++i) {
