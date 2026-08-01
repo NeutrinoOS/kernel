@@ -24,10 +24,55 @@ CONFIG_DIR ?= config
 DEPENDENCY_ROOT ?=
 DEPENDENCY_INCLUDE_DIR ?= $(if $(DEPENDENCY_ROOT),$(DEPENDENCY_ROOT)/include,$(INCLUDE_DIR))
 DEPENDENCY_LIBRARY_DIR ?= $(if $(DEPENDENCY_ROOT),$(DEPENDENCY_ROOT)/library,$(LIB_DIR))
+NEWLIB_SOURCE_DIR ?= $(DEPS_DIR)/newlib-cygwin
+NEWLIB_PORT_DIR := newlib-port
+NEWLIB_BUILD_DIR := $(OBJ_DIR)/newlib-pie-build
+NEWLIB_CONFIG_STAMP := $(NEWLIB_BUILD_DIR)/.neutrino-multithread-configured
+NEWLIB_SYSROOT := $(OBJ_DIR)/newlib-pie-sysroot
+NEWLIB_TARGET := x86_64-elf
+NEWLIB_CC ?= $(NEWLIB_TARGET)-gcc
+NEWLIB_AR ?= $(NEWLIB_TARGET)-ar
+NEWLIB_RANLIB ?= $(NEWLIB_TARGET)-ranlib
+NEWLIB_JOBS ?= 4
+NEWLIB_INCLUDE_DIR := $(NEWLIB_SYSROOT)/$(NEWLIB_TARGET)/include
+NEWLIB_PLATFORM_INCLUDE_DIR := $(NEWLIB_SYSROOT)/include
+NEWLIB_LIBRARY_DIR := $(NEWLIB_SYSROOT)/$(NEWLIB_TARGET)/lib
+NEWLIB_LIBC := $(NEWLIB_LIBRARY_DIR)/libc.a
+NEWLIB_LIBM := $(NEWLIB_LIBRARY_DIR)/libm.a
+NEWLIB_LIBNEUTRINO := $(NEWLIB_LIBRARY_DIR)/libneutrino.a
+NEWLIB_CRT0 := $(NEWLIB_LIBRARY_DIR)/crt0.o
+FFMPEG_SIBLING_SOURCE_DIR := $(abspath ../../neutrino-packages/ffmpeg/src)
+FFMPEG_SOURCE_DIR ?= $(if $(wildcard $(FFMPEG_SIBLING_SOURCE_DIR)/configure),$(FFMPEG_SIBLING_SOURCE_DIR),$(DEPS_DIR)/ffmpeg)
+FFMPEG_BUILD_DIR ?= $(OBJ_DIR)/ffmpeg-minimal
+FFMPEG_THREAD_MODE ?= pthread
+NEWLIB_PLATFORM_HEADER_NAMES := dirent.h poll.h pthread.h sched.h stdatomic.h sys/ioctl.h \
+                               sys/mman.h time.h unistd.h
+NEWLIB_PLATFORM_HEADERS := $(addprefix $(NEWLIB_PLATFORM_INCLUDE_DIR)/,$(NEWLIB_PLATFORM_HEADER_NAMES))
+NEWLIB_PORT_OBJ_DIR := $(OBJ_DIR)/newlib-port
+NEWLIB_PROGRAM_OBJ_DIR := $(OBJ_DIR)/newlib-programs
+NEWLIB_PORT_OBJECTS := $(NEWLIB_PORT_OBJ_DIR)/start.o \
+                       $(NEWLIB_PORT_OBJ_DIR)/syscalls.o \
+                       $(NEWLIB_PORT_OBJ_DIR)/dirent.o \
+                       $(NEWLIB_PORT_OBJ_DIR)/pthread.o \
+                       $(NEWLIB_PORT_OBJ_DIR)/posix_compat.o
+NEWLIB_CFLAGS := -O2 -g -ffreestanding -fno-builtin \
+                 -fno-stack-protector -nostdlib -m64 -mno-red-zone \
+                 -mno-avx -mno-avx512f -fPIE -D_POSIX_THREADS=200809L
+NEWLIB_PORT_CFLAGS := $(NEWLIB_CFLAGS) -std=c11 -Wall -Wextra -Wpedantic \
+                      -I$(NEWLIB_PORT_DIR)/include \
+                      -isystem $(NEWLIB_INCLUDE_DIR) -I$(NEWLIB_PORT_DIR)
+NEWLIB_PROGRAM_CFLAGS := $(NEWLIB_CFLAGS) -std=c11 -Wall -Wextra -Wpedantic \
+                         -isystem $(NEWLIB_PLATFORM_INCLUDE_DIR) \
+                         -isystem $(NEWLIB_INCLUDE_DIR)
+NEWLIB_LINK_LIBS := -Wl,--start-group $(NEWLIB_LIBNEUTRINO) \
+                    $(NEWLIB_LIBC) $(NEWLIB_LIBM) -lgcc -Wl,--end-group
 
-# Every standalone source in programs/ is built and installed into /binary.
-# Adding a new command therefore only requires programs/<name>.cpp.
-DEFAULT_PROGRAMS := $(sort $(patsubst $(SRC_PROG_DIR)/%.cpp,%,$(wildcard $(SRC_PROG_DIR)/*.cpp)))
+# Every standalone C or C++ source in programs/ is built and installed into
+# /binary. C sources use the Newlib CRT; legacy C++ sources retain the original
+# runtime until they are migrated.
+DEFAULT_CPP_PROGRAMS := $(patsubst $(SRC_PROG_DIR)/%.cpp,%,$(wildcard $(SRC_PROG_DIR)/*.cpp))
+DEFAULT_C_PROGRAMS := $(patsubst $(SRC_PROG_DIR)/%.c,%,$(wildcard $(SRC_PROG_DIR)/*.c))
+DEFAULT_PROGRAMS := $(sort $(DEFAULT_CPP_PROGRAMS) $(DEFAULT_C_PROGRAMS))
 PROGRAMS ?= $(DEFAULT_PROGRAMS)
 PROGRAM_OUTPUTS := $(addprefix $(OUT_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
@@ -84,7 +129,7 @@ PROGRAM_HELPERS_neupak += args text
 PROGRAM_HELPERS_download += http
 PROGRAM_HELPERS_netget += http
 PROGRAM_DEPS_font += ../shared/include/TOSH-SAT.F14
-PROGRAM_DEPS_desktop += ../shared/include/font8x8_basic.hpp
+PROGRAM_DEPS_desktop += ../shared/include/font8x8_basic.hpp desktop_protocol.hpp
 PROGRAM_DEPS_networkd += net/ipv4.hpp net/network_protocol.hpp net/tcp.hpp net/udp.hpp
 PROGRAM_DEPS_tcpd += net/network_protocol.hpp net/tcp.hpp net/tcpd_protocol.hpp net/udp.hpp
 
@@ -95,8 +140,10 @@ MOUNT_GID ?= $(shell id -g)
 MOUNT_OPTS ?= loop,rw,uid=$(MOUNT_UID),gid=$(MOUNT_GID),umask=022
 RESET_USERS ?= 0
 
-.PHONY: all bearssl bearssl-shared clean install install-reset-users install-mount install-mtools
+.PHONY: all bearssl bearssl-shared clean ffmpeg-minimal ffmpeg-configure \
+        install install-reset-users install-mount install-mtools newlib-crt newlib-sdk
 .SECONDEXPANSION:
+.SECONDARY: $(addprefix $(NEWLIB_PROGRAM_OBJ_DIR)/,$(addsuffix .o,$(DEFAULT_C_PROGRAMS)))
 
 ifneq ($(filter clean,$(MAKECMDGOALS)),)
 .NOTPARALLEL:
@@ -170,8 +217,99 @@ $(BEARSSL_STAGED_SO_LINK): $(BEARSSL_SO)
 bearssl: $(BEARSSL_LIB)
 bearssl-shared: $(BEARSSL_SO) $(BEARSSL_SO_LINK) $(BEARSSL_STAGED_SO) $(BEARSSL_STAGED_SO_LINK) $(BEARSSL_STAGED_HEADERS)
 
+$(NEWLIB_SOURCE_DIR)/newlib/configure:
+	@echo "Newlib not found at $(NEWLIB_SOURCE_DIR)." >&2
+	@echo "Provide a Newlib checkout there before building the CRT." >&2
+	@false
+
+$(NEWLIB_CONFIG_STAMP): $(NEWLIB_SOURCE_DIR)/newlib/configure
+	@mkdir -p $(NEWLIB_BUILD_DIR)
+	cd $(NEWLIB_BUILD_DIR) && \
+		$(abspath $(NEWLIB_SOURCE_DIR)/newlib/configure) \
+			--host=$(NEWLIB_TARGET) \
+			--prefix=/ \
+			--disable-multilib \
+			--disable-newlib-supplied-syscalls \
+			--enable-newlib-multithread \
+			--enable-newlib-retargetable-locking \
+			--enable-newlib-io-c99-formats \
+			--enable-newlib-io-long-long \
+			--enable-newlib-register-fini \
+			CC=$(NEWLIB_CC) \
+			AR=$(NEWLIB_AR) \
+			RANLIB=$(NEWLIB_RANLIB) \
+			CFLAGS='-O2 -g -ffreestanding -fno-stack-protector -mno-red-zone -mno-avx -mno-avx512f -fPIE'
+	@touch $@
+
+$(NEWLIB_BUILD_DIR)/Makefile: $(NEWLIB_CONFIG_STAMP)
+	@test -f $@
+
+$(NEWLIB_LIBC) $(NEWLIB_LIBM) &: $(NEWLIB_BUILD_DIR)/Makefile
+	$(MAKE) -C $(NEWLIB_BUILD_DIR) -j$(NEWLIB_JOBS)
+	@mkdir -p $(NEWLIB_SYSROOT)
+	$(MAKE) -C $(NEWLIB_BUILD_DIR) DESTDIR=$(abspath $(NEWLIB_SYSROOT)) install
+
+$(NEWLIB_PORT_OBJ_DIR)/crt0.o: $(NEWLIB_PORT_DIR)/crt0.S | $(NEWLIB_PORT_OBJ_DIR)
+	$(NEWLIB_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+
+$(NEWLIB_PORT_OBJ_DIR)/start.o: $(NEWLIB_PORT_DIR)/start.c $(NEWLIB_LIBC) | $(NEWLIB_PORT_OBJ_DIR)
+	$(NEWLIB_CC) $(NEWLIB_PORT_CFLAGS) -c $< -o $@
+
+$(NEWLIB_PORT_OBJ_DIR)/syscalls.o: $(NEWLIB_PORT_DIR)/syscalls.c $(NEWLIB_PORT_DIR)/neutrino_syscall.h $(NEWLIB_LIBC) | $(NEWLIB_PORT_OBJ_DIR)
+	$(NEWLIB_CC) $(NEWLIB_PORT_CFLAGS) -c $< -o $@
+
+$(NEWLIB_PORT_OBJ_DIR)/dirent.o: $(NEWLIB_PORT_DIR)/dirent.c $(NEWLIB_PORT_DIR)/neutrino_syscall.h $(NEWLIB_PORT_DIR)/include/dirent.h $(NEWLIB_LIBC) | $(NEWLIB_PORT_OBJ_DIR)
+	$(NEWLIB_CC) $(NEWLIB_PORT_CFLAGS) -c $< -o $@
+
+$(NEWLIB_PORT_OBJ_DIR)/pthread.o: $(NEWLIB_PORT_DIR)/pthread.c $(NEWLIB_PORT_DIR)/neutrino_syscall.h $(NEWLIB_PORT_DIR)/include/pthread.h $(NEWLIB_LIBC) | $(NEWLIB_PORT_OBJ_DIR)
+	$(NEWLIB_CC) $(NEWLIB_PORT_CFLAGS) -c $< -o $@
+
+$(NEWLIB_PORT_OBJ_DIR)/posix_compat.o: $(NEWLIB_PORT_DIR)/posix_compat.c $(NEWLIB_PORT_DIR)/neutrino_syscall.h $(NEWLIB_LIBC) | $(NEWLIB_PORT_OBJ_DIR)
+	$(NEWLIB_CC) $(NEWLIB_PORT_CFLAGS) -c $< -o $@
+
+$(NEWLIB_CRT0): $(NEWLIB_PORT_OBJ_DIR)/crt0.o $(NEWLIB_LIBC)
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+$(NEWLIB_LIBNEUTRINO): $(NEWLIB_PORT_OBJECTS) $(NEWLIB_LIBC)
+	@mkdir -p $(dir $@)
+	$(NEWLIB_AR) rcs $@ $(NEWLIB_PORT_OBJECTS)
+
+$(NEWLIB_PLATFORM_INCLUDE_DIR)/%.h: $(NEWLIB_PORT_DIR)/include/%.h $(NEWLIB_LIBC)
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+$(NEWLIB_PORT_OBJ_DIR):
+	mkdir -p $@
+
+$(NEWLIB_PROGRAM_OBJ_DIR):
+	mkdir -p $@
+
+newlib-crt: $(NEWLIB_CRT0) $(NEWLIB_LIBNEUTRINO) $(NEWLIB_PLATFORM_HEADERS) $(NEWLIB_LIBC) $(NEWLIB_LIBM)
+newlib-sdk: newlib-crt
+
+ffmpeg-configure: newlib-sdk
+	bash $(NEWLIB_PORT_DIR)/configure-ffmpeg.sh \
+		$(FFMPEG_SOURCE_DIR) $(FFMPEG_BUILD_DIR) $(FFMPEG_THREAD_MODE)
+
+ffmpeg-minimal: ffmpeg-configure
+	$(MAKE) -C $(FFMPEG_BUILD_DIR) -j$(NEWLIB_JOBS) ffmpeg
+
 INSTALL_PREREQS := $(if $(filter clean,$(MAKECMDGOALS)),clean) all
 program_helper_objects = $(addprefix $(OBJ_DIR)/helper_,$(addsuffix .o,$(PROGRAM_HELPERS_$(1))))
+
+$(NEWLIB_PROGRAM_OBJ_DIR)/%.o: $(SRC_PROG_DIR)/%.c $(NEWLIB_CRT0) $(NEWLIB_LIBNEUTRINO) $(NEWLIB_PLATFORM_HEADERS) | $(NEWLIB_PROGRAM_OBJ_DIR)
+	$(NEWLIB_CC) $(NEWLIB_PROGRAM_CFLAGS) -c $< -o $@
+
+$(OUT_DIR)/%.elf: $(SRC_PROG_DIR)/%.c $(NEWLIB_PROGRAM_OBJ_DIR)/%.o $(NEWLIB_CRT0) $(NEWLIB_LIBNEUTRINO) $(NEWLIB_PLATFORM_HEADERS) $(NEWLIB_LIBC) $(NEWLIB_LIBM) Makefile | $(OUT_DIR)
+	@mkdir -p $(OUT_DIR) $(BIN_DIR)
+	$(NEWLIB_CC) $(NEWLIB_CFLAGS) -pie \
+		-Wl,--no-dynamic-linker,-z,noexecstack \
+		$(NEWLIB_CRT0) \
+		$(NEWLIB_PROGRAM_OBJ_DIR)/$*.o \
+		$(NEWLIB_LINK_LIBS) \
+		-o $@
+	@cp $@ $(BIN_DIR)/$*.elf
 
 $(OUT_DIR)/%.elf: $(SRC_PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $(CRT_DIR)/syscall.hpp $$(PROGRAM_DEPS_$$*) $$(PROGRAM_LIBS_$$*) $$(call program_helper_objects,$$*) | $(OUT_DIR)
 	@mkdir -p $(OUT_DIR) $(BIN_DIR)

@@ -1,0 +1,83 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+userspace_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+neutrino_sysroot=${NEUTRINO_SYSROOT:-"$userspace_dir/build/newlib-pie-sysroot"}
+neutrino_target=${NEUTRINO_TARGET:-x86_64-elf}
+neutrino_cc=${NEUTRINO_CROSS_CC:-"$neutrino_target-gcc"}
+target_root="$neutrino_sysroot/$neutrino_target"
+
+if [ "${1:-}" = "--print-sysroot" ]; then
+    printf '%s\n' "$target_root"
+    exit 0
+fi
+
+compile_only=0
+shared_link=0
+for argument in "$@"; do
+    case "$argument" in
+        -c|-E|-S|-M|-MM|--version|--help)
+            compile_only=1
+            ;;
+        -shared)
+            shared_link=1
+            ;;
+    esac
+done
+
+common_flags="
+    -ffreestanding
+    -fno-builtin
+    -fno-stack-protector
+    -nostdlib
+    -m64
+    -mno-red-zone
+    -mno-avx
+    -mno-avx512f
+    -fPIE
+"
+
+if [ "$compile_only" -eq 1 ]; then
+    # Word splitting is intentional for this fixed, whitespace-only flag list.
+    # shellcheck disable=SC2086
+    exec "$neutrino_cc" $common_flags \
+        -isystem "$neutrino_sysroot/include" \
+        -isystem "$target_root/include" \
+        "$@"
+fi
+
+if [ "$shared_link" -eq 1 ]; then
+    # Shared objects intentionally leave libc and Neutrino platform symbols
+    # for the executable's exported symbol table. Do not inject crt0 or a
+    # second copy of libc into each DSO.
+    # shellcheck disable=SC2086
+    exec "$neutrino_cc" $common_flags \
+        -isystem "$neutrino_sysroot/include" \
+        -isystem "$target_root/include" \
+        -L"$target_root/lib" -Wl,-shared,-z,noexecstack \
+        "$@" -lgcc
+fi
+
+crt0="$target_root/lib/crt0.o"
+platform_library="$target_root/lib/libneutrino.a"
+libc="$target_root/lib/libc.a"
+libm="$target_root/lib/libm.a"
+for required_file in "$crt0" "$platform_library" "$libc" "$libm"; do
+    if [ ! -f "$required_file" ]; then
+        printf 'neutrino-cc: missing %s\n' "$required_file" >&2
+        printf 'run: make -C %s newlib-crt\n' "$userspace_dir" >&2
+        exit 1
+    fi
+done
+
+# Word splitting is intentional for this fixed, whitespace-only flag list.
+# shellcheck disable=SC2086
+exec "$neutrino_cc" $common_flags \
+    -isystem "$neutrino_sysroot/include" \
+    -isystem "$target_root/include" \
+    -pie -Wl,--no-dynamic-linker,-z,noexecstack,-E \
+    "$crt0" "$@" \
+    -Wl,--start-group "$platform_library" "$libc" "$libm" -lgcc \
+    -Wl,--end-group

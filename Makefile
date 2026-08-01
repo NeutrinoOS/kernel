@@ -104,7 +104,7 @@ TARGET_ISO_RAMFS := $(OUT_DIR)/neutrino_ramfs.iso
 ISO_ROOT_RAMFS := $(OUT_DIR)/iso_root_ramfs
 LIVE_ROOTFS_IMG ?= $(OUT_DIR)/live_rootfs.img
 LIVE_ROOTFS_SIZE ?= 128M
-LIVE_ROOTFS_PROGRAMS ?= init shell desktop neupak download networkd tcpd dhcp netctl ping netget browse lspci sensors installer shutdown dmesg lsdisk mount mkneufs mkpart ls cat cp mv rm mkdir rmdir pwd echo clear touch sync date lsmod insmod
+LIVE_ROOTFS_PROGRAMS ?= init shell desktop neupak download networkd tcpd dhcp netctl ping netget browse lspci sensors installer shutdown dmesg lsdisk mount mkneufs mkpart ls cat cp mv rm mkdir rmdir pwd echo clear touch sync date wc sleep lsmod insmod
 LIVE_ROOTFS_CONFIG_DIR ?= config/live-base
 LIVE_ESP_IMG ?= $(OUT_DIR)/esp.img
 LIVE_ESP_SIZE ?= 64M
@@ -288,7 +288,7 @@ live-esp: $(LIVE_ESP_IMG)
 .PHONY: force-live-esp
 force-live-esp: $(LIVE_ESP_IMG)
 
-$(LIVE_ROOTFS_IMG): userspace/Makefile shared/include/TOSH-SAT.F14 $(KERNEL_MODULES) $(KERNEL_MODULE_LOADS) $(shell find userspace/programs userspace/crt userspace/libc userspace/config -type f 2>/dev/null)
+$(LIVE_ROOTFS_IMG): userspace/Makefile shared/include/TOSH-SAT.F14 $(KERNEL_MODULES) $(KERNEL_MODULE_LOADS) $(shell find userspace/programs userspace/crt userspace/libc userspace/newlib-port userspace/config -type f 2>/dev/null)
 	@mkdir -p $(dir $@)
 	rm -f $@
 	truncate -s $(LIVE_ROOTFS_SIZE) $@
