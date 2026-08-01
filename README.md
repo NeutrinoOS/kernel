@@ -119,6 +119,20 @@ from binding and adopting the firmware-configured scanout. Neutrino continues
 using the framebuffer supplied by Limine. The alternate spelling
 `INTEL_UHD.DISABLE` is also accepted.
 
+## Desktop
+
+The `desktop` program is a small compositor and window manager. It owns the
+graphical session, composites application-owned ARGB surfaces through the
+desktop pipe protocol, and presents only the framebuffer rectangle damaged by
+an application, cursor movement, or window movement.
+
+Appearance and the taskbar launcher are configured in
+`/config/desktop.cfg`. Click a window to focus it, drag its title bar to move
+it, drag its bottom-right grip to resize it, and use its red title-bar button
+to request that it close. The launcher button starts its configured
+application; F12 exits the desktop. The `doomgeneric` package supports the
+protocol and retains fullscreen fallback when no desktop is running.
+
 ## Live network diagnostics
 
 The live ISO includes several tools for separating driver, DHCP, routing, DNS,
