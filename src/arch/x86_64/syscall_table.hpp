@@ -90,6 +90,15 @@ enum class SystemCall : uint64_t {
     ProcessGetLimits     = 80,
     ProcessGetUsage      = 81,
     ProcessTrace         = 82,
+    FileOpenFlags        = 83,
+    FileSeek             = 84,
+    FileStat             = 85,
+    PathStat             = 86,
+    FileReadAt           = 87,
+    ClockGet             = 88,
+    ThreadDetach         = 89,
+    FutexWaitTimed       = 90,
+    ProtectMemory        = 91,
 };
 
 Result handle_syscall(SyscallFrame& frame);

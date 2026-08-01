@@ -272,7 +272,7 @@ Vty* allocate_vty() {
     return selected;
 }
 
-int64_t vty_read(process::Process& proc,
+int64_t vty_read(process::Task& proc,
                  DescriptorEntry& entry,
                  uint64_t user_address,
                  uint64_t length,
@@ -318,7 +318,7 @@ int64_t vty_read(process::Process& proc,
     return static_cast<int64_t>(total);
 }
 
-int64_t vty_write(process::Process& proc,
+int64_t vty_write(process::Task& proc,
                   DescriptorEntry& entry,
                   uint64_t user_address,
                   uint64_t length,
@@ -499,7 +499,7 @@ bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents) {
     return true;
 }
 
-bool open_vty(process::Process& proc,
+bool open_vty(process::Task& proc,
               uint64_t resource_selector,
               uint64_t requested_flags,
               uint64_t open_context,

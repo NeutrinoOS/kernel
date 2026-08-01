@@ -6,7 +6,7 @@ namespace descriptor {
 
 namespace descriptor_keyboard {
 
-int64_t keyboard_read(process::Process& proc,
+int64_t keyboard_read(process::Task& proc,
                       DescriptorEntry& entry,
                       uint64_t user_address,
                       uint64_t length,
@@ -41,7 +41,7 @@ int64_t keyboard_read(process::Process& proc,
     return static_cast<int64_t>(read_count * sizeof(descriptor_defs::KeyboardEvent));
 }
 
-int64_t keyboard_write(process::Process&,
+int64_t keyboard_write(process::Task&,
                        DescriptorEntry&,
                        uint64_t,
                        uint64_t,
@@ -56,7 +56,7 @@ const Ops kKeyboardOps{
     .set_property = nullptr,
 };
 
-bool open_keyboard(process::Process& proc,
+bool open_keyboard(process::Task& proc,
                    uint64_t,
                    uint64_t,
                    uint64_t,

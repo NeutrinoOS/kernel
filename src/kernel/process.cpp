@@ -5,16 +5,18 @@
 #include "arch/x86_64/memory/paging.hpp"
 #include "capabilities.hpp"
 #include "drivers/log/logging.hpp"
+#include "error.hpp"
 #include "lib/mem.hpp"
 #include "scheduler.hpp"
 #include "string_util.hpp"
 #include "sync.hpp"
+#include "time.hpp"
 
 namespace {
 
-process::Process g_process_table[process::kMaxProcesses];
-alignas(16) uint8_t g_kernel_stacks[process::kMaxProcesses][process::kKernelStackSize];
-uint32_t g_next_pid = 1;
+process::Task g_task_table[process::kMaxTasks];
+alignas(16) uint8_t g_kernel_stacks[process::kMaxTasks][process::kKernelStackSize];
+uint32_t g_next_tid = 1;
 bool g_init_pid_reserved = true;
 sync::SpinLock g_address_space_lock;
 sync::SpinLock g_resource_pool_lock;
@@ -29,7 +31,7 @@ struct Session {
     bool in_use;
 };
 
-Session g_sessions[process::kMaxProcesses]{};
+Session g_sessions[process::kMaxTasks]{};
 
 constexpr uint32_t kInitPid = 1;
 
@@ -48,17 +50,17 @@ struct AddressSpace {
 
 namespace {
 
-process::AddressSpace g_address_spaces[process::kMaxProcesses]{};
-process::ProcessResources g_process_resources[process::kMaxProcesses]{};
+process::AddressSpace g_address_spaces[process::kMaxTasks]{};
+process::ProcessResources g_process_resources[process::kMaxTasks]{};
 
-bool running_on_process_stack(const process::Process& proc) {
+bool running_on_task_stack(const process::Task& proc) {
     uint64_t rsp = 0;
     asm volatile("mov %%rsp, %0" : "=r"(rsp));
     return rsp >= proc.kernel_stack_base && rsp < proc.kernel_stack_top;
 }
 
-void reset_process_resources(process::Process& proc) {
-    proc.process_id = 0;
+void reset_task(process::Task& proc) {
+    proc.pid = 0;
     proc.address_space = nullptr;
     proc.resources = nullptr;
     proc.fs_base = 0;
@@ -153,7 +155,7 @@ bool retain_shared_resources(process::ProcessResources* resources) {
     return true;
 }
 
-void release_shared_resources(process::Process& proc) {
+void release_shared_resources(process::Task& proc) {
     process::ProcessResources* resources = proc.resources;
     if (resources == nullptr) {
         return;
@@ -243,44 +245,44 @@ void release_address_space(process::AddressSpace* space) {
     paging_destroy_address_space(cr3);
 }
 
-bool pid_in_use(uint32_t pid) {
-    if (pid == 0) {
+bool tid_in_use(uint32_t tid) {
+    if (tid == 0) {
         return true;
     }
-    for (size_t i = 0; i < process::kMaxProcesses; ++i) {
-        const process::Process& proc = g_process_table[i];
+    for (size_t i = 0; i < process::kMaxTasks; ++i) {
+        const process::Task& proc = g_task_table[i];
         process::State state = process::load_state(proc);
         if (state != process::State::Unused &&
-            (proc.pid == pid || proc.process_id == pid)) {
+            (proc.tid == tid || proc.pid == tid)) {
             return true;
         }
     }
     return false;
 }
 
-uint32_t allocate_pid() {
+uint32_t allocate_tid() {
     for (uint32_t attempts = 0; attempts < UINT32_MAX; ++attempts) {
-        uint32_t pid = __atomic_fetch_add(&g_next_pid,
+        uint32_t tid = __atomic_fetch_add(&g_next_tid,
                                           uint32_t{1},
                                           __ATOMIC_RELAXED);
-        if (pid == 0 ||
+        if (tid == 0 ||
             (__atomic_load_n(&g_init_pid_reserved, __ATOMIC_ACQUIRE) &&
-             pid == kInitPid)) {
+             tid == kInitPid)) {
             continue;
         }
-        if (!pid_in_use(pid)) {
-            return pid;
+        if (!tid_in_use(tid)) {
+            return tid;
         }
     }
     return 0;
 }
 
-process::Process* allocate_slot(uint32_t pid) {
-    if (pid == 0 || pid_in_use(pid)) {
+process::Task* allocate_slot(uint32_t tid) {
+    if (tid == 0 || tid_in_use(tid)) {
         return nullptr;
     }
-    for (size_t i = 0; i < process::kMaxProcesses; ++i) {
-        process::Process& proc = g_process_table[i];
+    for (size_t i = 0; i < process::kMaxTasks; ++i) {
+        process::Task& proc = g_task_table[i];
         process::State expected = process::State::Unused;
         if (!process::compare_exchange_state(proc,
                                              expected,
@@ -288,8 +290,8 @@ process::Process* allocate_slot(uint32_t pid) {
             continue;
         }
         memset(&proc.context, 0, sizeof(proc.context));
-        reset_process_resources(proc);
-        proc.pid = pid;
+        reset_task(proc);
+        proc.tid = tid;
         return &proc;
     }
     return nullptr;
@@ -300,29 +302,29 @@ process::Process* allocate_slot(uint32_t pid) {
 namespace process {
 
 void init() {
-    memset(g_process_table, 0, sizeof(g_process_table));
+    memset(g_task_table, 0, sizeof(g_task_table));
     memset(g_address_spaces, 0, sizeof(g_address_spaces));
     memset(g_process_resources, 0, sizeof(g_process_resources));
     memset(g_sessions, 0, sizeof(g_sessions));
-    g_next_pid = 1;
+    g_next_tid = 1;
     g_init_pid_reserved = true;
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        store_state(g_process_table[i], State::Unused);
-        g_process_table[i].has_context = false;
-        g_process_table[i].is_kernel_task = false;
-        g_process_table[i].kernel_entry = nullptr;
-        g_process_table[i].pid = 0;
-        g_process_table[i].cr3 = paging_kernel_cr3();
-        g_process_table[i].kernel_stack_base =
+    for (size_t i = 0; i < kMaxTasks; ++i) {
+        store_state(g_task_table[i], State::Unused);
+        g_task_table[i].has_context = false;
+        g_task_table[i].is_kernel_task = false;
+        g_task_table[i].kernel_entry = nullptr;
+        g_task_table[i].tid = 0;
+        g_task_table[i].cr3 = paging_kernel_cr3();
+        g_task_table[i].kernel_stack_base =
             reinterpret_cast<uint64_t>(&g_kernel_stacks[i][0]);
-        g_process_table[i].kernel_stack_top =
-            g_process_table[i].kernel_stack_base + kKernelStackSize;
-        g_process_table[i].kernel_stack_top &= ~0xFULL;
-        reset_process_resources(g_process_table[i]);
+        g_task_table[i].kernel_stack_top =
+            g_task_table[i].kernel_stack_base + kKernelStackSize;
+        g_task_table[i].kernel_stack_top &= ~0xFULL;
+        reset_task(g_task_table[i]);
     }
 }
 
-bool attach_new_resources(Process& proc) {
+bool attach_new_resources(Task& proc) {
     ProcessResources* selected = nullptr;
     {
         sync::IrqLockGuard guard(g_resource_pool_lock);
@@ -339,30 +341,30 @@ bool attach_new_resources(Process& proc) {
         return false;
     }
     initialize_shared_resources(*selected);
-    selected->process_group_id = proc.pid;
-    selected->session_id = proc.pid;
+    selected->process_group_id = proc.tid;
+    selected->session_id = proc.tid;
     proc.resources = selected;
     return true;
 }
 
-Process* allocate() {
-    Process* proc = allocate_slot(allocate_pid());
+Task* allocate() {
+    Task* proc = allocate_slot(allocate_tid());
     if (proc == nullptr) {
         return nullptr;
     }
     AddressSpace* space = create_address_space();
     if (space == nullptr) {
-        proc->pid = 0;
+        proc->tid = 0;
         store_state(*proc, State::Unused);
         return nullptr;
     }
-    proc->process_id = proc->pid;
+    proc->pid = proc->tid;
     proc->address_space = space;
     proc->cr3 = space->cr3;
     if (!attach_new_resources(*proc)) {
         release_address_space(space);
-        proc->pid = 0;
-        reset_process_resources(*proc);
+        proc->tid = 0;
+        reset_task(*proc);
         store_state(*proc, State::Unused);
         return nullptr;
     }
@@ -370,45 +372,45 @@ Process* allocate() {
     return proc;
 }
 
-Process* allocate_init_task() {
+Task* allocate_init_task() {
     if (!__atomic_load_n(&g_init_pid_reserved, __ATOMIC_ACQUIRE) ||
-        pid_in_use(kInitPid)) {
+        tid_in_use(kInitPid)) {
         return nullptr;
     }
-    Process* proc = allocate_slot(kInitPid);
+    Task* proc = allocate_slot(kInitPid);
     if (proc == nullptr) {
         return nullptr;
     }
     AddressSpace* space = create_address_space();
     if (space == nullptr) {
-        proc->pid = 0;
+        proc->tid = 0;
         store_state(*proc, State::Unused);
         return nullptr;
     }
-    proc->process_id = proc->pid;
+    proc->pid = proc->tid;
     proc->address_space = space;
     proc->cr3 = space->cr3;
     if (!attach_new_resources(*proc)) {
         release_address_space(space);
-        proc->pid = 0;
-        reset_process_resources(*proc);
+        proc->tid = 0;
+        reset_task(*proc);
         store_state(*proc, State::Unused);
         return nullptr;
     }
     if (!create_session(*proc)) {
         release_shared_resources(*proc);
         release_address_space(space);
-        proc->pid = 0;
-        reset_process_resources(*proc);
+        proc->tid = 0;
+        reset_task(*proc);
         store_state(*proc, State::Unused);
         return nullptr;
     }
     store_state(*proc, State::Ready);
     __atomic_store_n(&g_init_pid_reserved, false, __ATOMIC_RELEASE);
-    uint32_t next_pid = __atomic_load_n(&g_next_pid, __ATOMIC_RELAXED);
-    while (next_pid <= kInitPid &&
-           !__atomic_compare_exchange_n(&g_next_pid,
-                                        &next_pid,
+    uint32_t next_tid = __atomic_load_n(&g_next_tid, __ATOMIC_RELAXED);
+    while (next_tid <= kInitPid &&
+           !__atomic_compare_exchange_n(&g_next_tid,
+                                        &next_tid,
                                         kInitPid + 1,
                                         false,
                                         __ATOMIC_RELAXED,
@@ -417,11 +419,11 @@ Process* allocate_init_task() {
     return proc;
 }
 
-Process* create_user_thread(Process& owner,
-                            uint64_t entry,
-                            uint64_t argument,
-                            size_t stack_size,
-                            uint64_t tls_base) {
+Task* create_user_thread(Task& owner,
+                         uint64_t entry,
+                         uint64_t argument,
+                         size_t stack_size,
+                         uint64_t tls_base) {
     if (owner.is_kernel_task || owner.address_space == nullptr ||
         owner.cr3 == 0 || !vm::is_user_range(entry, 1) ||
         (tls_base != 0 && !vm::is_user_range(tls_base, 1))) {
@@ -448,7 +450,7 @@ Process* create_user_thread(Process& owner,
         return nullptr;
     }
 
-    Process* thread = allocate_slot(allocate_pid());
+    Task* thread = allocate_slot(allocate_tid());
     if (thread == nullptr) {
         return nullptr;
     }
@@ -457,20 +459,20 @@ Process* create_user_thread(Process& owner,
         AddressSpace* space = owner.address_space;
         if (!space->in_use || space->exiting ||
             space->refcount == UINT32_MAX) {
-            thread->pid = 0;
+            thread->tid = 0;
             store_state(*thread, State::Unused);
             return nullptr;
         }
         ++space->refcount;
-        thread->process_id =
-            owner.process_id != 0 ? owner.process_id : owner.pid;
+        thread->pid =
+            owner.pid != 0 ? owner.pid : owner.tid;
         thread->address_space = space;
         thread->cr3 = space->cr3;
     }
     if (!retain_shared_resources(owner.resources)) {
         release_address_space(thread->address_space);
-        thread->pid = 0;
-        reset_process_resources(*thread);
+        thread->tid = 0;
+        reset_task(*thread);
         store_state(*thread, State::Unused);
         return nullptr;
     }
@@ -486,8 +488,8 @@ Process* create_user_thread(Process& owner,
     if (thread->stack_region.top == 0) {
         release_shared_resources(*thread);
         release_address_space(thread->address_space);
-        thread->pid = 0;
-        reset_process_resources(*thread);
+        thread->tid = 0;
+        reset_task(*thread);
         store_state(*thread, State::Unused);
         return nullptr;
     }
@@ -506,15 +508,15 @@ Process* create_user_thread(Process& owner,
     scheduler::enqueue(thread);
     log_message(LogLevel::Debug,
                 "Thread: created tid=%u pid=%u entry=%016llx stack=%016llx..%016llx",
+                static_cast<unsigned int>(thread->tid),
                 static_cast<unsigned int>(thread->pid),
-                static_cast<unsigned int>(thread->process_id),
                 static_cast<unsigned long long>(thread->user_ip),
                 static_cast<unsigned long long>(thread->stack_region.base),
                 static_cast<unsigned long long>(thread->stack_region.top));
     return thread;
 }
 
-bool set_thread_tls(Process& thread, uint64_t fs_base) {
+bool set_thread_tls(Task& thread, uint64_t fs_base) {
     if (fs_base != 0 && !vm::is_user_range(fs_base, 1)) {
         return false;
     }
@@ -525,12 +527,12 @@ bool set_thread_tls(Process& thread, uint64_t fs_base) {
     return true;
 }
 
-Process* current() {
-    return percpu::get_current_process();
+Task* current() {
+    return percpu::get_current_task();
 }
 
-void set_current(Process* proc) {
-    percpu::set_current_process(proc);
+void set_current(Task* proc) {
+    percpu::set_current_task(proc);
     if (proc != nullptr) {
         uint64_t target_cr3 =
             (proc->cr3 != 0) ? proc->cr3 : paging_kernel_cr3();
@@ -541,20 +543,20 @@ void set_current(Process* proc) {
     }
 }
 
-Process* table_entry(size_t index) {
-    if (index >= kMaxProcesses) {
+Task* task_table_entry(size_t index) {
+    if (index >= kMaxTasks) {
         return nullptr;
     }
-    return &g_process_table[index];
+    return &g_task_table[index];
 }
 
-Process* find_by_pid(uint32_t pid) {
-    if (pid == 0) {
+Task* find_by_tid(uint32_t tid) {
+    if (tid == 0) {
         return nullptr;
     }
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        Process& p = g_process_table[i];
-        if (load_state(p) != State::Unused && p.pid == pid) {
+    for (size_t i = 0; i < kMaxTasks; ++i) {
+        Task& p = g_task_table[i];
+        if (load_state(p) != State::Unused && p.tid == tid) {
             return &p;
         }
     }
@@ -562,7 +564,7 @@ Process* find_by_pid(uint32_t pid) {
 }
 
 void record_tick(bool user_mode) {
-    Process* proc = current();
+    Task* proc = current();
     if (proc == nullptr) {
         return;
     }
@@ -590,15 +592,15 @@ size_t usage_snapshot(descriptor_defs::TaskUsage* out, size_t max_entries) {
     }
 
     size_t written = 0;
-    for (size_t i = 0; i < kMaxProcesses && written < max_entries; ++i) {
-        const Process& proc = g_process_table[i];
+    for (size_t i = 0; i < kMaxTasks && written < max_entries; ++i) {
+        const Task& proc = g_task_table[i];
         State state = load_state(proc);
-        if (state == State::Unused || proc.pid == 0) {
+        if (state == State::Unused || proc.tid == 0) {
             continue;
         }
 
         descriptor_defs::TaskUsage& snapshot = out[written++];
-        snapshot.pid = proc.pid;
+        snapshot.pid = proc.tid;
         snapshot.parent_pid =
             proc.resources != nullptr
                 ? proc.resources->parent_process_id
@@ -615,7 +617,7 @@ size_t usage_snapshot(descriptor_defs::TaskUsage* out, size_t max_entries) {
             snapshot.flags |= descriptor_defs::kTaskStatFlagThread;
         }
         snapshot.preferred_cpu = proc.preferred_cpu;
-        snapshot.process_id = proc.process_id;
+        snapshot.process_id = proc.pid;
         snapshot.user_ticks = proc.user_ticks;
         snapshot.kernel_ticks = proc.kernel_ticks;
         vm::Usage memory_usage = vm::usage(proc.cr3);
@@ -631,8 +633,8 @@ size_t usage_snapshot(descriptor_defs::TaskUsage* out, size_t max_entries) {
 }
 
 void wake_ready_sleepers(uint64_t current_tick) {
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        Process& proc = g_process_table[i];
+    for (size_t i = 0; i < kMaxTasks; ++i) {
+        Task& proc = g_task_table[i];
         State state = load_state(proc);
         if ((state != State::Blocked &&
              !(state == State::Suspended &&
@@ -644,11 +646,15 @@ void wake_ready_sleepers(uint64_t current_tick) {
             continue;
         }
         proc.sleep_until_tick = 0;
-        (void)wake(proc);
+        if (proc.wait_reason == WaitReason::Futex) {
+            (void)wake_with_result(proc, -3);
+        } else {
+            (void)wake(proc);
+        }
     }
 }
 
-bool wake(Process& proc) {
+bool wake(Task& proc) {
     if (load_state(proc) == State::Suspended &&
         proc.suspended_from == State::Blocked) {
         proc.waiting_on = nullptr;
@@ -663,7 +669,7 @@ bool wake(Process& proc) {
     return true;
 }
 
-bool begin_wake(Process& proc) {
+bool begin_wake(Task& proc) {
     State expected = State::Blocked;
     if (!compare_exchange_state(proc, expected, State::Waking)) {
         return false;
@@ -671,20 +677,20 @@ bool begin_wake(Process& proc) {
     return true;
 }
 
-void finish_wake(Process& proc) {
+void finish_wake(Task& proc) {
     proc.waiting_on = nullptr;
     proc.wait_reason = WaitReason::None;
     store_state(proc, State::Ready);
     scheduler::enqueue(&proc);
 }
 
-void finish_wake_with_result(Process& proc, int64_t result) {
+void finish_wake_with_result(Task& proc, int64_t result) {
     proc.wait_result = result;
     __atomic_store_n(&proc.wait_result_pending, true, __ATOMIC_RELEASE);
     finish_wake(proc);
 }
 
-bool wake_with_result(Process& proc, int64_t result) {
+bool wake_with_result(Task& proc, int64_t result) {
     if (load_state(proc) == State::Suspended &&
         proc.suspended_from == State::Blocked) {
         proc.wait_result = result;
@@ -703,7 +709,7 @@ bool wake_with_result(Process& proc, int64_t result) {
     return true;
 }
 
-void terminate(Process& proc, uint16_t exit_code) {
+void terminate(Task& proc, uint16_t exit_code) {
     State state = load_state(proc);
     for (;;) {
         if (state == State::Waking) {
@@ -724,11 +730,11 @@ void terminate(Process& proc, uint16_t exit_code) {
     if (proc.is_thread) {
         log_message(LogLevel::Debug,
                     "Thread: tid=%u exited code=%u",
-                    static_cast<unsigned int>(proc.pid),
+                    static_cast<unsigned int>(proc.tid),
                     static_cast<unsigned int>(exit_code));
     }
 
-    Process* thread_joiner = nullptr;
+    Task* thread_joiner = nullptr;
     {
         sync::IrqLockGuard guard(g_thread_lock);
         if (proc.is_thread && proc.thread_join_claimed) {
@@ -742,7 +748,7 @@ void terminate(Process& proc, uint16_t exit_code) {
         (void)wake_with_result(*thread_joiner, proc.exit_code);
     }
 
-    Process* parent = proc.parent;
+    Task* parent = proc.parent;
     if (parent != nullptr && parent->waiting_on == &proc) {
         {
             sync::IrqLockGuard guard(g_child_lock);
@@ -758,18 +764,18 @@ void terminate(Process& proc, uint16_t exit_code) {
         proc.parent = nullptr;
     } else if (!proc.is_thread && proc.resources != nullptr) {
         sync::IrqLockGuard guard(g_child_lock);
-        for (size_t i = 0; i < kMaxProcesses; ++i) {
-            Process& waiter = g_process_table[i];
-            if (waiter.process_id != proc.resources->parent_process_id ||
+        for (size_t i = 0; i < kMaxTasks; ++i) {
+            Task& waiter = g_task_table[i];
+            if (waiter.pid != proc.resources->parent_process_id ||
                 waiter.wait_reason != WaitReason::Child ||
                 (waiter.wait_child_pid != 0 &&
-                 waiter.wait_child_pid != proc.pid)) {
+                 waiter.wait_child_pid != proc.tid)) {
                 continue;
             }
             proc.child_wait_claimed = true;
             proc.parent = nullptr;
             uint64_t result =
-                (static_cast<uint64_t>(proc.pid) << 16) | proc.exit_code;
+                (static_cast<uint64_t>(proc.tid) << 16) | proc.exit_code;
             (void)wake_with_result(waiter,
                                    static_cast<int64_t>(result));
             break;
@@ -777,9 +783,9 @@ void terminate(Process& proc, uint16_t exit_code) {
     }
 }
 
-void terminate_group(Process& proc, uint16_t exit_code) {
+void terminate_group(Task& proc, uint16_t exit_code) {
     const uint32_t process_id =
-        proc.process_id != 0 ? proc.process_id : proc.pid;
+        proc.pid != 0 ? proc.pid : proc.tid;
     if (proc.address_space != nullptr) {
         sync::IrqLockGuard guard(g_address_space_lock);
         if (proc.address_space->in_use) {
@@ -787,9 +793,9 @@ void terminate_group(Process& proc, uint16_t exit_code) {
         }
     }
 
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        Process& member = g_process_table[i];
-        if (&member == &proc || member.process_id != process_id ||
+    for (size_t i = 0; i < kMaxTasks; ++i) {
+        Task& member = g_task_table[i];
+        if (&member == &proc || member.pid != process_id ||
             load_state(member) == State::Unused) {
             continue;
         }
@@ -806,23 +812,23 @@ void terminate_group(Process& proc, uint16_t exit_code) {
     terminate(proc, exit_code);
 }
 
-bool join_thread(Process& caller,
+bool join_thread(Task& caller,
                  uint32_t thread_id,
                  int64_t& immediate_result,
                  bool& blocked) {
     immediate_result = -1;
     blocked = false;
-    if (thread_id == 0 || thread_id == caller.pid) {
+    if (thread_id == 0 || thread_id == caller.tid) {
         return false;
     }
 
-    Process* target = nullptr;
+    Task* target = nullptr;
     bool arm_reclaim = false;
     {
         sync::IrqLockGuard guard(g_thread_lock);
-        target = find_by_pid(thread_id);
+        target = find_by_tid(thread_id);
         if (target == nullptr || !target->is_thread ||
-            target->process_id != caller.process_id ||
+            target->pid != caller.pid ||
             target->thread_join_claimed) {
             return false;
         }
@@ -848,16 +854,39 @@ bool join_thread(Process& caller,
     return true;
 }
 
-int64_t wait_child(Process& caller,
+bool detach_thread(Task& caller, uint32_t thread_id) {
+    if (thread_id == 0) return false;
+    Task* target = nullptr;
+    bool arm_reclaim = false;
+    {
+        sync::IrqLockGuard guard(g_thread_lock);
+        target = find_by_tid(thread_id);
+        if (target == nullptr || !target->is_thread ||
+            target->pid != caller.pid ||
+            target->thread_join_claimed) {
+            return false;
+        }
+        target->thread_join_claimed = true;
+        arm_reclaim = load_state(*target) == State::Terminated &&
+            __atomic_load_n(&target->reclaim_cpu, __ATOMIC_ACQUIRE) !=
+                UINT32_MAX;
+    }
+    if (arm_reclaim) {
+        __atomic_store_n(&target->reclaim_pending, true, __ATOMIC_RELEASE);
+    }
+    return true;
+}
+
+int64_t wait_child(Task& caller,
                    uint32_t child_pid,
                    bool nonblocking) {
     sync::IrqLockGuard guard(g_child_lock);
     bool found_child = false;
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        Process& child = g_process_table[i];
+    for (size_t i = 0; i < kMaxTasks; ++i) {
+        Task& child = g_task_table[i];
         if (child.is_thread || child.resources == nullptr ||
-            child.resources->parent_process_id != caller.process_id ||
-            (child_pid != 0 && child.pid != child_pid) ||
+            child.resources->parent_process_id != caller.pid ||
+            (child_pid != 0 && child.tid != child_pid) ||
             child.child_wait_claimed) {
             continue;
         }
@@ -874,7 +903,7 @@ int64_t wait_child(Process& caller,
                              __ATOMIC_RELEASE);
         }
         return static_cast<int64_t>(
-            (static_cast<uint64_t>(child.pid) << 16) | child.exit_code);
+            (static_cast<uint64_t>(child.tid) << 16) | child.exit_code);
     }
     if (!found_child || nonblocking) {
         return found_child ? -2 : -1;
@@ -886,27 +915,31 @@ int64_t wait_child(Process& caller,
     return 0;
 }
 
-bool send_event(Process& sender,
+bool send_event(Task& sender,
                 uint32_t target_pid,
                 const ProcessEvent& event) {
-    Process* target = find_by_pid(target_pid);
+    Task* target = find_by_tid(target_pid);
     if (target == nullptr || target->resources == nullptr) {
         return false;
     }
     ProcessResources& resources = *target->resources;
     {
         sync::LockGuard guard(resources.event_lock);
+        KERNEL_ASSERT_MSG(resources.event_head < kMaxProcessEvents,
+                          "process event queue head is out of bounds");
+        KERNEL_ASSERT_MSG(resources.event_count <= kMaxProcessEvents,
+                          "process event queue count is out of bounds");
         if (resources.event_count >= kMaxProcessEvents) {
             return false;
         }
         size_t tail =
             (resources.event_head + resources.event_count) % kMaxProcessEvents;
         resources.events[tail] = event;
-        resources.events[tail].sender_process_id = sender.process_id;
+        resources.events[tail].sender_process_id = sender.pid;
         ++resources.event_count;
     }
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        Process& waiter = g_process_table[i];
+    for (size_t i = 0; i < kMaxTasks; ++i) {
+        Task& waiter = g_task_table[i];
         if (waiter.resources == &resources &&
             waiter.wait_reason == WaitReason::Event) {
             (void)wake_with_result(waiter, 1);
@@ -916,11 +949,15 @@ bool send_event(Process& sender,
     return true;
 }
 
-int64_t receive_event(Process& caller,
+int64_t receive_event(Task& caller,
                       ProcessEvent& event,
                       bool nonblocking) {
     ProcessResources& resources = *caller.resources;
     sync::LockGuard guard(resources.event_lock);
+    KERNEL_ASSERT_MSG(resources.event_head < kMaxProcessEvents,
+                      "process event queue head is out of bounds");
+    KERNEL_ASSERT_MSG(resources.event_count <= kMaxProcessEvents,
+                      "process event queue count is out of bounds");
     if (resources.event_count != 0) {
         event = resources.events[resources.event_head];
         resources.event_head =
@@ -939,15 +976,15 @@ int64_t receive_event(Process& caller,
     return 1;
 }
 
-bool control_group(Process&,
+bool control_group(Task&,
                    uint32_t target_pid,
                    uint32_t action,
                    uint16_t exit_code) {
-    Process* target = find_by_pid(target_pid);
+    Task* target = find_by_tid(target_pid);
     if (target == nullptr || target->is_kernel_task) {
         return false;
     }
-    uint32_t target_process_id = target->process_id;
+    uint32_t target_process_id = target->pid;
     if (action == 1) {
         terminate_group(*target, exit_code);
         return true;
@@ -958,9 +995,9 @@ bool control_group(Process&,
 
     bool changed = false;
     sync::IrqLockGuard guard(g_control_lock);
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        Process& member = g_process_table[i];
-        if (member.process_id != target_process_id) {
+    for (size_t i = 0; i < kMaxTasks; ++i) {
+        Task& member = g_task_table[i];
+        if (member.pid != target_process_id) {
             continue;
         }
         State state = load_state(member);
@@ -1005,20 +1042,20 @@ bool control_group(Process&,
     return changed;
 }
 
-bool set_process_group(Process& caller,
+bool set_process_group(Task& caller,
                        uint32_t target_pid,
                        uint32_t group_id) {
-    Process* target = target_pid == 0 ? &caller : find_by_pid(target_pid);
+    Task* target = target_pid == 0 ? &caller : find_by_tid(target_pid);
     if (target == nullptr || target->resources == nullptr ||
         target->is_thread || target->resources->session_id == 0) {
         return false;
     }
     if (group_id == 0) {
-        group_id = target->process_id;
+        group_id = target->pid;
     }
-    bool group_exists = group_id == target->process_id;
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        Process& member = g_process_table[i];
+    bool group_exists = group_id == target->pid;
+    for (size_t i = 0; i < kMaxTasks; ++i) {
+        Task& member = g_task_table[i];
         if (member.resources == nullptr || member.is_thread ||
             member.resources->process_group_id != group_id) {
             continue;
@@ -1037,22 +1074,22 @@ bool set_process_group(Process& caller,
     return true;
 }
 
-uint32_t process_group_id(const Process& proc) {
+uint32_t process_group_id(const Task& proc) {
     return proc.resources != nullptr
                ? proc.resources->process_group_id
                : 0;
 }
 
-uint32_t session_id(const Process& proc) {
+uint32_t session_id(const Task& proc) {
     return proc.resources != nullptr ? proc.resources->session_id : 0;
 }
 
-bool create_session(Process& caller) {
+bool create_session(Task& caller) {
     if (caller.is_thread || caller.resources == nullptr) {
         return false;
     }
     sync::IrqLockGuard guard(g_control_lock);
-    uint32_t id = caller.process_id;
+    uint32_t id = caller.pid;
     for (auto& session : g_sessions) {
         if (session.in_use && session.id == id) {
             return false;
@@ -1071,14 +1108,14 @@ bool create_session(Process& caller) {
     return false;
 }
 
-bool set_foreground_group(Process& caller, uint32_t group_id) {
+bool set_foreground_group(Task& caller, uint32_t group_id) {
     if (caller.resources == nullptr || group_id == 0) {
         return false;
     }
     uint32_t sid = caller.resources->session_id;
     bool group_exists = false;
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        Process& member = g_process_table[i];
+    for (size_t i = 0; i < kMaxTasks; ++i) {
+        Task& member = g_task_table[i];
         if (member.resources != nullptr &&
             member.resources->session_id == sid &&
             member.resources->process_group_id == group_id) {
@@ -1107,7 +1144,7 @@ bool set_foreground_group(Process& caller, uint32_t group_id) {
     return false;
 }
 
-uint32_t foreground_group(const Process& caller) {
+uint32_t foreground_group(const Task& caller) {
     if (caller.resources == nullptr) {
         return 0;
     }
@@ -1121,12 +1158,12 @@ uint32_t foreground_group(const Process& caller) {
     return 0;
 }
 
-bool is_foreground(const Process& proc) {
+bool is_foreground(const Task& proc) {
     return proc.resources != nullptr &&
            foreground_group(proc) == proc.resources->process_group_id;
 }
 
-bool get_limits(const Process& proc, ProcessLimits& limits) {
+bool get_limits(const Task& proc, ProcessLimits& limits) {
     if (proc.resources == nullptr) {
         return false;
     }
@@ -1135,7 +1172,7 @@ bool get_limits(const Process& proc, ProcessLimits& limits) {
     return true;
 }
 
-bool set_limits(Process& proc, const ProcessLimits& limits) {
+bool set_limits(Task& proc, const ProcessLimits& limits) {
     if (proc.resources == nullptr || limits.max_threads == 0 ||
         limits.max_descriptors == 0 ||
         limits.max_descriptors > descriptor::kMaxDescriptors ||
@@ -1151,14 +1188,14 @@ bool set_limits(Process& proc, const ProcessLimits& limits) {
     return true;
 }
 
-bool get_usage(const Process& proc, ProcessUsage& usage) {
+bool get_usage(const Task& proc, ProcessUsage& usage) {
     if (proc.resources == nullptr) {
         return false;
     }
     memset(&usage, 0, sizeof(usage));
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        if (g_process_table[i].resources == proc.resources &&
-            load_state(g_process_table[i]) != State::Unused) {
+    for (size_t i = 0; i < kMaxTasks; ++i) {
+        if (g_task_table[i].resources == proc.resources &&
+            load_state(g_task_table[i]) != State::Unused) {
             ++usage.threads;
         }
     }
@@ -1192,15 +1229,15 @@ bool get_usage(const Process& proc, ProcessUsage& usage) {
 
 namespace {
 
-bool trace_authorized(const Process& tracer, const Process& target) {
+bool trace_authorized(const Task& tracer, const Task& target) {
     return target.resources != nullptr &&
-           target.resources->tracer_process_id == tracer.process_id;
+           target.resources->tracer_process_id == tracer.pid;
 }
 
 bool group_is_stopped(uint32_t process_id) {
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        const Process& member = g_process_table[i];
-        if (member.process_id != process_id) {
+    for (size_t i = 0; i < kMaxTasks; ++i) {
+        const Task& member = g_task_table[i];
+        if (member.pid != process_id) {
             continue;
         }
         State state = load_state(member);
@@ -1214,25 +1251,25 @@ bool group_is_stopped(uint32_t process_id) {
 
 }  // namespace
 
-bool trace_attach(Process& tracer, uint32_t target_pid) {
-    Process* target = find_by_pid(target_pid);
+bool trace_attach(Task& tracer, uint32_t target_pid) {
+    Task* target = find_by_tid(target_pid);
     if (target == nullptr || target->resources == nullptr ||
-        target->process_id == tracer.process_id || target->is_kernel_task) {
+        target->pid == tracer.pid || target->is_kernel_task) {
         return false;
     }
     {
         sync::LockGuard guard(target->resources->lock);
         if (target->resources->tracer_process_id != 0 &&
-            target->resources->tracer_process_id != tracer.process_id) {
+            target->resources->tracer_process_id != tracer.pid) {
             return false;
         }
-        target->resources->tracer_process_id = tracer.process_id;
+        target->resources->tracer_process_id = tracer.pid;
     }
     return control_group(tracer, target_pid, 2, 0);
 }
 
-bool trace_detach(Process& tracer, uint32_t target_pid) {
-    Process* target = find_by_pid(target_pid);
+bool trace_detach(Task& tracer, uint32_t target_pid) {
+    Task* target = find_by_tid(target_pid);
     if (target == nullptr || !trace_authorized(tracer, *target)) {
         return false;
     }
@@ -1243,15 +1280,15 @@ bool trace_detach(Process& tracer, uint32_t target_pid) {
     return control_group(tracer, target_pid, 3, 0);
 }
 
-bool trace_read_memory(Process& tracer,
+bool trace_read_memory(Task& tracer,
                        uint32_t target_pid,
                        uint64_t target_address,
                        uint64_t user_buffer,
                        size_t length) {
-    Process* target = find_by_pid(target_pid);
+    Task* target = find_by_tid(target_pid);
     if (target == nullptr || length == 0 ||
         !trace_authorized(tracer, *target) ||
-        !group_is_stopped(target->process_id)) {
+        !group_is_stopped(target->pid)) {
         return false;
     }
     uint8_t bounce[256];
@@ -1278,15 +1315,15 @@ bool trace_read_memory(Process& tracer,
     return true;
 }
 
-bool trace_write_memory(Process& tracer,
+bool trace_write_memory(Task& tracer,
                         uint32_t target_pid,
                         uint64_t target_address,
                         uint64_t user_buffer,
                         size_t length) {
-    Process* target = find_by_pid(target_pid);
+    Task* target = find_by_tid(target_pid);
     if (target == nullptr || length == 0 ||
         !trace_authorized(tracer, *target) ||
-        !group_is_stopped(target->process_id)) {
+        !group_is_stopped(target->pid)) {
         return false;
     }
     uint8_t bounce[256];
@@ -1313,11 +1350,11 @@ bool trace_write_memory(Process& tracer,
     return true;
 }
 
-bool trace_get_registers(Process& tracer,
+bool trace_get_registers(Task& tracer,
                          uint32_t target_tid,
                          uint64_t user_buffer,
                          size_t length) {
-    Process* target = find_by_pid(target_tid);
+    Task* target = find_by_tid(target_tid);
     if (target == nullptr || length < sizeof(target->context) ||
         !trace_authorized(tracer, *target) ||
         load_state(*target) != State::Suspended) {
@@ -1329,13 +1366,13 @@ bool trace_get_registers(Process& tracer,
                             sizeof(target->context));
 }
 
-bool trace_stopped(Process& tracer, uint32_t target_pid) {
-    Process* target = find_by_pid(target_pid);
+bool trace_stopped(Task& tracer, uint32_t target_pid) {
+    Task* target = find_by_tid(target_pid);
     return target != nullptr && trace_authorized(tracer, *target) &&
-           group_is_stopped(target->process_id);
+           group_is_stopped(target->pid);
 }
 
-int64_t futex_wait(Process& caller,
+int64_t futex_wait(Task& caller,
                    uint64_t user_address,
                    uint32_t expected) {
     if ((user_address & (alignof(uint32_t) - 1)) != 0 ||
@@ -1359,7 +1396,35 @@ int64_t futex_wait(Process& caller,
     return 0;
 }
 
-size_t futex_wake(Process& caller,
+int64_t futex_wait_timed(Task& caller,
+                         uint64_t user_address,
+                         uint32_t expected,
+                         uint64_t timeout_ns) {
+    if (timeout_ns == 0) return -3;
+    if ((user_address & (alignof(uint32_t) - 1)) != 0 ||
+        !vm::is_user_range(user_address, sizeof(uint32_t))) {
+        return -1;
+    }
+    sync::IrqLockGuard guard(g_futex_lock);
+    uint32_t observed = 0;
+    if (!vm::copy_from_user(caller.cr3,
+                            &observed,
+                            user_address,
+                            sizeof(observed))) {
+        return -1;
+    }
+    if (observed != expected) return -2;
+    uint64_t ticks = timekeeping::ticks_for_duration_ns(timeout_ns);
+    uint64_t now = timekeeping::tick_count();
+    caller.sleep_until_tick =
+        ticks > UINT64_MAX - now ? UINT64_MAX : now + ticks;
+    caller.waiting_on = reinterpret_cast<void*>(user_address);
+    caller.wait_reason = WaitReason::Futex;
+    store_state(caller, State::Blocked);
+    return 0;
+}
+
+size_t futex_wake(Task& caller,
                   uint64_t user_address,
                   size_t max_count) {
     if ((user_address & (alignof(uint32_t) - 1)) != 0 ||
@@ -1369,13 +1434,14 @@ size_t futex_wake(Process& caller,
     }
     size_t woken = 0;
     sync::IrqLockGuard guard(g_futex_lock);
-    for (size_t i = 0; i < kMaxProcesses && woken < max_count; ++i) {
-        Process& waiter = g_process_table[i];
+    for (size_t i = 0; i < kMaxTasks && woken < max_count; ++i) {
+        Task& waiter = g_task_table[i];
         if (waiter.cr3 != caller.cr3 ||
             waiter.wait_reason != WaitReason::Futex ||
             waiter.waiting_on != reinterpret_cast<void*>(user_address)) {
             continue;
         }
+        waiter.sleep_until_tick = 0;
         if (wake_with_result(waiter, 0)) {
             ++woken;
         }
@@ -1383,7 +1449,7 @@ size_t futex_wake(Process& caller,
     return woken;
 }
 
-bool consume_wait_result(Process& proc, int64_t& out_result) {
+bool consume_wait_result(Task& proc, int64_t& out_result) {
     if (!__atomic_exchange_n(&proc.wait_result_pending,
                              false,
                              __ATOMIC_ACQ_REL)) {
@@ -1393,7 +1459,7 @@ bool consume_wait_result(Process& proc, int64_t& out_result) {
     return true;
 }
 
-void defer_reclaim(Process& proc) {
+void defer_reclaim(Task& proc) {
     State state = load_state(proc);
     if (state != State::Terminated) {
         return;
@@ -1421,11 +1487,11 @@ void reap_deferred() {
     if (cpu == nullptr || cpu->index >= percpu::kMaxCpus) {
         return;
     }
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        Process& proc = g_process_table[i];
+    for (size_t i = 0; i < kMaxTasks; ++i) {
+        Task& proc = g_task_table[i];
         if (!__atomic_load_n(&proc.reclaim_pending, __ATOMIC_ACQUIRE) ||
             __atomic_load_n(&proc.reclaim_cpu, __ATOMIC_RELAXED) != cpu->index ||
-            running_on_process_stack(proc)) {
+            running_on_task_stack(proc)) {
             continue;
         }
         bool expected = true;
@@ -1441,21 +1507,21 @@ void reap_deferred() {
     }
 }
 
-Process* allocate_kernel_task(void (*entry)(Process&)) {
+Task* allocate_kernel_task(void (*entry)(Task&)) {
     if (entry == nullptr) {
         return nullptr;
     }
-    Process* proc = allocate_slot(allocate_pid());
+    Task* proc = allocate_slot(allocate_tid());
     if (proc == nullptr) {
         return nullptr;
     }
     proc->cr3 = paging_kernel_cr3();
-    proc->process_id = proc->pid;
+    proc->pid = proc->tid;
     proc->is_kernel_task = true;
     proc->kernel_entry = entry;
     if (!attach_new_resources(*proc)) {
-        proc->pid = 0;
-        reset_process_resources(*proc);
+        proc->tid = 0;
+        reset_task(*proc);
         store_state(*proc, State::Unused);
         return nullptr;
     }
@@ -1463,8 +1529,8 @@ Process* allocate_kernel_task(void (*entry)(Process&)) {
     return proc;
 }
 
-void reclaim(Process& proc) {
-    if (running_on_process_stack(proc)) {
+void reclaim(Task& proc) {
+    if (running_on_task_stack(proc)) {
         defer_reclaim(proc);
         return;
     }
@@ -1482,12 +1548,12 @@ void reclaim(Process& proc) {
     __atomic_store_n(&proc.reclaim_cpu, UINT32_MAX, __ATOMIC_RELAXED);
     scheduler::remove(&proc);
 
-    uint32_t reclaimed_process_id = proc.process_id;
+    uint32_t reclaimed_process_id = proc.pid;
     uint32_t reclaimed_session_id =
         proc.resources != nullptr ? proc.resources->session_id : 0;
     if (!proc.is_thread) {
-        for (size_t i = 0; i < kMaxProcesses; ++i) {
-            Process& child = g_process_table[i];
+        for (size_t i = 0; i < kMaxTasks; ++i) {
+            Task& child = g_task_table[i];
             if (child.resources != nullptr &&
                 child.resources->parent_process_id ==
                     reclaimed_process_id) {
@@ -1506,7 +1572,7 @@ void reclaim(Process& proc) {
                 child.resources->tracer_process_id ==
                     reclaimed_process_id) {
                 child.resources->tracer_process_id = 0;
-                (void)control_group(proc, child.pid, 3, 0);
+                (void)control_group(proc, child.tid, 3, 0);
             }
         }
     }
@@ -1521,21 +1587,21 @@ void reclaim(Process& proc) {
 
     // Do not leave children pointing at a slot that can be reused for an
     // unrelated process.
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        if (g_process_table[i].parent == &proc) {
-            g_process_table[i].parent = nullptr;
+    for (size_t i = 0; i < kMaxTasks; ++i) {
+        if (g_task_table[i].parent == &proc) {
+            g_task_table[i].parent = nullptr;
         }
-        if (g_process_table[i].thread_joiner == &proc) {
-            g_process_table[i].thread_joiner = nullptr;
+        if (g_task_table[i].thread_joiner == &proc) {
+            g_task_table[i].thread_joiner = nullptr;
         }
     }
 
     if (!proc.is_thread && reclaimed_session_id != 0) {
         bool session_alive = false;
-        for (size_t i = 0; i < kMaxProcesses; ++i) {
-            if (&g_process_table[i] != &proc &&
-                g_process_table[i].resources != nullptr &&
-                g_process_table[i].resources->session_id ==
+        for (size_t i = 0; i < kMaxTasks; ++i) {
+            if (&g_task_table[i] != &proc &&
+                g_task_table[i].resources != nullptr &&
+                g_task_table[i].resources->session_id ==
                     reclaimed_session_id) {
                 session_alive = true;
                 break;
@@ -1553,9 +1619,9 @@ void reclaim(Process& proc) {
         }
     }
 
-    proc.pid = 0;
+    proc.tid = 0;
     proc.cr3 = paging_kernel_cr3();
-    reset_process_resources(proc);
+    reset_task(proc);
     store_state(proc, State::Unused);
 }
 

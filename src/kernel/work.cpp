@@ -1,5 +1,6 @@
 #include "kernel/work.hpp"
 
+#include "kernel/error.hpp"
 #include "kernel/scheduler.hpp"
 #include "kernel/sync.hpp"
 
@@ -20,8 +21,16 @@ void service() {
         Item item{};
         {
             sync::IrqLockGuard guard(g_lock);
+            KERNEL_ASSERT_MSG(g_head < kQueueSize,
+                              "work queue head is out of bounds");
+            KERNEL_ASSERT_MSG(g_tail < kQueueSize,
+                              "work queue tail is out of bounds");
+            KERNEL_ASSERT_MSG(g_count <= kQueueSize,
+                              "work queue count is out of bounds");
             if (g_count == 0) return;
             item = g_queue[g_head];
+            KERNEL_ASSERT_MSG(item.handler != nullptr,
+                              "work queue contains a null handler");
             g_head = (g_head + 1) % kQueueSize;
             --g_count;
             ++g_active;
@@ -29,6 +38,8 @@ void service() {
         item.handler(item.context);
         {
             sync::IrqLockGuard guard(g_lock);
+            KERNEL_ASSERT_MSG(g_active != 0,
+                              "work queue active count underflow");
             --g_active;
         }
     }
@@ -42,6 +53,12 @@ bool schedule(Handler handler, void* context) {
     if (handler == nullptr) return false;
     {
         sync::IrqLockGuard guard(g_lock);
+        KERNEL_ASSERT_MSG(g_head < kQueueSize,
+                          "work queue head is out of bounds");
+        KERNEL_ASSERT_MSG(g_tail < kQueueSize,
+                          "work queue tail is out of bounds");
+        KERNEL_ASSERT_MSG(g_count <= kQueueSize,
+                          "work queue count is out of bounds");
         if (g_count == kQueueSize) return false;
         if (!g_registered) {
             if (!scheduler::register_poll(service)) return false;

@@ -7,7 +7,7 @@
 #include "arch/x86_64/tss.hpp"
 
 namespace process {
-struct Process;
+struct Task;
 }  // namespace process
 
 namespace percpu {
@@ -26,7 +26,7 @@ struct Cpu {
     alignas(16) uint8_t tss_stack[65536];
     alignas(16) uint8_t gdt_area[8 * 8];
     alignas(16) uint8_t bootstrap_stack[kBootstrapStackSize];
-    process::Process* current_process;
+    process::Task* current_task;
     uint64_t user_ticks;
     uint64_t kernel_ticks;
     uint64_t idle_ticks;
@@ -34,7 +34,7 @@ struct Cpu {
     uint32_t kernel_fpu_depth;
     uint32_t kernel_fpu_reserved;
     uint64_t kernel_fpu_rflags;
-    process::Process* kernel_fpu_process;
+    process::Task* kernel_fpu_task;
 };
 
 static_assert(offsetof(Cpu, syscall_user_rsp) == 16,
@@ -51,9 +51,9 @@ size_t cpu_count();
 void set_current_cpu(Cpu* cpu);
 void setup_cpu_tss(Cpu& cpu);
 void setup_cpu_gdt(Cpu& cpu);
-void set_current_process(process::Process* proc);
-process::Process* get_current_process();
-void record_tick(bool user_mode, bool has_process);
+void set_current_task(process::Task* proc);
+process::Task* get_current_task();
+void record_tick(bool user_mode, bool has_task);
 void record_irq();
 size_t usage_snapshot(descriptor_defs::CpuUsage* out, size_t max_entries);
 

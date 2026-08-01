@@ -7,11 +7,11 @@ namespace audio_output_descriptor {
 
 void close(DescriptorEntry&) { hda::drain(); }
 
-int64_t read(process::Process&, DescriptorEntry&, uint64_t, uint64_t, uint64_t) {
+int64_t read(process::Task&, DescriptorEntry&, uint64_t, uint64_t, uint64_t) {
     return -1;
 }
 
-int64_t write(process::Process&, DescriptorEntry&, uint64_t address,
+int64_t write(process::Task&, DescriptorEntry&, uint64_t address,
               uint64_t length, uint64_t offset) {
     if (offset != 0 || (length & 3u) != 0) return -1;
     if (length == 0) return 0;
@@ -86,7 +86,7 @@ const Ops kOps{
     .set_property = set_property,
 };
 
-bool open(process::Process&, uint64_t selector, uint64_t, uint64_t,
+bool open(process::Task&, uint64_t selector, uint64_t, uint64_t,
           Allocation& allocation) {
     if (selector != 0 || !hda::available()) return false;
     allocation.type = kTypeAudioOutput;

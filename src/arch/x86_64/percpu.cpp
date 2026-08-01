@@ -51,7 +51,7 @@ Cpu* register_cpu(uint32_t lapic_id, uint32_t processor_id) {
     cpu.reserved0[1] = 0;
     cpu.reserved0[2] = 0;
     cpu.syscall_user_rsp = 0;
-    cpu.current_process = nullptr;
+    cpu.current_task = nullptr;
     cpu.user_ticks = 0;
     cpu.kernel_ticks = 0;
     cpu.idle_ticks = 0;
@@ -59,7 +59,7 @@ Cpu* register_cpu(uint32_t lapic_id, uint32_t processor_id) {
     cpu.kernel_fpu_depth = 0;
     cpu.kernel_fpu_reserved = 0;
     cpu.kernel_fpu_rflags = 0;
-    cpu.kernel_fpu_process = nullptr;
+    cpu.kernel_fpu_task = nullptr;
     return &cpu;
 }
 
@@ -108,24 +108,24 @@ void init_bsp(uint32_t lapic_id, uint32_t processor_id) {
     set_current_cpu(cpu);
 }
 
-void set_current_process(process::Process* proc) {
+void set_current_task(process::Task* proc) {
     Cpu* cpu = current_cpu();
     if (cpu != nullptr) {
-        cpu->current_process = proc;
+        cpu->current_task = proc;
     }
 }
 
-process::Process* get_current_process() {
+process::Task* get_current_task() {
     Cpu* cpu = current_cpu();
-    return cpu ? cpu->current_process : nullptr;
+    return cpu ? cpu->current_task : nullptr;
 }
 
-void record_tick(bool user_mode, bool has_process) {
+void record_tick(bool user_mode, bool has_task) {
     Cpu* cpu = current_cpu();
     if (cpu == nullptr) {
         return;
     }
-    if (!has_process) {
+    if (!has_task) {
         ++cpu->idle_ticks;
         return;
     }

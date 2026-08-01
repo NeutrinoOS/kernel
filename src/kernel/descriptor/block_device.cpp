@@ -218,7 +218,7 @@ DiskRecord* allocate_disk_record(const char* name) {
     return nullptr;
 }
 
-DescriptorEntry* lookup_process_entry(process::Process& proc, uint32_t handle) {
+DescriptorEntry* lookup_process_entry(process::Task& proc, uint32_t handle) {
     uint16_t index = handle_index(handle);
     uint16_t generation = handle_generation(handle);
     if (index >= kMaxDescriptors || generation == 0) {
@@ -252,7 +252,7 @@ void close_disk(DescriptorEntry& entry) {
     }
 }
 
-bool copy_from_caller(const process::Process& proc,
+bool copy_from_caller(const process::Task& proc,
                       void* dest,
                       uint64_t src,
                       size_t length) {
@@ -269,7 +269,7 @@ bool copy_from_caller(const process::Process& proc,
     return vm::copy_from_user(proc.cr3, dest, src, length);
 }
 
-bool copy_to_caller(const process::Process& proc,
+bool copy_to_caller(const process::Task& proc,
                     uint64_t dest,
                     const void* src,
                     size_t length) {
@@ -286,7 +286,7 @@ bool copy_to_caller(const process::Process& proc,
     return vm::copy_to_user(proc.cr3, dest, src, length);
 }
 
-int64_t block_device_read(process::Process& proc,
+int64_t block_device_read(process::Task& proc,
                           DescriptorEntry& entry,
                           uint64_t user_address,
                           uint64_t length,
@@ -370,7 +370,7 @@ int64_t block_device_read(process::Process& proc,
     return static_cast<int64_t>(length);
 }
 
-int64_t block_device_write(process::Process& proc,
+int64_t block_device_write(process::Task& proc,
                            DescriptorEntry& entry,
                            uint64_t user_address,
                            uint64_t length,
@@ -525,7 +525,7 @@ int partition_get_property(DescriptorEntry& entry,
     return block_device_get_property(entry, property, out, size);
 }
 
-int64_t disk_read(process::Process& proc,
+int64_t disk_read(process::Task& proc,
                   DescriptorEntry& entry,
                   uint64_t user_address,
                   uint64_t length,
@@ -584,7 +584,7 @@ const Ops kPartitionOps{
     .set_property = nullptr,
 };
 
-bool open_block_device(process::Process& proc,
+bool open_block_device(process::Task& proc,
                        uint64_t name_ptr,
                        uint64_t index,
                        uint64_t,
@@ -637,7 +637,7 @@ bool open_block_device(process::Process& proc,
     return true;
 }
 
-bool open_disk(process::Process& proc,
+bool open_disk(process::Task& proc,
                uint64_t name_ptr,
                uint64_t index,
                uint64_t,
@@ -680,7 +680,7 @@ bool open_disk(process::Process& proc,
     return true;
 }
 
-bool open_partition(process::Process& proc,
+bool open_partition(process::Task& proc,
                     uint64_t disk_handle,
                     uint64_t partition_index,
                     uint64_t,
@@ -756,7 +756,7 @@ bool register_block_device_descriptor() {
     return ok;
 }
 
-bool block_device_from_descriptor(process::Process& proc,
+bool block_device_from_descriptor(process::Task& proc,
                                   uint32_t handle,
                                   fs::BlockDevice& out) {
     sync::LockGuard guard(proc.resources->descriptor_lock);

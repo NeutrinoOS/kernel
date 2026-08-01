@@ -19,7 +19,7 @@ constexpr size_t kPageSize = 0x1000;
 constexpr size_t kMaxSegmentPages = 4096;  // Allow larger shared buffers (e.g., full-screen surfaces).
 
 struct SegmentMapping {
-    process::Process* proc;
+    process::Task* proc;
     vm::Region region;
     uint32_t refcount;
 };
@@ -30,7 +30,7 @@ struct SharedSegment {
     size_t length;
     size_t page_count;
     uint64_t pages[kMaxSegmentPages];
-    SegmentMapping mappings[process::kMaxProcesses];
+    SegmentMapping mappings[process::kMaxTasks];
     uint32_t refcount;
 };
 
@@ -81,7 +81,7 @@ SharedSegment* find_segment_locked(const char* name) {
     return nullptr;
 }
 
-SegmentMapping* find_mapping(SharedSegment& segment, process::Process& proc) {
+SegmentMapping* find_mapping(SharedSegment& segment, process::Task& proc) {
     for (auto& mapping : segment.mappings) {
         if (mapping.proc == &proc) {
             return &mapping;
@@ -91,7 +91,7 @@ SegmentMapping* find_mapping(SharedSegment& segment, process::Process& proc) {
 }
 
 SegmentMapping* allocate_mapping(SharedSegment& segment,
-                                 process::Process& proc) {
+                                 process::Task& proc) {
     for (auto& mapping : segment.mappings) {
         if (mapping.proc == nullptr) {
             mapping.proc = &proc;
@@ -104,7 +104,7 @@ SegmentMapping* allocate_mapping(SharedSegment& segment,
 }
 
 bool map_segment_into_process(SharedSegment& segment,
-                              process::Process& proc,
+                              process::Task& proc,
                               SegmentMapping& mapping) {
     if (segment.length == 0 || segment.page_count == 0) {
         return false;
@@ -165,7 +165,7 @@ bool map_segment_into_process(SharedSegment& segment,
 }
 
 void unmap_segment_from_process(SharedSegment& segment,
-                                process::Process& proc,
+                                process::Task& proc,
                                 SegmentMapping& mapping) {
     if (mapping.region.base == 0 || segment.page_count == 0 || proc.cr3 == 0) {
         return;
@@ -238,7 +238,7 @@ SharedSegment* allocate_segment_locked(const char* name,
     return slot;
 }
 
-int64_t shared_memory_read(process::Process&,
+int64_t shared_memory_read(process::Task&,
                            DescriptorEntry& entry,
                            uint64_t user_address,
                            uint64_t length,
@@ -260,7 +260,7 @@ int64_t shared_memory_read(process::Process&,
     if (to_copy == 0) {
         return 0;
     }
-    process::Process* proc = process::current();
+    process::Task* proc = process::current();
     if (proc == nullptr || proc->cr3 == 0 ||
         !vm::is_user_range(user_address, to_copy)) {
         return -1;
@@ -274,7 +274,7 @@ int64_t shared_memory_read(process::Process&,
     return static_cast<int64_t>(to_copy);
 }
 
-int64_t shared_memory_write(process::Process& proc,
+int64_t shared_memory_write(process::Task& proc,
                             DescriptorEntry& entry,
                             uint64_t user_address,
                             uint64_t length,
@@ -325,7 +325,7 @@ int shared_memory_get_property(DescriptorEntry& entry,
                                sizeof(descriptor_defs::SharedMemoryInfo))) {
             return -1;
         }
-        process::Process* proc = process::current();
+        process::Task* proc = process::current();
         if (proc == nullptr || proc->cr3 == 0) {
             return -1;
         }
@@ -380,7 +380,7 @@ const Ops kSharedMemoryOps{
     .set_property = nullptr,
 };
 
-bool open_shared_memory(process::Process& proc,
+bool open_shared_memory(process::Task& proc,
                         uint64_t name_ptr,
                         uint64_t length,
                         uint64_t,

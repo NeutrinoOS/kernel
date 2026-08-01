@@ -5,6 +5,7 @@
 #include "drivers/limine/limine_requests.hpp"
 #include "drivers/log/logging.hpp"
 #include "drivers/pci/pci.hpp"
+#include "kernel/cmdline.hpp"
 #include "kernel/interrupts.hpp"
 #include "kernel/memory/physical_allocator.hpp"
 #include "kernel/sync.hpp"
@@ -29,52 +30,6 @@ Interrupt* g_interrupts[16]{};
 bool g_initialized = false;
 bool g_tables_initialized = false;
 alignas(void*) unsigned char g_early_table_buffer[4096];
-
-bool is_cmdline_separator(char ch) {
-    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
-}
-
-bool cmdline_has_token(const char* cmdline, const char* expected) {
-    if (cmdline == nullptr || expected == nullptr || expected[0] == '\0') {
-        return false;
-    }
-
-    size_t expected_length = 0;
-    while (expected[expected_length] != '\0') {
-        ++expected_length;
-    }
-
-    const char* cursor = cmdline;
-    while (*cursor != '\0') {
-        while (is_cmdline_separator(*cursor)) {
-            ++cursor;
-        }
-        if (*cursor == '\0') {
-            break;
-        }
-
-        const char* token = cursor;
-        while (*cursor != '\0' && !is_cmdline_separator(*cursor)) {
-            ++cursor;
-        }
-        size_t token_length = static_cast<size_t>(cursor - token);
-        if (token_length != expected_length) {
-            continue;
-        }
-
-        bool matches = true;
-        for (size_t i = 0; i < expected_length; ++i) {
-            if (token[i] != expected[i]) {
-                matches = false;
-                break;
-            }
-        }
-        if (matches) {
-            return true;
-        }
-    }
-    return false;
-}
 
 template <unsigned Irq> void interrupt_thunk() {
     Interrupt* entry = g_interrupts[Irq];
@@ -293,19 +248,19 @@ bool initialize_tables() {
     return true;
 }
 
-bool initialize(const char* cmdline) {
+bool initialize() {
     if (g_initialized) return true;
-    if (cmdline_has_token(cmdline, "ACPI=OFF")) {
+    if (kernel_cmdline::has_value("ACPI", "OFF")) {
         log_message(LogLevel::Warn,
                     "uACPI: runtime disabled by kernel command line");
         return true;
     }
 
-    const bool no_mode = cmdline_has_token(cmdline, "ACPI.NO_MODE");
+    const bool no_mode = kernel_cmdline::has_flag("ACPI.NO_MODE");
     const bool no_namespace_load =
-        cmdline_has_token(cmdline, "ACPI.NO_NAMESPACE_LOAD");
+        kernel_cmdline::has_flag("ACPI.NO_NAMESPACE_LOAD");
     const bool no_namespace_init = no_namespace_load ||
-        cmdline_has_token(cmdline, "ACPI.NO_NAMESPACE_INIT");
+        kernel_cmdline::has_flag("ACPI.NO_NAMESPACE_INIT");
 
     if (g_tables_initialized) {
         uacpi_state_reset();

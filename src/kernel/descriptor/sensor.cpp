@@ -5,7 +5,7 @@
 namespace descriptor {
 namespace sensor_descriptor {
 
-int64_t read(process::Process&,
+int64_t read(process::Task&,
              DescriptorEntry& entry,
              uint64_t user_address,
              uint64_t length,
@@ -23,7 +23,7 @@ int64_t read(process::Process&,
     return sizeof(*sample);
 }
 
-int64_t write(process::Process&, DescriptorEntry&, uint64_t, uint64_t, uint64_t) {
+int64_t write(process::Task&, DescriptorEntry&, uint64_t, uint64_t, uint64_t) {
     return -1;
 }
 
@@ -45,7 +45,7 @@ const Ops kOps{
     .set_property = nullptr,
 };
 
-bool open(process::Process&,
+bool open(process::Task&,
           uint64_t selector,
           uint64_t,
           uint64_t,

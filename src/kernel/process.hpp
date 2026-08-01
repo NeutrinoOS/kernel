@@ -14,7 +14,7 @@
 
 namespace process {
 
-constexpr size_t kMaxProcesses = 256;
+constexpr size_t kMaxTasks = 256;
 constexpr size_t kKernelStackSize = 0x4000;
 constexpr size_t kMaxFileHandles = 16;
 constexpr size_t kMaxDirectoryHandles = 8;
@@ -75,7 +75,9 @@ enum class WaitReason : uint8_t {
 struct FileHandle {
     bool in_use;
     bool reserved;
+    bool can_read;
     bool can_write;
+    bool append;
     vfs::FileHandle handle;
     uint64_t position;
     char path[path_util::kMaxPathLength];
@@ -116,9 +118,9 @@ struct ProcessResources {
     DirectoryHandle directory_handles[kMaxDirectoryHandles];
 };
 
-struct Process {
+struct Task {
+    uint32_t tid;
     uint32_t pid;
-    uint32_t process_id;
     State state;
     uint64_t cr3;
     AddressSpace* address_space;
@@ -132,8 +134,8 @@ struct Process {
     vm::Region code_region;
     vm::Stack stack_region;
     syscall::SyscallFrame context;
-    Process* parent;
-    Process* thread_joiner;
+    Task* parent;
+    Task* thread_joiner;
     void* waiting_on;
     WaitReason wait_reason;
     State suspended_from;
@@ -148,7 +150,7 @@ struct Process {
     bool child_wait_claimed;
     bool reclaim_pending;
     uint32_t reclaim_cpu;
-    void (*kernel_entry)(Process&);
+    void (*kernel_entry)(Task&);
     uint32_t preferred_cpu;  // UINT32_MAX means unassigned
     uint64_t sleep_until_tick;
     uint64_t user_ticks;
@@ -163,23 +165,23 @@ struct Process {
         wait_descriptors[descriptor::kMaxWaitDescriptors];
 };
 
-inline ProcessResources& shared_resources(Process& proc) {
+inline ProcessResources& shared_resources(Task& proc) {
     return *proc.resources;
 }
 
-inline const ProcessResources& shared_resources(const Process& proc) {
+inline const ProcessResources& shared_resources(const Task& proc) {
     return *proc.resources;
 }
 
-inline State load_state(const Process& proc) {
+inline State load_state(const Task& proc) {
     return __atomic_load_n(&proc.state, __ATOMIC_ACQUIRE);
 }
 
-inline void store_state(Process& proc, State state) {
+inline void store_state(Task& proc, State state) {
     __atomic_store_n(&proc.state, state, __ATOMIC_RELEASE);
 }
 
-inline bool compare_exchange_state(Process& proc,
+inline bool compare_exchange_state(Task& proc,
                                    State& expected,
                                    State desired) {
     return __atomic_compare_exchange_n(&proc.state,
@@ -191,85 +193,90 @@ inline bool compare_exchange_state(Process& proc,
 }
 
 void init();
-Process* allocate();
-Process* allocate_init_task();
-Process* allocate_kernel_task(void (*entry)(Process&));
-bool attach_new_resources(Process& proc);
-Process* create_user_thread(Process& owner,
-                            uint64_t entry,
-                            uint64_t argument,
-                            size_t stack_size,
-                            uint64_t tls_base = 0);
-bool set_thread_tls(Process& thread, uint64_t fs_base);
-Process* current();
-void set_current(Process* proc);
-Process* table_entry(size_t index);
-Process* find_by_pid(uint32_t pid);
+Task* allocate();
+Task* allocate_init_task();
+Task* allocate_kernel_task(void (*entry)(Task&));
+bool attach_new_resources(Task& proc);
+Task* create_user_thread(Task& owner,
+                         uint64_t entry,
+                         uint64_t argument,
+                         size_t stack_size,
+                         uint64_t tls_base = 0);
+bool set_thread_tls(Task& thread, uint64_t fs_base);
+Task* current();
+void set_current(Task* proc);
+Task* task_table_entry(size_t index);
+Task* find_by_tid(uint32_t tid);
 void record_tick(bool user_mode);
 size_t usage_snapshot(descriptor_defs::TaskUsage* out, size_t max_entries);
 void wake_ready_sleepers(uint64_t current_tick);
-bool wake(Process& proc);
-bool begin_wake(Process& proc);
-void finish_wake(Process& proc);
-void finish_wake_with_result(Process& proc, int64_t result);
-bool wake_with_result(Process& proc, int64_t result);
-void terminate(Process& proc, uint16_t exit_code);
-void terminate_group(Process& proc, uint16_t exit_code);
-bool join_thread(Process& caller,
+bool wake(Task& proc);
+bool begin_wake(Task& proc);
+void finish_wake(Task& proc);
+void finish_wake_with_result(Task& proc, int64_t result);
+bool wake_with_result(Task& proc, int64_t result);
+void terminate(Task& proc, uint16_t exit_code);
+void terminate_group(Task& proc, uint16_t exit_code);
+bool join_thread(Task& caller,
                  uint32_t thread_id,
                  int64_t& immediate_result,
                  bool& blocked);
-int64_t wait_child(Process& caller,
+bool detach_thread(Task& caller, uint32_t thread_id);
+int64_t wait_child(Task& caller,
                    uint32_t child_pid,
                    bool nonblocking);
-bool send_event(Process& sender,
+bool send_event(Task& sender,
                 uint32_t target_pid,
                 const ProcessEvent& event);
-int64_t receive_event(Process& caller,
+int64_t receive_event(Task& caller,
                       ProcessEvent& event,
                       bool nonblocking);
-bool control_group(Process& caller,
+bool control_group(Task& caller,
                    uint32_t target_pid,
                    uint32_t action,
                    uint16_t exit_code);
-bool set_process_group(Process& caller,
+bool set_process_group(Task& caller,
                        uint32_t target_pid,
                        uint32_t group_id);
-uint32_t process_group_id(const Process& proc);
-uint32_t session_id(const Process& proc);
-bool create_session(Process& caller);
-bool set_foreground_group(Process& caller, uint32_t group_id);
-uint32_t foreground_group(const Process& caller);
-bool is_foreground(const Process& proc);
-bool get_limits(const Process& proc, ProcessLimits& limits);
-bool set_limits(Process& proc, const ProcessLimits& limits);
-bool get_usage(const Process& proc, ProcessUsage& usage);
-bool trace_attach(Process& tracer, uint32_t target_pid);
-bool trace_detach(Process& tracer, uint32_t target_pid);
-bool trace_read_memory(Process& tracer,
+uint32_t process_group_id(const Task& proc);
+uint32_t session_id(const Task& proc);
+bool create_session(Task& caller);
+bool set_foreground_group(Task& caller, uint32_t group_id);
+uint32_t foreground_group(const Task& caller);
+bool is_foreground(const Task& proc);
+bool get_limits(const Task& proc, ProcessLimits& limits);
+bool set_limits(Task& proc, const ProcessLimits& limits);
+bool get_usage(const Task& proc, ProcessUsage& usage);
+bool trace_attach(Task& tracer, uint32_t target_pid);
+bool trace_detach(Task& tracer, uint32_t target_pid);
+bool trace_read_memory(Task& tracer,
                        uint32_t target_pid,
                        uint64_t target_address,
                        uint64_t user_buffer,
                        size_t length);
-bool trace_write_memory(Process& tracer,
+bool trace_write_memory(Task& tracer,
                         uint32_t target_pid,
                         uint64_t target_address,
                         uint64_t user_buffer,
                         size_t length);
-bool trace_get_registers(Process& tracer,
+bool trace_get_registers(Task& tracer,
                          uint32_t target_tid,
                          uint64_t user_buffer,
                          size_t length);
-bool trace_stopped(Process& tracer, uint32_t target_pid);
-int64_t futex_wait(Process& caller,
+bool trace_stopped(Task& tracer, uint32_t target_pid);
+int64_t futex_wait(Task& caller,
                    uint64_t user_address,
                    uint32_t expected);
-size_t futex_wake(Process& caller,
+int64_t futex_wait_timed(Task& caller,
+                         uint64_t user_address,
+                         uint32_t expected,
+                         uint64_t timeout_ns);
+size_t futex_wake(Task& caller,
                   uint64_t user_address,
                   size_t max_count);
-bool consume_wait_result(Process& proc, int64_t& out_result);
-void defer_reclaim(Process& proc);
+bool consume_wait_result(Task& proc, int64_t& out_result);
+void defer_reclaim(Task& proc);
 void reap_deferred();
-void reclaim(Process& proc);
+void reclaim(Task& proc);
 
 }  // namespace process

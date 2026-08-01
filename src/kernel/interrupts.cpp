@@ -1,6 +1,7 @@
 #include "interrupts.hpp"
 
 #include "drivers/interrupts/ioapic.hpp"
+#include "kernel/error.hpp"
 #include "kernel/sync.hpp"
 
 namespace {
@@ -101,6 +102,13 @@ void unregister_isa_irq(uint8_t irq) {
     sync::IrqLockGuard guard(g_lock);
     uint8_t vector = g_isa_vectors[irq];
     if (vector != 0) {
+        KERNEL_ASSERT_MSG(vector >= kFirstAllocVector &&
+                              vector <= kLastAllocVector,
+                          "ISA IRQ references an invalid interrupt vector");
+        KERNEL_ASSERT_MSG(g_reserved[vector],
+                          "ISA IRQ vector is not reserved");
+        KERNEL_ASSERT_MSG(g_handlers[vector] != nullptr,
+                          "ISA IRQ vector has no registered handler");
         g_handlers[vector] = nullptr;
         g_reserved[vector] = false;
         g_isa_vectors[irq] = 0;

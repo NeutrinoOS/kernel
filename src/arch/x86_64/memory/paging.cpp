@@ -111,6 +111,8 @@ void write_msr(uint32_t msr, uint64_t value) {
 }
 
 void* alloc_boot_page() {
+    KERNEL_ASSERT_MSG(boot_pool_free_count <= BOOT_POOL_PAGES,
+                      "paging boot-pool freelist count is out of bounds");
     if (boot_pool_free_count > 0) {
         void* v = boot_pool_freelist[--boot_pool_free_count];
         memset(v, 0, PAGE_SIZE);
@@ -138,12 +140,13 @@ void free_boot_page(void* page) {
     auto* ptr = reinterpret_cast<uint8_t*>(page);
     auto* pool_begin = &boot_pool[0];
     auto* pool_end = pool_begin + BOOT_POOL_SIZE;
-    if (ptr < pool_begin || ptr >= pool_end) {
-        return;
-    }
-    if (boot_pool_free_count >= BOOT_POOL_PAGES) {
-        return;
-    }
+    KERNEL_ASSERT_MSG(ptr >= pool_begin && ptr < pool_end,
+                      "paging boot pool received a foreign page");
+    KERNEL_ASSERT_MSG(
+        (static_cast<size_t>(ptr - pool_begin) & PAGE_MASK) == 0,
+        "paging boot pool received an unaligned page");
+    KERNEL_ASSERT_MSG(boot_pool_free_count < BOOT_POOL_PAGES,
+                      "paging boot-pool freelist overflow");
     boot_pool_freelist[boot_pool_free_count++] = page;
 }
 

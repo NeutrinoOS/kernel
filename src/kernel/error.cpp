@@ -1,7 +1,7 @@
 #include "error.hpp"
 
 #include "drivers/console/console.hpp"
-#include "drivers/log/logging.hpp"
+#include "drivers/serial/serial.hpp"
 
 namespace {
 constexpr uint32_t kErrorBackground = 0xFF941616;
@@ -74,6 +74,73 @@ void print_registers(const InterruptFrame* regs) {
                      static_cast<unsigned long long>(cr.cr3),
                      static_cast<unsigned long long>(cr.cr4));
 }
+
+void prepare_screen(const char* main_message, const char* info_message) {
+    if (kconsole == nullptr) {
+        return;
+    }
+
+    kconsole->set_color(kErrorForeground, kErrorBackground);
+    kconsole->clear();
+    kconsole->putc('\n');
+    kconsole->printf(" An error has occurred: %s%s\n",
+                     main_message ? main_message : "",
+                     info_message ? info_message : "");
+    kconsole->printf(" Neutrino has been halted to prevent damage to your system or data.\n");
+    kconsole->printf(" If possible, please record the following information for debugging purposes.\n\n");
+}
+
+void print_footer() {
+    if (kconsole == nullptr) {
+        return;
+    }
+
+    kconsole->putc('\n');
+    kconsole->printf(" Please create a bug report at https://github.com/i3vie/neutrino.\n");
+    kconsole->printf(" Include the information above and any steps to reproduce the issue.\n");
+    kconsole->printf(" Thank you for helping to improve Neutrino!\n");
+    kconsole->putc('\n');
+    kconsole->printf(" System halted.\n");
+}
+
+void serial_write_u32(uint32_t value) {
+    char digits[10];
+    size_t count = 0;
+    do {
+        digits[count++] = static_cast<char>('0' + value % 10);
+        value /= 10;
+    } while (value != 0);
+    while (count != 0) {
+        serial::write_char(digits[--count]);
+    }
+}
+
+void print_assertion_to_serial(const char* expression,
+                               const char* message,
+                               const char* file,
+                               uint32_t line,
+                               const char* function) {
+    serial::write_string("[FATAL] FAILED_KERNEL_ASSERTION\n");
+    serial::write_string("Assertion: ");
+    serial::write_string(expression ? expression : "(unavailable)");
+    serial::write_string("\nLocation: ");
+    serial::write_string(file ? file : "(unavailable)");
+    serial::write_string(":");
+    serial_write_u32(line);
+    serial::write_string("\nFunction: ");
+    serial::write_string(function ? function : "(unavailable)");
+    if (message != nullptr && message[0] != '\0') {
+        serial::write_string("\nMessage: ");
+        serial::write_string(message);
+    }
+    serial::write_string("\n");
+}
+
+[[noreturn]] void halt() {
+    while (true) {
+        asm volatile("cli; hlt");
+    }
+}
 }  // namespace
 
 namespace error_screen {
@@ -84,27 +151,41 @@ namespace error_screen {
     const char* main_message = primary ? primary : "";
     const char* info_message = secondary ? secondary : "";
 
+    asm volatile("cli" ::: "memory");
+    prepare_screen(main_message, info_message);
     if (kconsole != nullptr) {
-        kconsole->set_color(kErrorForeground, kErrorBackground);
-        kconsole->clear();
-        kconsole->putc('\n');
-        kconsole->printf(" An error has occurred: %s%s\n", main_message, info_message);
-        kconsole->printf(" Neutrino has been halted to prevent damage to your system or data.\n");
-        kconsole->printf(" If possible, please record the following information for debugging purposes.\n\n");
         kconsole->putc('\n');
         print_registers(regs);
-        kconsole->putc('\n');
-        kconsole->printf(" Please create a bug report at https://github.com/i3vie/neutrino.\n");
-        kconsole->printf(" Include the information above and any steps to reproduce the issue.\n");
-        kconsole->printf(" Thank you for helping to improve Neutrino!\n");
-        kconsole->putc('\n');
-        kconsole->printf(" System halted.\n");
+        print_footer();
     }
-
-    while (true) {
-        asm volatile("cli; hlt");
-    }
+    halt();
 }
 
 }  // namespace error_screen
 
+extern "C" [[noreturn]] void kernel_assertion_failed(const char* expression,
+                                                     const char* message,
+                                                     const char* file,
+                                                     uint32_t line,
+                                                     const char* function) {
+    asm volatile("cli" ::: "memory");
+    print_assertion_to_serial(expression, message, file, line, function);
+    prepare_screen("FAILED_KERNEL_ASSERTION", nullptr);
+    if (kconsole != nullptr) {
+        kconsole->printf(" Assertion: %s\n",
+                         expression ? expression : "(unavailable)");
+        if (message != nullptr && message[0] != '\0') {
+            kconsole->printf(" Message:   %s\n", message);
+        }
+        kconsole->printf(" Location:  %s:%u\n",
+                         file ? file : "(unavailable)",
+                         static_cast<unsigned int>(line));
+        kconsole->printf(" Function:  %s\n",
+                         function ? function : "(unavailable)");
+        kconsole->printf(" Caller RIP: %016x\n",
+                         reinterpret_cast<unsigned long long>(
+                             __builtin_return_address(0)));
+        print_footer();
+    }
+    halt();
+}

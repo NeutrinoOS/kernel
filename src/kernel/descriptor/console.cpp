@@ -37,7 +37,7 @@ uint32_t stdout_redirect_handle(const DescriptorEntry& entry) {
         ~kRedirectStdoutTag);
 }
 
-void fill_stdout_redirect(process::Process& proc, Allocation& alloc) {
+void fill_stdout_redirect(process::Task& proc, Allocation& alloc) {
     alloc.type = kTypeConsole;
     alloc.flags = static_cast<uint64_t>(Flag::Writable);
     alloc.extended_flags = 0;
@@ -51,7 +51,7 @@ void fill_stdout_redirect(process::Process& proc, Allocation& alloc) {
     alloc.ops = &kConsoleOps;
 }
 
-bool can_redirect_to_stdout(process::Process& proc) {
+bool can_redirect_to_stdout(process::Task& proc) {
     uint32_t handle = proc.resources->standard_descriptors[1];
     if (handle == kInvalidHandle) {
         return false;
@@ -270,7 +270,7 @@ int console_get_property(DescriptorEntry& entry,
     return -1;
 }
 
-int64_t console_read(process::Process&,
+int64_t console_read(process::Task&,
                      DescriptorEntry&,
                      uint64_t,
                      uint64_t,
@@ -278,7 +278,7 @@ int64_t console_read(process::Process&,
     return -1;
 }
 
-int64_t console_write(process::Process& proc,
+int64_t console_write(process::Task& proc,
                       DescriptorEntry& entry,
                       uint64_t user_address,
                       uint64_t length,
@@ -325,7 +325,7 @@ const Ops kConsoleOps{
     .set_property = console_set_property,
 };
 
-process::Process* g_console_owner = nullptr;
+process::Task* g_console_owner = nullptr;
 size_t g_console_refcount = 0;
 
 void close_console(DescriptorEntry&) {
@@ -337,7 +337,7 @@ void close_console(DescriptorEntry&) {
     }
 }
 
-bool open_console(process::Process& proc,
+bool open_console(process::Task& proc,
                   uint64_t,
                   uint64_t,
                   uint64_t,
@@ -386,7 +386,7 @@ bool register_console_descriptor() {
     return register_type(kTypeConsole, console_descriptor::open_console, &console_descriptor::kConsoleOps);
 }
 
-bool transfer_console_owner(process::Process& from, process::Process& to) {
+bool transfer_console_owner(process::Task& from, process::Task& to) {
     if (console_descriptor::g_console_owner != &from &&
         (console_descriptor::g_console_owner == nullptr ||
          console_descriptor::g_console_owner->resources != from.resources)) {
@@ -397,12 +397,12 @@ bool transfer_console_owner(process::Process& from, process::Process& to) {
     return true;
 }
 
-void restore_console_owner(process::Process& proc) {
+void restore_console_owner(process::Task& proc) {
     console_descriptor::g_console_owner = &proc;
     ++console_descriptor::g_console_refcount;
 }
 
-bool console_is_owner(const process::Process& proc) {
+bool console_is_owner(const process::Task& proc) {
     return console_descriptor::g_console_owner == &proc ||
            (console_descriptor::g_console_owner != nullptr &&
             (console_descriptor::g_console_owner->resources == proc.resources ||

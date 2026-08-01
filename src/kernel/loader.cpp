@@ -11,9 +11,11 @@ namespace {
 
 constexpr uint8_t kElfMagic[4] = {0x7F, 'E', 'L', 'F'};
 constexpr uint64_t kPageSize = 0x1000;
-constexpr size_t kMaxSharedObjects = 5;
+// The main image plus FFmpeg's seven public DSOs fits within this bounded
+// graph while leaving room for ordinary package-level dependencies.
+constexpr size_t kMaxSharedObjects = 16;
+constexpr size_t kDefaultMainStackSize = 256 * 1024;
 constexpr size_t kMaxNeeded = 8;
-constexpr size_t kMaxSharedObjectImageSize = 2 * 1024 * 1024;
 constexpr size_t kMaxSharedObjectName = 64;
 constexpr size_t kMaxSharedObjectPath = 128;
 
@@ -295,7 +297,7 @@ bool read_shared_object_image(const char* path,
     if (!vfs::open_file(path, handle)) {
         return false;
     }
-    if (handle.size == 0 || handle.size > kMaxSharedObjectImageSize) {
+    if (handle.size == 0 || handle.size > SIZE_MAX) {
         vfs::close_file(handle);
         return false;
     }
@@ -346,8 +348,14 @@ bool looks_like_elf(const uint8_t* data, size_t size) {
            header->ident[3] == kElfMagic[3];
 }
 
-bool setup_user_stack(process::Process& proc) {
-    proc.stack_region = vm::allocate_user_stack(proc.cr3, 16 * 1024);
+bool setup_user_stack(process::Task& proc) {
+    // Library code can legitimately use frames larger than the old 16 KiB
+    // allocation (enabled FFmpeg routines use up to about 48 KiB apiece).
+    // Keep enough headroom for callers without adopting FFmpeg's 1 MiB
+    // pthread default for every process. allocate_user_stack() retains an
+    // unmapped guard page below this region.
+    proc.stack_region = vm::allocate_user_stack(proc.cr3,
+                                                 kDefaultMainStackSize);
     if (proc.stack_region.top == 0) {
         log_message(LogLevel::Error,
                     "Loader: failed to allocate stack for process %u",
@@ -360,7 +368,7 @@ bool setup_user_stack(process::Process& proc) {
 }
 
 bool load_flat_binary(const loader::ProgramImage& image,
-                      process::Process& proc) {
+                      process::Task& proc) {
     uint64_t entry_point = 0;
     proc.code_region = vm::map_user_code(proc.cr3,
                                          image.data,
@@ -641,7 +649,7 @@ bool resolve_symbol(const char* name,
 }
 
 bool map_elf_object(const loader::ProgramImage& image,
-                    process::Process& proc,
+                    process::Task& proc,
                     const char* name,
                     bool main_object,
                     LoadedObject& object) {
@@ -784,7 +792,7 @@ bool map_elf_object(const loader::ProgramImage& image,
 }
 
 bool protect_elf_object_pages(const LoadedObject& object,
-                              process::Process& proc) {
+                              process::Task& proc) {
     loader::ProgramImage image{object.data, object.size, 0};
     const auto* header = reinterpret_cast<const Elf64Ehdr*>(object.data);
     uint64_t aligned_min = align_down(object.min_vaddr, kPageSize);
@@ -842,7 +850,7 @@ bool apply_relocation(const LoadedObject& object,
                       const Elf64Rela& rela,
                       const LoadedObject* objects,
                       size_t object_count,
-                      process::Process& proc) {
+                      process::Task& proc) {
     uint32_t type = static_cast<uint32_t>(rela.info & 0xFFFFFFFFu);
     uint32_t sym_index = static_cast<uint32_t>(rela.info >> 32);
     uint64_t value = 0;
@@ -901,7 +909,7 @@ bool apply_relocation_table(const LoadedObject& object,
                             uint64_t rela_ent,
                             const LoadedObject* objects,
                             size_t object_count,
-                            process::Process& proc) {
+                            process::Task& proc) {
     if (rela_addr == 0 || rela_size == 0) {
         return true;
     }
@@ -942,7 +950,7 @@ bool apply_relocation_table(const LoadedObject& object,
 
 bool apply_dynamic_relocations(const LoadedObject* objects,
                                size_t object_count,
-                               process::Process& proc) {
+                               process::Task& proc) {
     for (size_t i = 0; i < object_count; ++i) {
         const LoadedObject& object = objects[i];
         if (!apply_relocation_table(object,
@@ -981,7 +989,7 @@ bool object_already_loaded(const LoadedObject* objects,
 bool load_needed_object(const char* name,
                         LoadedObject* objects,
                         size_t& object_count,
-                        process::Process& proc) {
+                        process::Task& proc) {
     if (name == nullptr || name[0] == '\0') {
         return false;
     }
@@ -1051,7 +1059,7 @@ void free_dependency_images(LoadedObject* objects, size_t object_count) {
 }
 
 bool load_dynamic_elf_binary(const loader::ProgramImage& image,
-                             process::Process& proc) {
+                             process::Task& proc) {
     LoadedObject objects[kMaxSharedObjects]{};
     size_t object_count = 0;
 
@@ -1114,7 +1122,7 @@ bool load_dynamic_elf_binary(const loader::ProgramImage& image,
 }
 
 bool load_elf_binary(const loader::ProgramImage& image,
-                     process::Process& proc) {
+                     process::Task& proc) {
     if (image.data == nullptr || image.size < sizeof(Elf64Ehdr)) {
         log_message(LogLevel::Error,
                     "Loader: ELF image too small for header");
@@ -1417,11 +1425,254 @@ bool load_elf_binary(const loader::ProgramImage& image,
     return true;
 }
 
+bool read_exact(vfs::FileHandle& file,
+                uint64_t offset,
+                void* buffer,
+                size_t length) {
+    auto* bytes = static_cast<uint8_t*>(buffer);
+    size_t total = 0;
+    while (total < length) {
+        if (offset > UINT64_MAX - total) {
+            return false;
+        }
+        size_t read = 0;
+        if (!vfs::read_file(file,
+                            offset + total,
+                            bytes + total,
+                            length - total,
+                            read) ||
+            read == 0) {
+            return false;
+        }
+        total += read;
+    }
+    return true;
+}
+
+bool load_static_elf_file(vfs::FileHandle& file,
+                          const Elf64Ehdr& header,
+                          const Elf64Phdr* phdrs,
+                          process::Task& proc) {
+    uint64_t min_vaddr = UINT64_MAX;
+    uint64_t max_vaddr = 0;
+    size_t loadable_segments = 0;
+    const Elf64Phdr* dynamic_phdr = nullptr;
+
+    for (uint16_t i = 0; i < header.phnum; ++i) {
+        const Elf64Phdr& ph = phdrs[i];
+        if (ph.type == PT_DYNAMIC) {
+            dynamic_phdr = &ph;
+        }
+        if (ph.type != PT_LOAD) {
+            continue;
+        }
+        ++loadable_segments;
+        if (ph.filesz > ph.memsz || ph.offset > file.size ||
+            ph.filesz > file.size - ph.offset ||
+            ph.vaddr > UINT64_MAX - ph.memsz) {
+            log_message(LogLevel::Error,
+                        "Loader: invalid streamed ELF segment");
+            return false;
+        }
+        if (ph.memsz == 0) {
+            continue;
+        }
+        if (ph.vaddr < min_vaddr) min_vaddr = ph.vaddr;
+        if (ph.vaddr + ph.memsz > max_vaddr) {
+            max_vaddr = ph.vaddr + ph.memsz;
+        }
+    }
+    if (loadable_segments == 0 || min_vaddr == UINT64_MAX ||
+        max_vaddr <= min_vaddr || header.entry < min_vaddr ||
+        header.entry >= max_vaddr) {
+        log_message(LogLevel::Error,
+                    "Loader: invalid streamed ELF load range");
+        return false;
+    }
+
+    uint64_t aligned_min = align_down(min_vaddr, kPageSize);
+    uint64_t aligned_max = align_up(max_vaddr, kPageSize);
+    if (aligned_max < max_vaddr || aligned_max <= aligned_min ||
+        aligned_max - aligned_min > SIZE_MAX) {
+        return false;
+    }
+    size_t span = static_cast<size_t>(aligned_max - aligned_min);
+    vm::Usage usage = vm::usage(proc.cr3);
+    uint64_t limit = proc.resources->limits.max_virtual_bytes;
+    if (usage.virtual_bytes > limit || span > limit - usage.virtual_bytes) {
+        log_message(LogLevel::Error,
+                    "Loader: executable exceeds process virtual-memory limit");
+        return false;
+    }
+    vm::Region region = vm::allocate_user_region(proc.cr3, span);
+    if (region.base == 0) {
+        return false;
+    }
+    uint64_t load_bias = region.base - aligned_min;
+
+    constexpr size_t kStreamChunk = 4096;
+    auto* buffer = static_cast<uint8_t*>(
+        memory::alloc_kernel(kStreamChunk, alignof(uint64_t)));
+    if (buffer == nullptr) {
+        return false;
+    }
+    bool copied = true;
+    for (uint16_t i = 0; i < header.phnum && copied; ++i) {
+        const Elf64Phdr& ph = phdrs[i];
+        if (ph.type != PT_LOAD || ph.memsz == 0) continue;
+        uint64_t copied_bytes = 0;
+        while (copied_bytes < ph.filesz) {
+            size_t chunk = static_cast<size_t>(ph.filesz - copied_bytes);
+            if (chunk > kStreamChunk) chunk = kStreamChunk;
+            if (!read_exact(file, ph.offset + copied_bytes, buffer, chunk) ||
+                !vm::copy_to_user(proc.cr3,
+                                  load_bias + ph.vaddr + copied_bytes,
+                                  buffer,
+                                  chunk)) {
+                copied = false;
+                break;
+            }
+            copied_bytes += chunk;
+        }
+        if (copied && ph.memsz > ph.filesz &&
+            !vm::fill_user(proc.cr3,
+                           load_bias + ph.vaddr + ph.filesz,
+                           0,
+                           static_cast<size_t>(ph.memsz - ph.filesz))) {
+            copied = false;
+        }
+    }
+    memory::free_kernel(buffer);
+    if (!copied) {
+        return false;
+    }
+
+    if (dynamic_phdr != nullptr) {
+        if (dynamic_phdr->vaddr < min_vaddr ||
+            dynamic_phdr->vaddr > max_vaddr ||
+            dynamic_phdr->memsz > max_vaddr - dynamic_phdr->vaddr) {
+            log_message(LogLevel::Error,
+                        "Loader: streamed dynamic table is outside load range");
+            return false;
+        }
+        uint64_t rela_addr = 0;
+        uint64_t rela_size = 0;
+        uint64_t rela_ent = sizeof(Elf64Rela);
+        size_t dyn_count =
+            static_cast<size_t>(dynamic_phdr->memsz / sizeof(Elf64Dyn));
+        for (size_t i = 0; i < dyn_count; ++i) {
+            Elf64Dyn dyn{};
+            if (!vm::copy_from_user(
+                    proc.cr3,
+                    &dyn,
+                    load_bias + dynamic_phdr->vaddr + i * sizeof(dyn),
+                    sizeof(dyn))) {
+                return false;
+            }
+            if (dyn.tag == DT_NULL) break;
+            if (dyn.tag == DT_RELA) rela_addr = dyn.val;
+            if (dyn.tag == DT_RELASZ) rela_size = dyn.val;
+            if (dyn.tag == DT_RELAENT) rela_ent = dyn.val;
+        }
+        if (rela_addr != 0 && rela_size != 0) {
+            if (rela_ent < sizeof(Elf64Rela) ||
+                rela_size / rela_ent > SIZE_MAX) {
+                return false;
+            }
+            size_t count = static_cast<size_t>(rela_size / rela_ent);
+            for (size_t i = 0; i < count; ++i) {
+                Elf64Rela rela{};
+                if (!vm::copy_from_user(proc.cr3,
+                                        &rela,
+                                        load_bias + rela_addr + i * rela_ent,
+                                        sizeof(rela)) ||
+                    static_cast<uint32_t>(rela.info) != R_X86_64_RELATIVE) {
+                    log_message(LogLevel::Error,
+                                "Loader: unsupported streamed ELF relocation");
+                    return false;
+                }
+                if (rela.offset < aligned_min ||
+                    rela.offset > aligned_max - sizeof(uint64_t)) {
+                    log_message(LogLevel::Error,
+                                "Loader: streamed relocation target is outside image");
+                    return false;
+                }
+                uint64_t value =
+                    load_bias + static_cast<uint64_t>(rela.addend);
+                if (!vm::copy_to_user(proc.cr3,
+                                      load_bias + rela.offset,
+                                      &value,
+                                      sizeof(value))) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    for (uint64_t page = aligned_min; page < aligned_max; page += kPageSize) {
+        bool covered = false;
+        bool writable = false;
+        bool executable = false;
+        for (uint16_t i = 0; i < header.phnum; ++i) {
+            const Elf64Phdr& ph = phdrs[i];
+            if (ph.type != PT_LOAD || ph.memsz == 0) continue;
+            uint64_t start = align_down(ph.vaddr, kPageSize);
+            uint64_t end = align_up(ph.vaddr + ph.memsz, kPageSize);
+            if (page < start || page >= end) continue;
+            covered = true;
+            writable = writable || (ph.flags & PF_W) != 0;
+            executable = executable || (ph.flags & PF_X) != 0;
+        }
+        if (!covered) continue;
+        if (writable && executable) {
+            log_message(LogLevel::Error,
+                        "Loader: refusing writable executable streamed ELF page");
+            return false;
+        }
+        uint64_t address = load_bias + page;
+        if (!vm::set_user_region_writable(
+                proc.cr3, address, kPageSize, writable) ||
+            !vm::set_user_region_executable(
+                proc.cr3, address, kPageSize, executable)) {
+            return false;
+        }
+    }
+
+    proc.code_region = region;
+    proc.user_ip = load_bias + header.entry;
+    return true;
+}
+
+bool file_has_needed_dependencies(vfs::FileHandle& file,
+                                  const Elf64Ehdr& header,
+                                  const Elf64Phdr* phdrs) {
+    for (uint16_t i = 0; i < header.phnum; ++i) {
+        const Elf64Phdr& ph = phdrs[i];
+        if (ph.type != PT_DYNAMIC || ph.filesz == 0 ||
+            ph.offset > file.size || ph.filesz > file.size - ph.offset) {
+            continue;
+        }
+        size_t count = static_cast<size_t>(ph.filesz / sizeof(Elf64Dyn));
+        for (size_t j = 0; j < count; ++j) {
+            Elf64Dyn dyn{};
+            if (!read_exact(file,
+                            ph.offset + j * sizeof(dyn),
+                            &dyn,
+                            sizeof(dyn)) ||
+                dyn.tag == DT_NULL) {
+                break;
+            }
+            if (dyn.tag == DT_NEEDED) return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 namespace loader {
 
-bool load_into_process(const ProgramImage& image, process::Process& proc) {
+bool load_into_process(const ProgramImage& image, process::Task& proc) {
     bool loaded = false;
     if (looks_like_elf(image.data, image.size)) {
         if (image_has_needed_dependencies(image)) {
@@ -1441,6 +1692,59 @@ bool load_into_process(const ProgramImage& image, process::Process& proc) {
         return false;
     }
 
+    proc.has_context = false;
+    process::store_state(proc, process::State::Ready);
+    return true;
+}
+
+bool load_file_into_process(const char* path, process::Task& proc) {
+    if (path == nullptr) return false;
+    vfs::FileHandle file{};
+    if (!vfs::open_file(path, file) || file.size < sizeof(Elf64Ehdr)) {
+        vfs::close_file(file);
+        return false;
+    }
+    Elf64Ehdr header{};
+    if (!read_exact(file, 0, &header, sizeof(header)) ||
+        !looks_like_elf(reinterpret_cast<const uint8_t*>(&header),
+                        sizeof(header)) ||
+        !validate_elf_header(header) ||
+        header.phoff > file.size ||
+        static_cast<uint64_t>(header.phnum) >
+            (file.size - header.phoff) / sizeof(Elf64Phdr) ||
+        header.phnum > SIZE_MAX / sizeof(Elf64Phdr)) {
+        vfs::close_file(file);
+        return false;
+    }
+    size_t phdr_bytes = static_cast<size_t>(header.phnum) * sizeof(Elf64Phdr);
+    auto* phdrs = static_cast<Elf64Phdr*>(
+        memory::alloc_kernel(phdr_bytes, alignof(Elf64Phdr)));
+    if (phdrs == nullptr ||
+        !read_exact(file, header.phoff, phdrs, phdr_bytes)) {
+        memory::free_kernel(phdrs);
+        vfs::close_file(file);
+        return false;
+    }
+
+    bool loaded = false;
+    if (file_has_needed_dependencies(file, header, phdrs)) {
+        if (file.size <= SIZE_MAX) {
+            auto* image_data = static_cast<uint8_t*>(
+                memory::alloc_kernel(static_cast<size_t>(file.size), 16));
+            if (image_data != nullptr &&
+                read_exact(file, 0, image_data, static_cast<size_t>(file.size))) {
+                ProgramImage image{
+                    image_data, static_cast<size_t>(file.size), 0};
+                loaded = load_dynamic_elf_binary(image, proc);
+            }
+            memory::free_kernel(image_data);
+        }
+    } else {
+        loaded = load_static_elf_file(file, header, phdrs, proc);
+    }
+    memory::free_kernel(phdrs);
+    vfs::close_file(file);
+    if (!loaded || !setup_user_stack(proc)) return false;
     proc.has_context = false;
     process::store_state(proc, process::State::Ready);
     return true;

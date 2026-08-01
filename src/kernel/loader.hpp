@@ -13,7 +13,7 @@ struct ProgramImage {
     uint64_t entry_offset;
 };
 
-bool load_into_process(const ProgramImage& image, process::Process& proc);
+bool load_into_process(const ProgramImage& image, process::Task& proc);
+bool load_file_into_process(const char* path, process::Task& proc);
 
 }  // namespace loader
-

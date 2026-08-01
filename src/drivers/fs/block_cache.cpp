@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "drivers/log/logging.hpp"
+#include "kernel/error.hpp"
 #include "lib/mem.hpp"
 
 namespace fs {
@@ -86,6 +87,8 @@ public:
             return;
         }
         lock();
+        KERNEL_ASSERT_MSG(g_active_cached_ops != 0,
+                          "block-cache active operation count underflow");
         --g_active_cached_ops;
         unlock();
     }
@@ -154,7 +157,12 @@ size_t cache_hash(const CachedDevice& cached, uint32_t lba) {
 
 CacheEntry* find_entry(CachedDevice& cached, uint32_t lba, size_t sector_size) {
     int32_t index = g_hash_heads[cache_hash(cached, lba)];
+    size_t traversed = 0;
     while (index >= 0) {
+        KERNEL_ASSERT_MSG(static_cast<size_t>(index) < kCacheEntryCount,
+                          "block-cache hash chain index is out of bounds");
+        KERNEL_ASSERT_MSG(traversed++ < kCacheEntryCount,
+                          "block-cache hash chain contains a cycle");
         CacheEntry& entry = g_entries[static_cast<size_t>(index)];
         if (entry.valid && entry.owner == &cached && entry.lba == lba &&
             entry.sector_size == sector_size) {
@@ -172,7 +180,12 @@ void unlink_entry_locked(CacheEntry& target) {
     }
     size_t bucket = cache_hash(*target.owner, target.lba);
     int32_t* link = &g_hash_heads[bucket];
+    size_t traversed = 0;
     while (*link >= 0) {
+        KERNEL_ASSERT_MSG(static_cast<size_t>(*link) < kCacheEntryCount,
+                          "block-cache unlink index is out of bounds");
+        KERNEL_ASSERT_MSG(traversed++ < kCacheEntryCount,
+                          "block-cache unlink chain contains a cycle");
         CacheEntry& entry = g_entries[static_cast<size_t>(*link)];
         if (&entry == &target) {
             *link = entry.hash_next;
@@ -185,7 +198,11 @@ void unlink_entry_locked(CacheEntry& target) {
 }
 
 void link_entry_locked(CacheEntry& entry) {
+    KERNEL_ASSERT_MSG(entry.owner != nullptr,
+                      "block-cache entry has no owning device");
     size_t index = static_cast<size_t>(&entry - g_entries);
+    KERNEL_ASSERT_MSG(index < kCacheEntryCount,
+                      "block-cache entry is outside the cache table");
     size_t bucket = cache_hash(*entry.owner, entry.lba);
     entry.hash_next = g_hash_heads[bucket];
     g_hash_heads[bucket] = static_cast<int32_t>(index);
@@ -231,9 +248,14 @@ bool flush_dirty_entry(CacheEntry* target) {
     }
 
     owner = target->owner;
+    KERNEL_ASSERT_MSG(owner != nullptr,
+                      "dirty block-cache entry has no owning device");
     lba = target->lba;
     generation = target->generation;
     sector_size = target->sector_size;
+    KERNEL_ASSERT_MSG(sector_size != 0 &&
+                          sector_size <= kCacheSectorSize,
+                      "block-cache entry has an invalid sector size");
     // Claim the backing device while the cache identity is still protected.
     // A write-through invalidation cannot overtake this older snapshot and be
     // overwritten by it later.

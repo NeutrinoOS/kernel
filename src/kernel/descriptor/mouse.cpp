@@ -6,7 +6,7 @@ namespace descriptor {
 
 namespace descriptor_mouse {
 
-int64_t mouse_read(process::Process& proc,
+int64_t mouse_read(process::Task& proc,
                    DescriptorEntry& entry,
                    uint64_t user_address,
                    uint64_t length,
@@ -36,7 +36,7 @@ int64_t mouse_read(process::Process& proc,
     return static_cast<int64_t>(count * sizeof(mouse::Event));
 }
 
-int64_t mouse_write(process::Process&,
+int64_t mouse_write(process::Task&,
                     DescriptorEntry&,
                     uint64_t,
                     uint64_t,
@@ -67,7 +67,7 @@ bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents) {
     return true;
 }
 
-bool open_mouse(process::Process& proc,
+bool open_mouse(process::Task& proc,
                 uint64_t,
                 uint64_t,
                 uint64_t,

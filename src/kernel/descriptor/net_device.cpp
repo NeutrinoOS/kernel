@@ -8,7 +8,7 @@ namespace descriptor {
 
 namespace descriptor_net_device {
 
-int64_t net_device_read(process::Process&,
+int64_t net_device_read(process::Task&,
                         DescriptorEntry& entry,
                         uint64_t user_address,
                         uint64_t length,
@@ -39,7 +39,7 @@ int64_t net_device_read(process::Process&,
     return static_cast<int64_t>(out_size);
 }
 
-int64_t net_device_write(process::Process&,
+int64_t net_device_write(process::Task&,
                          DescriptorEntry& entry,
                          uint64_t user_address,
                          uint64_t length,
@@ -192,7 +192,7 @@ const Ops kNetDeviceOps{
     .set_property = set_property,
 };
 
-bool open_net_device(process::Process&,
+bool open_net_device(process::Task&,
                      uint64_t resource_selector,
                      uint64_t requested_flags,
                      uint64_t,

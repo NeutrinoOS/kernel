@@ -88,7 +88,7 @@ extern "C" void syscall_dispatch(SyscallFrame* frame) {
             scheduler::reschedule(*frame);
             break;
         case Result::Unschedule: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc != nullptr) {
                 process::terminate(
                     *proc,
@@ -100,7 +100,7 @@ extern "C" void syscall_dispatch(SyscallFrame* frame) {
     }
 
     if (!valid_user_return_state(frame->user_rip, frame->user_rsp)) {
-        process::Process* proc = process::current();
+        process::Task* proc = process::current();
         if (proc != nullptr) {
             process::terminate(*proc, 0x800Du);
             scheduler::reschedule(*frame);
@@ -110,7 +110,7 @@ extern "C" void syscall_dispatch(SyscallFrame* frame) {
 }
 
 extern "C" uint64_t syscall_kernel_stack_top() {
-    process::Process* proc = process::current();
+    process::Task* proc = process::current();
     if (proc != nullptr && proc->kernel_stack_top != 0) {
         return proc->kernel_stack_top;
     }

@@ -15,13 +15,14 @@
 #include "arch/x86_64/smp.hpp"
 #include "descriptor.hpp"
 #include "debug_heartbeat.hpp"
+#include "error.hpp"
 #include "sync.hpp"
 #include "time.hpp"
 
 namespace {
 
 struct RunQueue {
-    process::Process* items[process::kMaxProcesses];
+    process::Task* items[process::kMaxTasks];
     size_t head = 0;
     size_t count = 0;
 };
@@ -33,7 +34,7 @@ uint32_t g_rr_assign = 0;
 constexpr size_t kMaxPollFns = 16;
 scheduler::PollFn g_poll_fns[kMaxPollFns]{};
 sync::SpinLock g_poll_lock;
-process::Process* g_poll_worker = nullptr;
+process::Task* g_poll_worker = nullptr;
 bool g_poll_worker_starting = false;
 constexpr uint64_t kTargetLatencyNs = 6'000'000ull;
 constexpr uint64_t kMinGranularityNs = 900'000ull;
@@ -53,7 +54,7 @@ RunQueue& queue_for_cpu(size_t idx) {
     return g_run_queues[idx];
 }
 
-bool queue_contains(process::Process* proc) {
+bool queue_contains(process::Task* proc) {
     for (size_t q = 0; q < percpu::kMaxCpus; ++q) {
         RunQueue& rq = g_run_queues[q];
         size_t idx = rq.head;
@@ -61,27 +62,37 @@ bool queue_contains(process::Process* proc) {
             if (rq.items[idx] == proc) {
                 return true;
             }
-            idx = (idx + 1) % process::kMaxProcesses;
+            idx = (idx + 1) % process::kMaxTasks;
         }
     }
     return false;
 }
 
-void queue_push(RunQueue& rq, process::Process* proc) {
-    if (rq.count >= process::kMaxProcesses) {
+void queue_push(RunQueue& rq, process::Task* proc) {
+    KERNEL_ASSERT_MSG(rq.head < process::kMaxTasks,
+                      "scheduler run queue head is out of bounds");
+    KERNEL_ASSERT_MSG(rq.count <= process::kMaxTasks,
+                      "scheduler run queue count is out of bounds");
+    KERNEL_ASSERT_MSG(proc != nullptr,
+                      "scheduler attempted to enqueue a null process");
+    if (rq.count >= process::kMaxTasks) {
         return;
     }
-    size_t tail = (rq.head + rq.count) % process::kMaxProcesses;
+    size_t tail = (rq.head + rq.count) % process::kMaxTasks;
     rq.items[tail] = proc;
     ++rq.count;
 }
 
-process::Process* queue_pop(RunQueue& rq) {
+process::Task* queue_pop(RunQueue& rq) {
+    KERNEL_ASSERT_MSG(rq.head < process::kMaxTasks,
+                      "scheduler run queue head is out of bounds");
+    KERNEL_ASSERT_MSG(rq.count <= process::kMaxTasks,
+                      "scheduler run queue count is out of bounds");
     if (rq.count == 0) {
         return nullptr;
     }
-    process::Process* proc = rq.items[rq.head];
-    rq.head = (rq.head + 1) % process::kMaxProcesses;
+    process::Task* proc = rq.items[rq.head];
+    rq.head = (rq.head + 1) % process::kMaxTasks;
     --rq.count;
     return proc;
 }
@@ -112,15 +123,15 @@ private:
 
 size_t current_cpu_index();
 
-process::Process* pop_next_runnable(bool include_kernel_tasks) {
+process::Task* pop_next_runnable(bool include_kernel_tasks) {
     for (;;) {
-        process::Process* candidate = nullptr;
+        process::Task* candidate = nullptr;
         {
             QueueGuard guard;
             RunQueue& queue = queue_for_cpu(current_cpu_index());
             size_t remaining = queue.count;
             while (remaining-- != 0) {
-                process::Process* proc = queue_pop(queue);
+                process::Task* proc = queue_pop(queue);
                 if (proc == nullptr) {
                     break;
                 }
@@ -152,7 +163,7 @@ process::Process* pop_next_runnable(bool include_kernel_tasks) {
     }
 }
 
-void poll_worker(process::Process& proc) {
+void poll_worker(process::Task& proc) {
     scheduler::service_polls();
     {
         PollGuard guard;
@@ -170,7 +181,7 @@ void poll_worker(process::Process& proc) {
     }
 }
 
-void enqueue_locked(process::Process* proc) {
+void enqueue_locked(process::Task* proc) {
     size_t total = g_cpu_total;
     size_t online = smp::online_cpus();
     if (online != 0 && online < total) {
@@ -195,19 +206,19 @@ size_t current_cpu_index() {
     return cpu->index;
 }
 
-size_t runnable_user_task_count_locked(process::Process* current_proc) {
+size_t runnable_user_task_count_locked(process::Task* current_proc) {
     size_t total = 0;
     for (size_t q = 0; q < percpu::kMaxCpus; ++q) {
         RunQueue& rq = g_run_queues[q];
         size_t idx = rq.head;
         for (size_t i = 0; i < rq.count; ++i) {
-            process::Process* proc = rq.items[idx];
+            process::Task* proc = rq.items[idx];
             if (proc != nullptr &&
                 !proc->is_kernel_task &&
                 process::load_state(*proc) == process::State::Ready) {
                 ++total;
             }
-            idx = (idx + 1) % process::kMaxProcesses;
+            idx = (idx + 1) % process::kMaxTasks;
         }
     }
     if (current_proc != nullptr &&
@@ -219,7 +230,7 @@ size_t runnable_user_task_count_locked(process::Process* current_proc) {
     return total == 0 ? 1 : total;
 }
 
-uint64_t timeslice_ticks_locked(process::Process* current_proc) {
+uint64_t timeslice_ticks_locked(process::Task* current_proc) {
     size_t task_count = runnable_user_task_count_locked(current_proc);
     uint64_t slice_ns = kTargetLatencyNs / static_cast<uint64_t>(task_count);
     if (slice_ns < kMinGranularityNs) {
@@ -228,7 +239,7 @@ uint64_t timeslice_ticks_locked(process::Process* current_proc) {
     return timekeeping::ticks_for_duration_ns(slice_ns);
 }
 
-void begin_timeslice_locked(process::Process* proc) {
+void begin_timeslice_locked(process::Task* proc) {
     if (proc == nullptr || proc->is_kernel_task) {
         return;
     }
@@ -237,7 +248,7 @@ void begin_timeslice_locked(process::Process* proc) {
     g_slice_duration_ticks[idx] = timeslice_ticks_locked(proc);
 }
 
-bool timeslice_expired_locked(process::Process* proc) {
+bool timeslice_expired_locked(process::Task* proc) {
     if (proc == nullptr || proc->is_kernel_task) {
         return false;
     }
@@ -255,7 +266,7 @@ bool timeslice_expired_locked(process::Process* proc) {
     return now - g_slice_start_ticks[idx] >= duration;
 }
 
-void prepare_frame_for_process(process::Process& proc,
+void prepare_frame_for_task(process::Task& proc,
                                syscall::SyscallFrame& frame) {
     int64_t wait_result = 0;
     if (process::consume_wait_result(proc, wait_result)) {
@@ -273,8 +284,8 @@ void prepare_frame_for_process(process::Process& proc,
     frame.user_rflags = syscall::sanitize_user_rflags(frame.user_rflags);
     if (!proc.has_context) {
         log_message(LogLevel::Debug,
-                    "Scheduler: starting pid=%u image=%s code=%016llx+%zu rip=%016llx stack=%016llx..%016llx rsp=%016llx",
-                    static_cast<unsigned int>(proc.pid),
+                    "Scheduler: starting tid=%u image=%s code=%016llx+%zu rip=%016llx stack=%016llx..%016llx rsp=%016llx",
+                    static_cast<unsigned int>(proc.tid),
                     proc.image_path[0] != '\0' ? proc.image_path : "(unknown)",
                     static_cast<unsigned long long>(proc.code_region.base),
                     static_cast<size_t>(proc.code_region.length),
@@ -347,7 +358,7 @@ void init() {
     }
 }
 
-process::Process* current() {
+process::Task* current() {
     return process::current();
 }
 
@@ -408,7 +419,7 @@ bool register_poll(PollFn fn) {
     }
 
     bool create_worker = false;
-    process::Process* worker_to_wake = nullptr;
+    process::Task* worker_to_wake = nullptr;
     {
         PollGuard guard;
         if (g_poll_worker == nullptr && !g_poll_worker_starting) {
@@ -420,7 +431,7 @@ bool register_poll(PollFn fn) {
     }
 
     if (create_worker) {
-        process::Process* worker = process::allocate_kernel_task(poll_worker);
+        process::Task* worker = process::allocate_kernel_task(poll_worker);
         {
             PollGuard guard;
             g_poll_worker_starting = false;
@@ -462,7 +473,7 @@ void service_polls() {
     }
 }
 
-void enqueue(process::Process* proc) {
+void enqueue(process::Task* proc) {
     if (proc == nullptr) {
         return;
     }
@@ -476,7 +487,7 @@ void enqueue(process::Process* proc) {
     }
 }
 
-void remove(process::Process* proc) {
+void remove(process::Task* proc) {
     if (proc == nullptr) {
         return;
     }
@@ -485,7 +496,7 @@ void remove(process::Process* proc) {
         RunQueue& queue = g_run_queues[q];
         size_t remaining = queue.count;
         while (remaining-- != 0) {
-            process::Process* candidate = queue_pop(queue);
+            process::Task* candidate = queue_pop(queue);
             if (candidate != nullptr && candidate != proc) {
                 queue_push(queue, candidate);
             }
@@ -496,7 +507,7 @@ void remove(process::Process* proc) {
 [[noreturn]] static void run_loop() {
     for (;;) {
         process::reap_deferred();
-        process::Process* next = pop_next_runnable(true);
+        process::Task* next = pop_next_runnable(true);
         if (next == nullptr) {
             process::set_current(nullptr);
             fs::block_cache::service_idle_flush();
@@ -528,16 +539,16 @@ void remove(process::Process* proc) {
             begin_timeslice_locked(next);
         }
         set_rsp0(next->kernel_stack_top);
-        userspace::enter_process(*next);
+        userspace::enter_task(*next);
         log_message(LogLevel::Error,
-                    "Scheduler: process %u returned unexpectedly",
-                    static_cast<unsigned int>(next->pid));
+                    "Scheduler: task %u returned unexpectedly",
+                    static_cast<unsigned int>(next->tid));
     }
 }
 
 void reschedule_impl(syscall::SyscallFrame& frame, bool run_kernel_tasks) {
     process::reap_deferred();
-    process::Process* current_proc = process::current();
+    process::Task* current_proc = process::current();
     if (current_proc == nullptr) {
         return;
     }
@@ -572,7 +583,7 @@ void reschedule_impl(syscall::SyscallFrame& frame, bool run_kernel_tasks) {
         current_proc->has_context = false;
     }
 
-    process::Process* next = nullptr;
+    process::Task* next = nullptr;
     {
         QueueGuard guard;
         if (!terminated) {
@@ -633,7 +644,7 @@ void reschedule_impl(syscall::SyscallFrame& frame, bool run_kernel_tasks) {
             }
             if (state == process::State::Running) {
                 process::set_current(current_proc);
-                prepare_frame_for_process(*current_proc, frame);
+                prepare_frame_for_task(*current_proc, frame);
                 asm volatile("pause");
                 return;
             }
@@ -658,7 +669,7 @@ void reschedule_impl(syscall::SyscallFrame& frame, bool run_kernel_tasks) {
     if (terminated && current_proc != nullptr) {
         process::defer_reclaim(*current_proc);
     }
-    prepare_frame_for_process(*next, frame);
+    prepare_frame_for_task(*next, frame);
 }
 
 void reschedule(syscall::SyscallFrame& frame) {
@@ -683,7 +694,7 @@ void tick(InterruptFrame& frame) {
         process::wake_ready_sleepers(timekeeping::tick_count());
     }
     if ((frame.cs & 0x3) != 0) {
-        process::Process* current_proc = process::current();
+        process::Task* current_proc = process::current();
         bool expired = false;
         {
             QueueGuard guard;

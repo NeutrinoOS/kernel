@@ -2,6 +2,7 @@
 
 #include "arch/x86_64/memory/paging.hpp"
 #include "fs/vfs.hpp"
+#include "kernel/error.hpp"
 #include "kernel/memory/physical_allocator.hpp"
 #include "kernel/sync.hpp"
 #include "lib/mem.hpp"
@@ -152,6 +153,8 @@ void release_private_page(uint64_t phys) {
         if (!entry.in_use || entry.phys != phys) {
             continue;
         }
+        KERNEL_ASSERT_MSG(entry.refcount != 0,
+                          "live page-cache entry has a zero refcount");
         if (entry.refcount > 1) {
             --entry.refcount;
             return;
@@ -160,6 +163,8 @@ void release_private_page(uint64_t phys) {
         entry = {};
         return;
     }
+    KERNEL_ASSERT_MSG(false,
+                      "page cache was asked to release an unknown page");
 }
 
 size_t cached_pages() {

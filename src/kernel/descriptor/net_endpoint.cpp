@@ -22,7 +22,7 @@ enum class Role : uint32_t {
 };
 
 struct EndpointWaiter {
-    process::Process* proc;
+    process::Task* proc;
     uint64_t user_address;
     uint64_t length;
     bool is_read;
@@ -55,7 +55,7 @@ struct NetEndpoint {
 
 struct EndpointHandle {
     NetEndpoint* endpoint;
-    process::Process* owner;
+    process::Task* owner;
     Role role;
     bool in_use;
 };
@@ -180,7 +180,7 @@ NetEndpoint* find_endpoint_locked(uint32_t id) {
 }
 
 EndpointHandle* allocate_handle_locked(NetEndpoint* endpoint,
-                                       process::Process* owner,
+                                       process::Task* owner,
                                        Role role) {
     for (auto& handle : g_handles) {
         if (__atomic_load_n(&handle.in_use, __ATOMIC_ACQUIRE)) {
@@ -262,7 +262,7 @@ void complete_waiter(EndpointWaiter* waiter, int64_t result) {
 }
 
 int64_t ring_copy_out_to_user(Ring& ring,
-                              process::Process& proc,
+                              process::Task& proc,
                               uint64_t user_address,
                               size_t max_bytes) {
     if (user_address == 0 || proc.cr3 == 0) {
@@ -287,7 +287,7 @@ int64_t ring_copy_out_to_user(Ring& ring,
 }
 
 int64_t ring_copy_in_from_user(Ring& ring,
-                               process::Process& proc,
+                               process::Task& proc,
                                uint64_t user_address,
                                size_t max_bytes) {
     if (user_address == 0 || proc.cr3 == 0) {
@@ -403,7 +403,7 @@ void pump_waiters_locked(NetEndpoint& endpoint) {
     } while (progressed);
 }
 
-int64_t endpoint_read(process::Process& proc,
+int64_t endpoint_read(process::Task& proc,
                       DescriptorEntry& entry,
                       uint64_t user_address,
                       uint64_t length,
@@ -462,7 +462,7 @@ int64_t endpoint_read(process::Process& proc,
     return kWouldBlock;
 }
 
-int64_t endpoint_write(process::Process& proc,
+int64_t endpoint_write(process::Task& proc,
                        DescriptorEntry& entry,
                        uint64_t user_address,
                        uint64_t length,
@@ -547,7 +547,7 @@ int endpoint_get_property(DescriptorEntry& entry,
     return 0;
 }
 
-void drop_waiters_for_owner_locked(NetEndpoint& endpoint, process::Process* owner) {
+void drop_waiters_for_owner_locked(NetEndpoint& endpoint, process::Task* owner) {
     EndpointWaiter** lists[] = {
         &endpoint.app_read_waiters,
         &endpoint.app_write_waiters,
@@ -677,7 +677,7 @@ const Ops kEndpointOps{
     .set_property = nullptr,
 };
 
-bool open_endpoint(process::Process& proc,
+bool open_endpoint(process::Task& proc,
                    uint64_t flags,
                    uint64_t existing_id,
                    uint64_t open_context,

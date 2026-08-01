@@ -2,7 +2,7 @@
 
 namespace intel_uhd {
 
-void configure(const char* cmdline);
+void configure();
 void register_driver();
 void init();
 

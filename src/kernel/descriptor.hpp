@@ -6,7 +6,7 @@
 #include "descriptors.hpp"
 
 namespace process {
-struct Process;
+struct Task;
 }
 
 struct Framebuffer;
@@ -89,12 +89,12 @@ struct DescriptorExt {
 };
 
 struct Ops {
-    int64_t (*read)(process::Process& proc,
+    int64_t (*read)(process::Task& proc,
                     DescriptorEntry& entry,
                     uint64_t user_address,
                     uint64_t length,
                     uint64_t offset);
-    int64_t (*write)(process::Process& proc,
+    int64_t (*write)(process::Task& proc,
                      DescriptorEntry& entry,
                      uint64_t user_address,
                      uint64_t length,
@@ -145,7 +145,7 @@ struct Allocation {
     void (*close)(DescriptorEntry& entry);
 };
 
-using OpenFn = bool (*)(process::Process& proc,
+using OpenFn = bool (*)(process::Task& proc,
                         uint64_t arg0,
                         uint64_t arg1,
                         uint64_t arg2,
@@ -156,46 +156,46 @@ bool register_type(uint32_t type, OpenFn open, const Ops* ops);
 void init();
 void register_builtin_types();
 
-bool transfer_console_owner(process::Process& from, process::Process& to);
-void restore_console_owner(process::Process& proc);
-bool console_is_owner(const process::Process& proc);
+bool transfer_console_owner(process::Task& from, process::Task& to);
+void restore_console_owner(process::Task& proc);
+bool console_is_owner(const process::Task& proc);
 
 void init_table(Table& table);
-void destroy_table(process::Process& proc, Table& table);
+void destroy_table(process::Task& proc, Table& table);
 
-uint32_t install(process::Process& proc,
+uint32_t install(process::Task& proc,
                  Table& table,
                  const Allocation& alloc);
-uint32_t install_at(process::Process& proc,
+uint32_t install_at(process::Task& proc,
                     Table& table,
                     uint16_t index,
                     const Allocation& alloc);
-uint32_t open(process::Process& proc,
+uint32_t open(process::Task& proc,
               Table& table,
               uint32_t type,
               uint64_t arg0,
               uint64_t arg1,
               uint64_t arg2);
-uint32_t open_at(process::Process& proc,
+uint32_t open_at(process::Task& proc,
                  Table& table,
                  uint16_t index,
                  uint32_t type,
                  uint64_t arg0,
                  uint64_t arg1,
                  uint64_t arg2);
-int64_t read(process::Process& proc,
+int64_t read(process::Task& proc,
              Table& table,
              uint32_t handle,
              uint64_t user_address,
              uint64_t length,
              uint64_t offset);
-int64_t write(process::Process& proc,
+int64_t write(process::Task& proc,
               Table& table,
               uint32_t handle,
               uint64_t user_address,
               uint64_t length,
               uint64_t offset);
-bool close(process::Process& proc, Table& table, uint32_t handle);
+bool close(process::Task& proc, Table& table, uint32_t handle);
 
 bool get_type(const Table& table, uint32_t handle, uint16_t& out_type);
 bool test_flag(const Table& table,
@@ -206,7 +206,7 @@ bool get_flags(const Table& table,
                uint32_t handle,
                bool extended_set,
                uint64_t& out_flags);
-int get_property(process::Process& proc,
+int get_property(process::Task& proc,
                  Table& table,
                  uint32_t handle,
                  uint32_t property,
@@ -220,13 +220,13 @@ int get_property_trusted(Table& table,
                          uint32_t property,
                          void* out,
                          size_t size);
-int set_property(process::Process& proc,
+int set_property(process::Task& proc,
                  Table& table,
                  uint32_t handle,
                  uint32_t property,
                  uint64_t in_ptr,
                  uint64_t size);
-int wait(process::Process& proc,
+int wait(process::Task& proc,
          Table& table,
          uint64_t user_address,
          size_t count);
@@ -239,13 +239,13 @@ void register_framebuffer_device(Framebuffer& framebuffer,
 void framebuffer_select(uint32_t index);
 uint32_t framebuffer_active_slot();
 bool framebuffer_is_active(uint32_t index);
-int32_t framebuffer_slot_for_process(const process::Process& proc);
-bool framebuffer_process_owns_slot(const process::Process& proc,
+int32_t framebuffer_slot_for_process(const process::Task& proc);
+bool framebuffer_process_owns_slot(const process::Task& proc,
                                    uint32_t slot);
-bool framebuffer_activate_for_process(const process::Process& proc,
+bool framebuffer_activate_for_process(const process::Task& proc,
                                       uint32_t slot);
 bool register_block_device(fs::BlockDevice& device, bool lock_for_kernel);
-bool block_device_from_descriptor(process::Process& proc,
+bool block_device_from_descriptor(process::Task& proc,
                                   uint32_t handle,
                                   fs::BlockDevice& out);
 void reset_block_device_registry();
@@ -274,7 +274,7 @@ int set_property_kernel(uint32_t handle,
                         uint32_t property,
                         const void* in,
                         uint64_t size);
-bool is_kernel_process(const process::Process& proc);
+bool is_kernel_process(const process::Task& proc);
 
 inline constexpr uint16_t handle_index(uint32_t handle) {
     return static_cast<uint16_t>(handle & kHandleIndexMask);

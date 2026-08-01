@@ -29,8 +29,8 @@ struct FramebufferSlot {
     uint64_t physical_base;
     uint64_t physical_pages[kMaxFramebufferPages];
     size_t physical_page_count;
-    process::Process* owner;
-    process::Process* session_owner;
+    process::Task* owner;
+    process::Task* session_owner;
     uint32_t open_count;
     uint32_t session_id;
     bool kernel_reserved;
@@ -300,7 +300,7 @@ bool copy_rect_to_hardware(const FramebufferSlot& slot,
     return true;
 }
 
-bool map_slot_into_process(process::Process& proc,
+bool map_slot_into_process(process::Task& proc,
                            FramebufferSlot& slot,
                            uint64_t& out_base) {
     if (proc.cr3 == 0 || slot.physical_page_count == 0 ||
@@ -373,7 +373,7 @@ bool map_slot_into_process(process::Process& proc,
     return true;
 }
 
-int64_t framebuffer_read(process::Process&,
+int64_t framebuffer_read(process::Task&,
                          DescriptorEntry& entry,
                          uint64_t user_address,
                          uint64_t length,
@@ -403,7 +403,7 @@ int64_t framebuffer_read(process::Process&,
     return static_cast<int64_t>(length);
 }
 
-int64_t framebuffer_write(process::Process&,
+int64_t framebuffer_write(process::Task&,
                           DescriptorEntry& entry,
                           uint64_t user_address,
                           uint64_t length,
@@ -518,7 +518,7 @@ void framebuffer_close(DescriptorEntry& entry) {
     if (slot == nullptr) {
         return;
     }
-    process::Process* owner = nullptr;
+    process::Task* owner = nullptr;
     bool last_close = false;
     {
         LeaseGuard lease_guard;
@@ -549,7 +549,7 @@ void framebuffer_close(DescriptorEntry& entry) {
         if (open_count == 0 && !slot->kernel_reserved) {
             if (slot->owner == owner) {
                 __atomic_store_n(&slot->owner,
-                                 static_cast<process::Process*>(nullptr),
+                                 static_cast<process::Task*>(nullptr),
                                  __ATOMIC_RELEASE);
             }
             last_close = true;
@@ -578,7 +578,7 @@ const Ops kFramebufferOps{
     .set_property = framebuffer_set_property,
 };
 
-FramebufferSlot* allocate_user_slot(process::Process& proc) {
+FramebufferSlot* allocate_user_slot(process::Task& proc) {
     // A graphical session reserves its display slot before opening the
     // framebuffer, making the session descriptor the authority for display
     // and input ownership.
@@ -599,7 +599,7 @@ FramebufferSlot* allocate_user_slot(process::Process& proc) {
     return nullptr;
 }
 
-bool open_framebuffer(process::Process& proc,
+bool open_framebuffer(process::Task& proc,
                       uint64_t arg0,
                       uint64_t,
                       uint64_t,
@@ -776,7 +776,7 @@ const Ops kGraphicalSessionOps{
     .set_property = graphical_session_set_property,
 };
 
-bool open_graphical_session(process::Process& proc,
+bool open_graphical_session(process::Task& proc,
                             uint64_t resource_selector,
                             uint64_t requested_flags,
                             uint64_t open_context,
@@ -892,7 +892,7 @@ uint32_t framebuffer_active_slot() {
     return __atomic_load_n(&g_active_slot, __ATOMIC_ACQUIRE);
 }
 
-int32_t framebuffer_slot_for_process(const process::Process& proc) {
+int32_t framebuffer_slot_for_process(const process::Task& proc) {
     using namespace framebuffer_descriptor;
     if (is_kernel_process(proc)) {
         return 0;
@@ -911,7 +911,7 @@ int32_t framebuffer_slot_for_process(const process::Process& proc) {
     return -1;
 }
 
-bool framebuffer_process_owns_slot(const process::Process& proc,
+bool framebuffer_process_owns_slot(const process::Task& proc,
                                    uint32_t slot) {
     using namespace framebuffer_descriptor;
     if (is_kernel_process(proc)) {
@@ -925,7 +925,7 @@ bool framebuffer_process_owns_slot(const process::Process& proc,
     return candidate.session_owner == &proc || candidate.owner == &proc;
 }
 
-bool framebuffer_activate_for_process(const process::Process& proc,
+bool framebuffer_activate_for_process(const process::Task& proc,
                                       uint32_t slot) {
     using namespace framebuffer_descriptor;
     if (is_kernel_process(proc) || slot == 0 || slot >= kFramebufferSlots) {

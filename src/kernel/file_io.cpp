@@ -23,7 +23,7 @@ volatile int g_file_io_bounce_lock = 0;
 
 class PrincipalSnapshot {
 public:
-    explicit PrincipalSnapshot(const process::Process& proc) {
+    explicit PrincipalSnapshot(const process::Task& proc) {
         sync::LockGuard guard(proc.resources->lock);
         principal_ = proc.resources->principal;
         valid_ = principal_ == nullptr ||
@@ -53,7 +53,7 @@ void unlock_file_io_bounce() {
     __atomic_clear(&g_file_io_bounce_lock, __ATOMIC_RELEASE);
 }
 
-process::FileHandle* get_file_handle(process::Process& proc, uint32_t handle) {
+process::FileHandle* get_file_handle(process::Task& proc, uint32_t handle) {
     if (handle >= process::kMaxFileHandles) {
         return nullptr;
     }
@@ -61,7 +61,7 @@ process::FileHandle* get_file_handle(process::Process& proc, uint32_t handle) {
     return __atomic_load_n(&entry.in_use, __ATOMIC_ACQUIRE) ? &entry : nullptr;
 }
 
-process::DirectoryHandle* get_directory_handle(process::Process& proc,
+process::DirectoryHandle* get_directory_handle(process::Task& proc,
                                                uint32_t handle) {
     if (handle >= process::kMaxDirectoryHandles) {
         return nullptr;
@@ -71,7 +71,7 @@ process::DirectoryHandle* get_directory_handle(process::Process& proc,
     return __atomic_load_n(&entry.in_use, __ATOMIC_ACQUIRE) ? &entry : nullptr;
 }
 
-int32_t allocate_file_handle(process::Process& proc) {
+int32_t allocate_file_handle(process::Task& proc) {
     sync::LockGuard guard(proc.resources->lock);
     uint32_t limit = proc.resources->limits.max_file_handles;
     if (limit > process::kMaxFileHandles) {
@@ -83,7 +83,9 @@ int32_t allocate_file_handle(process::Process& proc) {
         if (!__atomic_load_n(&handle.in_use, __ATOMIC_ACQUIRE) &&
             !handle.reserved) {
             handle.reserved = true;
+            proc.resources->file_handles[i].can_read = false;
             proc.resources->file_handles[i].can_write = false;
+            proc.resources->file_handles[i].append = false;
             proc.resources->file_handles[i].handle = {};
             proc.resources->file_handles[i].position = 0;
             proc.resources->file_handles[i].path[0] = '\0';
@@ -93,7 +95,7 @@ int32_t allocate_file_handle(process::Process& proc) {
     return -1;
 }
 
-int32_t allocate_directory_handle(process::Process& proc) {
+int32_t allocate_directory_handle(process::Task& proc) {
     sync::LockGuard guard(proc.resources->lock);
     uint32_t limit = proc.resources->limits.max_directory_handles;
     if (limit > process::kMaxDirectoryHandles) {
@@ -114,19 +116,19 @@ int32_t allocate_directory_handle(process::Process& proc) {
     return -1;
 }
 
-void release_file_reservation(process::Process& proc, size_t slot) {
+void release_file_reservation(process::Task& proc, size_t slot) {
     sync::LockGuard guard(proc.resources->lock);
     proc.resources->file_handles[slot].reserved = false;
 }
 
-void publish_file_handle(process::Process& proc, size_t slot) {
+void publish_file_handle(process::Task& proc, size_t slot) {
     sync::LockGuard guard(proc.resources->lock);
     process::FileHandle& handle = proc.resources->file_handles[slot];
     handle.reserved = false;
     __atomic_store_n(&handle.in_use, true, __ATOMIC_RELEASE);
 }
 
-void publish_directory_handle(process::Process& proc, size_t slot) {
+void publish_directory_handle(process::Task& proc, size_t slot) {
     sync::LockGuard guard(proc.resources->lock);
     process::DirectoryHandle& handle =
         proc.resources->directory_handles[slot];
@@ -134,7 +136,7 @@ void publish_directory_handle(process::Process& proc, size_t slot) {
     __atomic_store_n(&handle.in_use, true, __ATOMIC_RELEASE);
 }
 
-bool copy_path(process::Process& proc,
+bool copy_path(process::Task& proc,
                const char* user_path,
                char (&out)[path_util::kMaxPathLength]) {
     if (user_path == nullptr) {
@@ -157,7 +159,7 @@ bool copy_path(process::Process& proc,
     return path_util::build_absolute_path(cwd, temp, out);
 }
 
-bool build_child_path(process::Process& proc,
+bool build_child_path(process::Task& proc,
                       const char* base,
                       const char* name,
                       char (&out)[path_util::kMaxPathLength]) {
@@ -189,7 +191,7 @@ vfs::AclValue permission_value(const vfs::AclEntry& entry,
     return vfs::AclValue::Deny;
 }
 
-bool acl_allows(const process::Process& proc,
+bool acl_allows(const process::Task& proc,
                 const char* path,
                 vfs::AclPermission permission) {
     PrincipalSnapshot principal(proc);
@@ -297,7 +299,31 @@ bool parent_path(const char* path,
 
 namespace file_io {
 
-int32_t open_file(process::Process& proc, const char* path) {
+static int32_t open_file_impl(process::Task& proc,
+                              const char* path,
+                              uint32_t flags,
+                              bool legacy_write_if_allowed);
+
+int32_t open_file(process::Task& proc, const char* path) {
+    return open_file_impl(proc, path, OpenRead, true);
+}
+
+int32_t open_file(process::Task& proc, const char* path, uint32_t flags) {
+    return open_file_impl(proc, path, flags, false);
+}
+
+static int32_t open_file_impl(process::Task& proc,
+                              const char* path,
+                              uint32_t flags,
+                              bool legacy_write_if_allowed) {
+    constexpr uint32_t kKnownFlags =
+        OpenRead | OpenWrite | OpenCreate | OpenExclusive | OpenAppend;
+    if ((flags & ~kKnownFlags) != 0 ||
+        (flags & (OpenRead | OpenWrite)) == 0 ||
+        ((flags & OpenExclusive) != 0 && (flags & OpenCreate) == 0) ||
+        ((flags & OpenAppend) != 0 && (flags & OpenWrite) == 0)) {
+        return -1;
+    }
     char local_path[path_util::kMaxPathLength];
     if (!copy_path(proc, path, local_path)) {
         return -1;
@@ -318,9 +344,23 @@ int32_t open_file(process::Process& proc, const char* path) {
         return -1;
     }
     bool check_acl = acl_check_required(principal.get());
-    if (!vfs::open_file(local_path,
-                        vfs_handle,
-                        check_acl ? &acl : nullptr)) {
+    bool opened = false;
+    if ((flags & OpenExclusive) == 0) {
+        opened = vfs::open_file(local_path,
+                                vfs_handle,
+                                check_acl ? &acl : nullptr);
+    }
+    if (!opened && (flags & OpenCreate) != 0) {
+        char parent[path_util::kMaxPathLength];
+        if (parent_path(local_path, parent) &&
+            acl_allows(proc, parent, vfs::AclPermission::Write)) {
+            opened = vfs::create_file(local_path, vfs_handle);
+            if (opened) {
+                acl = {};
+            }
+        }
+    }
+    if (!opened) {
         vfs::close_file(vfs_handle);
         proc.resources->file_handles[static_cast<size_t>(slot)].handle = {};
         release_file_reservation(proc, static_cast<size_t>(slot));
@@ -329,7 +369,8 @@ int32_t open_file(process::Process& proc, const char* path) {
     AclDecision decision = check_acl
                                ? acl_snapshot_decision(principal.get(), acl)
                                : AclDecision{true, true, true, true};
-    if (!decision.read) {
+    if (((flags & OpenRead) != 0 && !decision.read) ||
+        ((flags & OpenWrite) != 0 && !decision.write)) {
         vfs::close_file(vfs_handle);
         proc.resources->file_handles[static_cast<size_t>(slot)].handle = {};
         release_file_reservation(proc, static_cast<size_t>(slot));
@@ -338,14 +379,18 @@ int32_t open_file(process::Process& proc, const char* path) {
 
     process::FileHandle& handle = proc.resources->file_handles[static_cast<size_t>(slot)];
     handle.handle = vfs_handle;
-    handle.can_write = decision.write;
-    handle.position = 0;
+    handle.can_read = (flags & OpenRead) != 0;
+    handle.can_write = legacy_write_if_allowed
+                           ? decision.write
+                           : (flags & OpenWrite) != 0;
+    handle.append = (flags & OpenAppend) != 0;
+    handle.position = handle.append ? handle.handle.size : 0;
     string_util::copy(handle.path, sizeof(handle.path), local_path);
     publish_file_handle(proc, static_cast<size_t>(slot));
     return slot;
 }
 
-int32_t create_file(process::Process& proc, const char* path) {
+int32_t create_file(process::Task& proc, const char* path) {
     char local_path[path_util::kMaxPathLength];
     if (!copy_path(proc, path, local_path)) {
         return -1;
@@ -373,14 +418,16 @@ int32_t create_file(process::Process& proc, const char* path) {
 
     process::FileHandle& handle = proc.resources->file_handles[static_cast<size_t>(slot)];
     handle.handle = vfs_handle;
+    handle.can_read = true;
     handle.can_write = true;
+    handle.append = false;
     handle.position = 0;
     string_util::copy(handle.path, sizeof(handle.path), local_path);
     publish_file_handle(proc, static_cast<size_t>(slot));
     return slot;
 }
 
-bool close_file(process::Process& proc, uint32_t handle) {
+bool close_file(process::Task& proc, uint32_t handle) {
     if (handle >= process::kMaxFileHandles) {
         return false;
     }
@@ -392,13 +439,15 @@ bool close_file(process::Process& proc, uint32_t handle) {
     vfs::close_file(entry->handle);
     __atomic_store_n(&entry->in_use, false, __ATOMIC_RELEASE);
     entry->can_write = false;
+    entry->can_read = false;
+    entry->append = false;
     entry->handle = {};
     entry->position = 0;
     entry->path[0] = '\0';
     return true;
 }
 
-bool sync_file(process::Process& proc, uint32_t handle) {
+bool sync_file(process::Task& proc, uint32_t handle) {
     if (handle >= process::kMaxFileHandles) {
         return false;
     }
@@ -410,14 +459,14 @@ bool sync_file(process::Process& proc, uint32_t handle) {
     return fs::block_cache::flush_all();
 }
 
-int64_t read_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
+int64_t read_file(process::Task& proc, uint32_t handle, uint64_t user_addr,
                   uint64_t length) {
     if (handle >= process::kMaxFileHandles) {
         return -1;
     }
     sync::LockGuard guard(proc.resources->file_locks[handle]);
     process::FileHandle* entry = get_file_handle(proc, handle);
-    if (entry == nullptr) {
+    if (entry == nullptr || !entry->can_read) {
         return -1;
     }
     if (length == 0) {
@@ -470,7 +519,53 @@ int64_t read_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
     return static_cast<int64_t>(total_read);
 }
 
-int64_t write_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
+int64_t read_file_at(process::Task& proc, uint32_t handle,
+                     uint64_t user_addr, uint64_t length, uint64_t offset) {
+    if (handle >= process::kMaxFileHandles) {
+        return -1;
+    }
+    sync::LockGuard guard(proc.resources->file_locks[handle]);
+    process::FileHandle* entry = get_file_handle(proc, handle);
+    if (entry == nullptr || !entry->can_read ||
+        (length != 0 && user_addr == 0)) {
+        return -1;
+    }
+    size_t requested = length > static_cast<uint64_t>(SIZE_MAX)
+                           ? static_cast<size_t>(SIZE_MAX)
+                           : static_cast<size_t>(length);
+    size_t total_read = 0;
+    while (total_read < requested) {
+        if (offset > UINT64_MAX - total_read) {
+            return total_read == 0 ? -1 : static_cast<int64_t>(total_read);
+        }
+        size_t chunk = requested - total_read;
+        if (chunk > kFileIoBounceSize) {
+            chunk = kFileIoBounceSize;
+        }
+        size_t out_size = 0;
+        lock_file_io_bounce();
+        bool ok = vfs::read_file(entry->handle,
+                                 offset + total_read,
+                                 g_file_io_bounce,
+                                 chunk,
+                                 out_size) &&
+                  vm::copy_to_user(proc.cr3,
+                                   user_addr + total_read,
+                                   g_file_io_bounce,
+                                   out_size);
+        unlock_file_io_bounce();
+        if (!ok) {
+            return total_read == 0 ? -1 : static_cast<int64_t>(total_read);
+        }
+        total_read += out_size;
+        if (out_size < chunk) {
+            break;
+        }
+    }
+    return static_cast<int64_t>(total_read);
+}
+
+int64_t write_file(process::Task& proc, uint32_t handle, uint64_t user_addr,
                    uint64_t length) {
     if (handle >= process::kMaxFileHandles) {
         return -1;
@@ -495,6 +590,9 @@ int64_t write_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
         return -1;
     }
 
+    if (entry->append) {
+        entry->position = entry->handle.size;
+    }
     size_t total_written = 0;
     while (total_written < requested) {
         size_t chunk = requested - total_written;
@@ -535,7 +633,76 @@ int64_t write_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
     return static_cast<int64_t>(total_written);
 }
 
-uint64_t map_file_private(process::Process& proc,
+int64_t seek_file(process::Task& proc, uint32_t handle,
+                  int64_t offset, uint32_t whence) {
+    if (handle >= process::kMaxFileHandles || whence > 2) {
+        return -1;
+    }
+    sync::LockGuard guard(proc.resources->file_locks[handle]);
+    process::FileHandle* entry = get_file_handle(proc, handle);
+    if (entry == nullptr) {
+        return -1;
+    }
+    uint64_t base = whence == 0 ? 0 :
+                    whence == 1 ? entry->position : entry->handle.size;
+    uint64_t new_position = 0;
+    if (offset < 0) {
+        uint64_t magnitude = static_cast<uint64_t>(-(offset + 1)) + 1;
+        if (magnitude > base) {
+            return -1;
+        }
+        new_position = base - magnitude;
+    } else {
+        uint64_t positive = static_cast<uint64_t>(offset);
+        if (positive > UINT64_MAX - base || base + positive > INT64_MAX) {
+            return -1;
+        }
+        new_position = base + positive;
+    }
+    entry->position = new_position;
+    return static_cast<int64_t>(new_position);
+}
+
+bool stat_file(process::Task& proc, uint32_t handle, Metadata& metadata) {
+    if (handle >= process::kMaxFileHandles) {
+        return false;
+    }
+    sync::LockGuard guard(proc.resources->file_locks[handle]);
+    process::FileHandle* entry = get_file_handle(proc, handle);
+    if (entry == nullptr) {
+        return false;
+    }
+    metadata = {};
+    metadata.size = entry->handle.size;
+    return true;
+}
+
+bool stat_path(process::Task& proc, const char* path, Metadata& metadata) {
+    char local_path[path_util::kMaxPathLength];
+    if (!copy_path(proc, path, local_path)) {
+        return false;
+    }
+    if (!acl_allows(proc, local_path, vfs::AclPermission::Read)) {
+        return false;
+    }
+    vfs::FileHandle file{};
+    if (vfs::open_file(local_path, file)) {
+        metadata = {};
+        metadata.size = file.size;
+        vfs::close_file(file);
+        return true;
+    }
+    vfs::DirectoryHandle directory{};
+    if (!vfs::open_directory(local_path, directory)) {
+        return false;
+    }
+    metadata = {};
+    metadata.flags = MetadataDirectory;
+    vfs::close_directory(directory);
+    return true;
+}
+
+uint64_t map_file_private(process::Task& proc,
                           uint32_t handle,
                           uint64_t file_offset,
                           size_t length,
@@ -556,7 +723,7 @@ uint64_t map_file_private(process::Process& proc,
                                 flags);
 }
 
-int32_t open_directory(process::Process& proc, const char* path) {
+int32_t open_directory(process::Task& proc, const char* path) {
     char local_path[path_util::kMaxPathLength];
     if (!copy_path(proc, path, local_path)) {
         return -1;
@@ -596,7 +763,7 @@ int32_t open_directory(process::Process& proc, const char* path) {
     return slot;
 }
 
-int32_t open_directory_root(process::Process& proc) {
+int32_t open_directory_root(process::Task& proc) {
     char local_path[path_util::kMaxPathLength];
     local_path[0] = '/';
     local_path[1] = '\0';
@@ -623,7 +790,7 @@ int32_t open_directory_root(process::Process& proc) {
     return slot;
 }
 
-int32_t open_directory_at(process::Process& proc,
+int32_t open_directory_at(process::Task& proc,
                           uint32_t dir_handle,
                           const char* name) {
     if (dir_handle >= process::kMaxDirectoryHandles) {
@@ -679,7 +846,7 @@ int32_t open_directory_at(process::Process& proc,
     return slot;
 }
 
-bool create_directory(process::Process& proc, const char* path) {
+bool create_directory(process::Task& proc, const char* path) {
     char local_path[path_util::kMaxPathLength];
     if (!copy_path(proc, path, local_path)) {
         return false;
@@ -690,7 +857,7 @@ bool create_directory(process::Process& proc, const char* path) {
            vfs::create_directory(local_path);
 }
 
-bool remove_file(process::Process& proc, const char* path) {
+bool remove_file(process::Task& proc, const char* path) {
     char local_path[path_util::kMaxPathLength];
     if (!copy_path(proc, path, local_path)) {
         return false;
@@ -701,7 +868,7 @@ bool remove_file(process::Process& proc, const char* path) {
     return vfs::remove_file(local_path);
 }
 
-bool remove_directory(process::Process& proc, const char* path) {
+bool remove_directory(process::Task& proc, const char* path) {
     char local_path[path_util::kMaxPathLength];
     if (!copy_path(proc, path, local_path)) {
         return false;
@@ -710,7 +877,7 @@ bool remove_directory(process::Process& proc, const char* path) {
            vfs::remove_directory(local_path);
 }
 
-int32_t open_file_at(process::Process& proc,
+int32_t open_file_at(process::Task& proc,
                      uint32_t dir_handle,
                      const char* name) {
     if (dir_handle >= process::kMaxDirectoryHandles) {
@@ -767,14 +934,16 @@ int32_t open_file_at(process::Process& proc,
 
     process::FileHandle& handle = proc.resources->file_handles[static_cast<size_t>(slot)];
     handle.handle = vfs_handle;
+    handle.can_read = true;
     handle.can_write = decision.write;
+    handle.append = false;
     handle.position = 0;
     string_util::copy(handle.path, sizeof(handle.path), local_path);
     publish_file_handle(proc, static_cast<size_t>(slot));
     return slot;
 }
 
-int32_t create_file_at(process::Process& proc,
+int32_t create_file_at(process::Task& proc,
                        uint32_t dir_handle,
                        const char* name) {
     if (dir_handle >= process::kMaxDirectoryHandles) {
@@ -820,14 +989,16 @@ int32_t create_file_at(process::Process& proc,
 
     process::FileHandle& handle = proc.resources->file_handles[static_cast<size_t>(slot)];
     handle.handle = vfs_handle;
+    handle.can_read = true;
     handle.can_write = true;
+    handle.append = false;
     handle.position = 0;
     string_util::copy(handle.path, sizeof(handle.path), local_path);
     publish_file_handle(proc, static_cast<size_t>(slot));
     return slot;
 }
 
-bool close_directory(process::Process& proc, uint32_t handle) {
+bool close_directory(process::Task& proc, uint32_t handle) {
     if (handle >= process::kMaxDirectoryHandles) {
         return false;
     }
@@ -843,7 +1014,7 @@ bool close_directory(process::Process& proc, uint32_t handle) {
     return true;
 }
 
-int64_t read_directory(process::Process& proc, uint32_t handle,
+int64_t read_directory(process::Task& proc, uint32_t handle,
                        uint64_t user_addr) {
     if (handle >= process::kMaxDirectoryHandles) {
         return -1;
@@ -865,7 +1036,7 @@ int64_t read_directory(process::Process& proc, uint32_t handle,
     return 1;
 }
 
-int64_t get_acl(process::Process& proc,
+int64_t get_acl(process::Task& proc,
                 const char* path,
                 uint64_t user_entries,
                 uint64_t max_entries) {
@@ -892,7 +1063,7 @@ int64_t get_acl(process::Process& proc,
     return static_cast<int64_t>(count);
 }
 
-bool set_acl(process::Process& proc,
+bool set_acl(process::Task& proc,
              const char* path,
              uint64_t user_entries,
              uint64_t entry_count) {

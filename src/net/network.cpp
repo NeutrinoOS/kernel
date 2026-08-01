@@ -2,8 +2,10 @@
 
 #include "drivers/log/logging.hpp"
 #include "fs/vfs.hpp"
+#include "kernel/cmdline.hpp"
 #include "kernel/config.hpp"
 #include "kernel/descriptor.hpp"
+#include "kernel/error.hpp"
 #include "kernel/string_util.hpp"
 #include "kernel/sync.hpp"
 #include "lib/mem.hpp"
@@ -230,47 +232,18 @@ bool parse_ipv4_literal(const char* text, size_t length, uint32_t& out) {
     return true;
 }
 
-bool parse_cmdline_ipv4(const char* cmdline, uint32_t& out) {
-    if (cmdline == nullptr) {
-        return false;
-    }
-
-    const char* cursor = cmdline;
-    while (*cursor != '\0') {
-        while (*cursor == ' ') {
-            ++cursor;
+bool find_cmdline_ipv4(uint32_t& out) {
+    for (size_t i = 0; i < kernel_cmdline::token_count(); ++i) {
+        const kernel_cmdline::Token* token = kernel_cmdline::token_at(i);
+        if (token == nullptr || token->value == nullptr) {
+            continue;
         }
-        if (*cursor == '\0') {
-            break;
-        }
-
-        const char* token = cursor;
-        while (*cursor != '\0' && *cursor != ' ') {
-            ++cursor;
-        }
-        size_t token_length = static_cast<size_t>(cursor - token);
-        constexpr const char* kPrefixes[] = {"IPV4=", "IP="};
-        for (size_t i = 0; i < sizeof(kPrefixes) / sizeof(kPrefixes[0]); ++i) {
-            const char* prefix = kPrefixes[i];
-            size_t prefix_length = string_util::length(prefix);
-            if (token_length <= prefix_length) {
-                continue;
-            }
-
-            bool match = true;
-            for (size_t j = 0; j < prefix_length; ++j) {
-                if (token[j] != prefix[j]) {
-                    match = false;
-                    break;
-                }
-            }
-
-            if (match &&
-                parse_ipv4_literal(token + prefix_length,
-                                   token_length - prefix_length,
-                                   out)) {
-                return true;
-            }
+        if ((string_util::equals(token->name, "IPV4") ||
+             string_util::equals(token->name, "IP")) &&
+            parse_ipv4_literal(token->value,
+                               string_util::length(token->value),
+                               out)) {
+            return true;
         }
     }
 
@@ -459,7 +432,7 @@ void handle_ipv4(LinkDevice& device,
 
 }  // namespace
 
-void init(const char* cmdline) {
+void init() {
     g_link_count = 0;
     for (size_t i = 0; i < kMaxLinks; ++i) {
         g_links[i] = nullptr;
@@ -469,7 +442,7 @@ void init(const char* cmdline) {
     g_default_ipv4_address = 0;
 
     uint32_t parsed_ipv4 = 0;
-    if (parse_cmdline_ipv4(cmdline, parsed_ipv4)) {
+    if (find_cmdline_ipv4(parsed_ipv4)) {
         g_default_ipv4_address = parsed_ipv4;
         g_default_ipv4_configured = true;
         char address_text[16];
@@ -622,15 +595,23 @@ bool register_link(LinkDevice& device,
 }
 
 size_t device_count() {
+    KERNEL_ASSERT_MSG(g_link_count <= kMaxLinks,
+                      "network link count is out of bounds");
     return g_link_count;
 }
 
 LinkDevice* device_at(size_t index) {
+    KERNEL_ASSERT_MSG(g_link_count <= kMaxLinks,
+                      "network link count is out of bounds");
     return (index < g_link_count) ? g_links[index] : nullptr;
 }
 
 size_t queued_frame_count(LinkDevice& device) {
     DeviceGuard guard(device);
+    KERNEL_ASSERT_MSG(device.rx_head < kMaxQueuedFrames,
+                      "network receive queue head is out of bounds");
+    KERNEL_ASSERT_MSG(device.rx_tail < kMaxQueuedFrames,
+                      "network receive queue tail is out of bounds");
     size_t count = (device.rx_head >= device.rx_tail)
                        ? static_cast<size_t>(device.rx_head - device.rx_tail)
                        : static_cast<size_t>(kMaxQueuedFrames -
@@ -648,6 +629,10 @@ int read_frame(LinkDevice& device,
     }
 
     DeviceGuard guard(device);
+    KERNEL_ASSERT_MSG(device.rx_head < kMaxQueuedFrames,
+                      "network receive queue head is out of bounds");
+    KERNEL_ASSERT_MSG(device.rx_tail < kMaxQueuedFrames,
+                      "network receive queue tail is out of bounds");
     if (device.rx_head == device.rx_tail) {
         return 0;
     }
@@ -712,6 +697,10 @@ void receive_frame(LinkDevice* device, const void* frame, size_t length) {
         bool queued = false;
         {
             DeviceGuard guard(*device);
+            KERNEL_ASSERT_MSG(device->rx_head < kMaxQueuedFrames,
+                              "network receive queue head is out of bounds");
+            KERNEL_ASSERT_MSG(device->rx_tail < kMaxQueuedFrames,
+                              "network receive queue tail is out of bounds");
             ++device->rx_frames_received;
             uint16_t next_head =
                 static_cast<uint16_t>((device->rx_head + 1) % kMaxQueuedFrames);

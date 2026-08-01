@@ -33,7 +33,7 @@ struct LinkDevice {
     volatile int rx_lock;
 };
 
-void init(const char* cmdline);
+void init();
 void load_config(const char* root_mount_path);
 
 bool register_link(LinkDevice& device,

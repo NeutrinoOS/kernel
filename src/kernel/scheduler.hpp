@@ -10,13 +10,13 @@ namespace scheduler {
 using PollFn = void (*)();
 
 void init();
-void enqueue(process::Process* proc);
-void remove(process::Process* proc);
+void enqueue(process::Task* proc);
+void remove(process::Task* proc);
 [[noreturn]] void run();
 [[noreturn]] void run_cpu();
 void reschedule(syscall::SyscallFrame& frame);
 void reschedule_from_interrupt(InterruptFrame& frame);
-process::Process* current();
+process::Task* current();
 void register_cpu(percpu::Cpu* cpu);
 void tick(InterruptFrame& frame);
 size_t cpu_total();

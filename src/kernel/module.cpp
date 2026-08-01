@@ -6,6 +6,7 @@
 #include "drivers/log/logging.hpp"
 #include "drivers/pci/pci.hpp"
 #include "fs/vfs.hpp"
+#include "kernel/error.hpp"
 #include "kernel/interrupts.hpp"
 #include "kernel/memory/physical_allocator.hpp"
 #include "kernel/scheduler.hpp"
@@ -669,6 +670,8 @@ bool resolve_external_symbol(const char* name, uint64_t& out_value) {
          reinterpret_cast<uint64_t>(&memory::free_kernel_block)},
         {"_ZN9scheduler13register_pollEPFvvE",
          reinterpret_cast<uint64_t>(&scheduler::register_poll)},
+        {"kernel_assertion_failed",
+         reinterpret_cast<uint64_t>(&kernel_assertion_failed)},
         {"memcpy", reinterpret_cast<uint64_t>(&memcpy)},
         {"memset", reinterpret_cast<uint64_t>(&memset)},
     };

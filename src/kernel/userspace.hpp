@@ -1,11 +1,11 @@
 #pragma once
 
 namespace process {
-struct Process;
+struct Task;
 }
 
 namespace userspace {
 
-[[noreturn]] void enter_process(process::Process& proc);
+[[noreturn]] void enter_task(process::Task& proc);
 
 }  // namespace userspace

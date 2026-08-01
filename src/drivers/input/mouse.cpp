@@ -5,6 +5,7 @@
 #include "../interrupts/pic.hpp"
 #include "../log/logging.hpp"
 #include "../../kernel/descriptor.hpp"
+#include "../../kernel/error.hpp"
 #include "../../kernel/sync.hpp"
 
 namespace mouse {
@@ -97,6 +98,10 @@ void enqueue(uint32_t slot, const Event& ev) {
     bool queued = false;
     {
         sync::IrqLockGuard guard(buf.lock);
+        KERNEL_ASSERT_MSG(buf.head < kBufferSize,
+                          "mouse queue head is out of bounds");
+        KERNEL_ASSERT_MSG(buf.tail < kBufferSize,
+                          "mouse queue tail is out of bounds");
         size_t next = (buf.head + 1) % kBufferSize;
         if (next != buf.tail) {
             buf.data[buf.head] = ev;
@@ -115,6 +120,10 @@ bool dequeue(uint32_t slot, Event& ev) {
     }
     SlotBuffer& buf = g_buffers[slot];
     sync::IrqLockGuard guard(buf.lock);
+    KERNEL_ASSERT_MSG(buf.head < kBufferSize,
+                      "mouse queue head is out of bounds");
+    KERNEL_ASSERT_MSG(buf.tail < kBufferSize,
+                      "mouse queue tail is out of bounds");
     if (buf.head == buf.tail) {
         return false;
     }

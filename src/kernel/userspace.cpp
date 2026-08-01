@@ -34,7 +34,7 @@ extern "C" [[noreturn]] void userspace_enter_frame(
 
 namespace userspace {
 
-[[noreturn]] void enter_process(process::Process& proc) {
+[[noreturn]] void enter_task(process::Task& proc) {
     set_rsp0(proc.kernel_stack_top);
     cpu::restore_fpu_state(proc.fpu_state);
     if (proc.has_context) {

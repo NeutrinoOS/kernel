@@ -17,7 +17,7 @@ constexpr size_t kMaxPipes = 64;
 constexpr size_t kMaxPipeWaiters = 128;
 
 struct PipeWaiter {
-    process::Process* proc;
+    process::Task* proc;
     uint64_t user_address;
     uint64_t length;
     bool is_read;
@@ -42,7 +42,7 @@ struct Pipe {
 
 struct PipeEndpoint {
     Pipe* pipe;
-    process::Process* owner;
+    process::Task* owner;
     bool can_read;
     bool can_write;
     bool in_use;
@@ -129,7 +129,7 @@ Pipe* allocate_pipe_locked() {
 }
 
 PipeEndpoint* allocate_pipe_endpoint_locked(Pipe* pipe,
-                                            process::Process* owner,
+                                            process::Task* owner,
                                             bool can_read,
                                             bool can_write) {
     for (auto& endpoint : g_pipe_endpoints) {
@@ -260,7 +260,7 @@ size_t pipe_copy_in(Pipe& pipe, const uint8_t* src, size_t max_bytes) {
 }
 
 int64_t pipe_copy_out_to_user(Pipe& pipe,
-                              process::Process& proc,
+                              process::Task& proc,
                               uint64_t user_address,
                               size_t max_bytes) {
     if (user_address == 0 || proc.cr3 == 0) {
@@ -285,7 +285,7 @@ int64_t pipe_copy_out_to_user(Pipe& pipe,
 }
 
 int64_t pipe_copy_in_from_user(Pipe& pipe,
-                               process::Process& proc,
+                               process::Task& proc,
                                uint64_t user_address,
                                size_t max_bytes) {
     if (user_address == 0 || proc.cr3 == 0) {
@@ -310,7 +310,7 @@ int64_t pipe_copy_in_from_user(Pipe& pipe,
     return static_cast<int64_t>(copied);
 }
 
-void drop_waiters_for_owner_locked(Pipe& pipe, process::Process* owner) {
+void drop_waiters_for_owner_locked(Pipe& pipe, process::Task* owner) {
     PipeWaiter* prev = nullptr;
     PipeWaiter* cur = pipe.read_waiters;
     while (cur != nullptr) {
@@ -409,7 +409,7 @@ void wake_write_waiters_locked(Pipe& pipe) {
     }
 }
 
-int64_t pipe_read(process::Process& proc,
+int64_t pipe_read(process::Task& proc,
                   DescriptorEntry& entry,
                   uint64_t user_address,
                   uint64_t length,
@@ -484,7 +484,7 @@ int64_t pipe_read(process::Process& proc,
     return kWouldBlock;
 }
 
-int64_t pipe_write(process::Process& proc,
+int64_t pipe_write(process::Task& proc,
                    DescriptorEntry& entry,
                    uint64_t user_address,
                    uint64_t length,
@@ -692,7 +692,7 @@ const Ops kPipeOps{
     .set_property = nullptr,
 };
 
-bool open_pipe(process::Process& proc,
+bool open_pipe(process::Task& proc,
                uint64_t flags,
                uint64_t existing_id,
                uint64_t,

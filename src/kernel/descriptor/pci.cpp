@@ -5,7 +5,7 @@
 namespace descriptor {
 namespace pci_descriptor {
 
-int64_t read(process::Process&,
+int64_t read(process::Task&,
              DescriptorEntry&,
              uint64_t user_address,
              uint64_t length,
@@ -46,7 +46,7 @@ int64_t read(process::Process&,
     return static_cast<int64_t>(to_copy * entry_size);
 }
 
-int64_t write(process::Process&, DescriptorEntry&, uint64_t, uint64_t, uint64_t) {
+int64_t write(process::Task&, DescriptorEntry&, uint64_t, uint64_t, uint64_t) {
     return -1;
 }
 
@@ -61,7 +61,7 @@ const Ops kPciOps{
     .set_property = nullptr,
 };
 
-bool open(process::Process&, uint64_t, uint64_t, uint64_t, Allocation& alloc) {
+bool open(process::Task&, uint64_t, uint64_t, uint64_t, Allocation& alloc) {
     alloc.type = kTypePci;
     alloc.flags = static_cast<uint64_t>(Flag::Readable) |
                   static_cast<uint64_t>(Flag::Seekable) |

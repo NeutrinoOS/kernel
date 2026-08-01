@@ -20,7 +20,7 @@ struct PciDriverEntry {
 
 constexpr size_t kMaxPciDrivers = 32;
 PciDriverEntry g_pci_drivers[kMaxPciDrivers]{};
-process::Process* g_pci_probe_worker = nullptr;
+process::Task* g_pci_probe_worker = nullptr;
 bool g_pci_probe_worker_started = false;
 
 bool match_field(uint32_t actual, uint32_t expected, uint32_t any_value) {
@@ -96,7 +96,7 @@ void probe_pci_drivers() {
 
 namespace {
 
-void pci_probe_worker(process::Process& proc) {
+void pci_probe_worker(process::Task& proc) {
     for (size_t i = 0; i < kMaxPciDrivers; ++i) {
         PciDriverEntry& entry = g_pci_drivers[i];
         if (!entry.used || entry.init == nullptr || entry.probed) {
@@ -129,7 +129,7 @@ void start_pci_probe_worker() {
     }
     g_pci_probe_worker_started = true;
 
-    process::Process* worker = process::allocate_kernel_task(pci_probe_worker);
+    process::Task* worker = process::allocate_kernel_task(pci_probe_worker);
     if (worker == nullptr) {
         log_message(LogLevel::Warn,
                     "DriverRegistry: failed to allocate PCI probe worker");

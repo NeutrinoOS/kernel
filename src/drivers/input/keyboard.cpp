@@ -5,6 +5,7 @@
 #include "../interrupts/pic.hpp"
 #include "../log/logging.hpp"
 #include "../../kernel/descriptor.hpp"
+#include "../../kernel/error.hpp"
 #include "../../kernel/sync.hpp"
 
 namespace keyboard {
@@ -87,6 +88,10 @@ bool enqueue(uint32_t slot, const descriptor_defs::KeyboardEvent& event) {
     }
     SlotBuffer& buf = g_buffers[slot];
     sync::IrqLockGuard guard(buf.lock);
+    KERNEL_ASSERT_MSG(buf.head < kBufferSize,
+                      "keyboard queue head is out of bounds");
+    KERNEL_ASSERT_MSG(buf.tail < kBufferSize,
+                      "keyboard queue tail is out of bounds");
     size_t next = (buf.head + 1) % kBufferSize;
     if (next == buf.tail) {
         return false;
@@ -102,6 +107,10 @@ bool dequeue(uint32_t slot, descriptor_defs::KeyboardEvent& event) {
     }
     SlotBuffer& buf = g_buffers[slot];
     sync::IrqLockGuard guard(buf.lock);
+    KERNEL_ASSERT_MSG(buf.head < kBufferSize,
+                      "keyboard queue head is out of bounds");
+    KERNEL_ASSERT_MSG(buf.tail < kBufferSize,
+                      "keyboard queue tail is out of bounds");
     if (buf.head == buf.tail) {
         return false;
     }

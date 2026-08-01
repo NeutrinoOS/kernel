@@ -6,6 +6,6 @@ namespace acpi {
 bool initialize_tables();
 // Starts the AML namespace and runtime services after core kernel init.
 // Diagnostic command-line flags may stop initialization at individual stages.
-bool initialize(const char* cmdline = nullptr);
+bool initialize();
 
 }  // namespace acpi

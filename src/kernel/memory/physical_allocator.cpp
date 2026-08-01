@@ -3,6 +3,7 @@
 #include "arch/x86_64/memory/paging.hpp"
 #include "drivers/limine/limine_requests.hpp"
 #include "drivers/log/logging.hpp"
+#include "kernel/error.hpp"
 #include "kernel/memory/buddy.hpp"
 #include "lib/mem.hpp"
 
@@ -405,7 +406,8 @@ void* alloc_kernel(size_t bytes, size_t alignment) {
 void free_kernel(void* ptr) {
     if (ptr == nullptr) return;
     auto* header = reinterpret_cast<AllocationHeader*>(reinterpret_cast<uintptr_t>(ptr) - sizeof(AllocationHeader));
-    if (header->magic != kAllocationMagic) return;
+    KERNEL_ASSERT_MSG(header->magic == kAllocationMagic,
+                      "free_kernel received an invalid or already-freed allocation");
     uint64_t phys = header->phys;
     header->magic = 0;
     free_kernel_block(phys);

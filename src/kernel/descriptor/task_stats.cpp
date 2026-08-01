@@ -6,7 +6,7 @@ namespace descriptor {
 
 namespace task_stats_descriptor {
 
-int64_t read(process::Process&,
+int64_t read(process::Task&,
              DescriptorEntry&,
              uint64_t user_address,
              uint64_t length,
@@ -25,7 +25,7 @@ int64_t read(process::Process&,
     return static_cast<int64_t>(written * sizeof(descriptor_defs::TaskUsage));
 }
 
-int64_t write(process::Process&,
+int64_t write(process::Task&,
               DescriptorEntry&,
               uint64_t,
               uint64_t,
@@ -47,7 +47,7 @@ const Ops kTaskStatsOps{
     .set_property = nullptr,
 };
 
-bool open(process::Process&,
+bool open(process::Task&,
           uint64_t,
           uint64_t,
           uint64_t,

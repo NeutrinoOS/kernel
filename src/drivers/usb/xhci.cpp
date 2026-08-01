@@ -8,6 +8,7 @@
 #include "drivers/log/logging.hpp"
 #include "drivers/pci/pci.hpp"
 #include "drivers/usb/usb_core.hpp"
+#include "kernel/error.hpp"
 #include "kernel/memory/physical_allocator.hpp"
 #include "kernel/module.hpp"
 #include "kernel/process.hpp"
@@ -168,7 +169,7 @@ uint64_t g_mmio_next_virt = kMmioVirtBase;
 bool g_initialized = false;
 DeviceSlot g_device_slots[kMaxDeviceSlots]{};
 uint8_t g_next_usb_address = 1;
-process::Process* g_enumeration_worker = nullptr;
+process::Task* g_enumeration_worker = nullptr;
 Controller* g_pending_controller = nullptr;
 uint8_t g_pending_port = 0;
 volatile uint8_t g_enumeration_pending = 0;
@@ -708,6 +709,10 @@ uint64_t enqueue_ring_trb(Ring& ring,
                           uint64_t parameter,
                           uint32_t status,
                           uint32_t control) {
+    KERNEL_ASSERT_MSG(ring.phys != 0,
+                      "xHCI endpoint ring is not allocated");
+    KERNEL_ASSERT_MSG(ring.enqueue < kTrbsPerPage - 1,
+                      "xHCI endpoint enqueue index is out of bounds");
     Trb* trbs = ring_trbs(ring);
     size_t index = ring.enqueue;
     trbs[index].parameter = parameter;
@@ -732,6 +737,10 @@ uint64_t enqueue_command_trb(Controller& controller,
                              uint64_t parameter,
                              uint32_t status,
                              uint32_t control) {
+    KERNEL_ASSERT_MSG(controller.command_ring_phys != 0,
+                      "xHCI command ring is not allocated");
+    KERNEL_ASSERT_MSG(controller.command_enqueue < kTrbsPerPage - 1,
+                      "xHCI command enqueue index is out of bounds");
     Trb* trbs = controller_command_ring(controller);
     size_t index = controller.command_enqueue;
     trbs[index].parameter = parameter;
@@ -766,6 +775,10 @@ void ring_endpoint_doorbell(DeviceSlot& slot, uint8_t endpoint_id) {
 }
 
 void update_erdp(Controller& controller) {
+    KERNEL_ASSERT_MSG(controller.event_ring_phys != 0,
+                      "xHCI event ring is not allocated");
+    KERNEL_ASSERT_MSG(controller.event_dequeue < kTrbsPerPage,
+                      "xHCI event dequeue index is out of bounds");
     uint64_t erdp = controller.event_ring_phys +
                     controller.event_dequeue * sizeof(Trb);
     volatile uint8_t* interrupter0 = controller.runtime + 0x20;
@@ -773,6 +786,10 @@ void update_erdp(Controller& controller) {
 }
 
 bool poll_event(Controller& controller, Trb& out) {
+    KERNEL_ASSERT_MSG(controller.event_ring_phys != 0,
+                      "xHCI event ring is not allocated");
+    KERNEL_ASSERT_MSG(controller.event_dequeue < kTrbsPerPage,
+                      "xHCI event dequeue index is out of bounds");
     Trb* events = controller_event_ring(controller);
     Trb& event = events[controller.event_dequeue];
     if ((event.control & kTrbCycle) != controller.event_cycle) {
@@ -2001,7 +2018,7 @@ bool take_enumeration_request(Controller*& controller, uint8_t& port) {
     return true;
 }
 
-void park_enumeration_worker(process::Process& proc) {
+void park_enumeration_worker(process::Task& proc) {
     proc.waiting_on = nullptr;
     process::store_state(proc, process::State::Blocked);
     // A producer that ran while this callback was still Running could not
@@ -2011,7 +2028,7 @@ void park_enumeration_worker(process::Process& proc) {
     }
 }
 
-void enumeration_worker(process::Process& proc) {
+void enumeration_worker(process::Task& proc) {
     Controller* controller = nullptr;
     uint8_t port = 0;
     if (!take_enumeration_request(controller, port)) {

@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 #include "drivers/console/console.hpp"
+#include "kernel/cmdline.hpp"
 
 namespace {
 
@@ -13,46 +14,6 @@ constexpr uint8_t kMemoryModelRgb = 1;
 Framebuffer g_framebuffer{};
 bool g_enabled = false;
 uint8_t g_last_phase = UINT8_MAX;
-
-bool is_separator(char c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
-}
-
-bool has_debug_flag(const char* cmdline) {
-    if (cmdline == nullptr) {
-        return false;
-    }
-
-    const char debug[] = "DEBUG";
-    const char* cursor = cmdline;
-    while (*cursor != '\0') {
-        while (is_separator(*cursor)) {
-            ++cursor;
-        }
-        if (*cursor == '\0') {
-            break;
-        }
-
-        const char* token = cursor;
-        while (*cursor != '\0' && !is_separator(*cursor)) {
-            ++cursor;
-        }
-        size_t token_length = static_cast<size_t>(cursor - token);
-        if (token_length == sizeof(debug) - 1) {
-            bool matches = true;
-            for (size_t i = 0; i < sizeof(debug) - 1; ++i) {
-                if (token[i] != debug[i]) {
-                    matches = false;
-                    break;
-                }
-            }
-            if (matches) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
 
 uint64_t scale_component(uint8_t value, uint8_t bits) {
     if (bits == 0) {
@@ -98,8 +59,8 @@ void draw(uint32_t rgb) {
 
 namespace debug_heartbeat {
 
-void init(const char* cmdline, const Framebuffer& framebuffer) {
-    if (!has_debug_flag(cmdline) || framebuffer.base == nullptr ||
+void init(const Framebuffer& framebuffer) {
+    if (!kernel_cmdline::has_flag("DEBUG") || framebuffer.base == nullptr ||
         framebuffer.width < kHeartbeatSize ||
         framebuffer.height < kHeartbeatSize ||
         framebuffer.memory_model != kMemoryModelRgb) {

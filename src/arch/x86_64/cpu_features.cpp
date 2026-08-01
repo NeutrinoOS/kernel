@@ -218,9 +218,9 @@ bool kernel_fpu_begin() {
 
     if (current_cpu->kernel_fpu_depth == 0) {
         current_cpu->kernel_fpu_rflags = rflags;
-        current_cpu->kernel_fpu_process = current_cpu->current_process;
-        if (current_cpu->kernel_fpu_process != nullptr) {
-            save_fpu_state(current_cpu->kernel_fpu_process->fpu_state);
+        current_cpu->kernel_fpu_task = current_cpu->current_task;
+        if (current_cpu->kernel_fpu_task != nullptr) {
+            save_fpu_state(current_cpu->kernel_fpu_task->fpu_state);
         }
         load_default_fpu_state();
     }
@@ -240,13 +240,13 @@ void kernel_fpu_end() {
         return;
     }
 
-    process::Process* proc = current_cpu->kernel_fpu_process;
+    process::Task* proc = current_cpu->kernel_fpu_task;
     if (proc != nullptr) {
         restore_fpu_state(proc->fpu_state);
     } else {
         load_default_fpu_state();
     }
-    current_cpu->kernel_fpu_process = nullptr;
+    current_cpu->kernel_fpu_task = nullptr;
 
     restore_interrupt_flag(current_cpu->kernel_fpu_rflags);
     current_cpu->kernel_fpu_rflags = 0;

@@ -2,6 +2,7 @@
 
 #include "lib/mem.hpp"
 #include "drivers/log/logging.hpp"
+#include "kernel/error.hpp"
 
 namespace memory {
 
@@ -119,14 +120,11 @@ uint64_t BuddyAllocator::alloc_order(uint8_t order) {
 
     uint64_t phys = virt_to_phys(block);
     Range* range = find_range(phys);
-    if (range == nullptr) {
-        log_message(LogLevel::Error,
-                    "Buddy alloc corrupt: order=%u phys=%llx",
-                    static_cast<unsigned int>(current),
-                    static_cast<unsigned long long>(phys));
-        return 0;
-    }
+    KERNEL_ASSERT_MSG(range != nullptr,
+                      "buddy free list contains an address outside its ranges");
     size_t index = index_for_phys(*range, phys);
+    KERNEL_ASSERT_MSG(index < range->pages,
+                      "buddy free list index is outside its range");
 
     while (current > order) {
         --current;
@@ -141,6 +139,8 @@ uint64_t BuddyAllocator::alloc_order(uint8_t order) {
     }
 
     mark_block_allocated(*range, index, order);
+    KERNEL_ASSERT_MSG(free_pages_ >= (1ull << order),
+                      "buddy free-page count underflow");
     free_pages_ -= (1ull << order);
     return phys;
 }
@@ -149,23 +149,23 @@ void BuddyAllocator::free(uint64_t phys) {
     if (phys == 0) {
         return;
     }
+    KERNEL_ASSERT_MSG((phys & (kPageSize - 1)) == 0,
+                      "buddy allocator received an unaligned free");
     Range* range = find_range(phys);
-    if (range == nullptr) {
-        return;
-    }
+    KERNEL_ASSERT_MSG(range != nullptr,
+                      "buddy allocator received a free outside its ranges");
     size_t index = index_for_phys(*range, phys);
-    if (index >= range->pages) {
-        return;
-    }
+    KERNEL_ASSERT_MSG(index < range->pages,
+                      "buddy free index is outside its range");
 
     int8_t entry = range->order_map[index];
-    if (entry == kMapNonHead || entry >= 0) {
-        return;
-    }
+    KERNEL_ASSERT_MSG(entry != kMapNonHead,
+                      "buddy allocator received a non-head free");
+    KERNEL_ASSERT_MSG(entry < 0,
+                      "buddy allocator detected a double free");
     uint8_t order = static_cast<uint8_t>(-entry - 2);
-    if (order > max_order_) {
-        return;
-    }
+    KERNEL_ASSERT_MSG(order <= max_order_,
+                      "buddy allocation metadata contains an invalid order");
 
     range->order_map[index] = static_cast<int8_t>(order);
 

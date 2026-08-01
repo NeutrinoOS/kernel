@@ -2,6 +2,7 @@
 
 #include "process.hpp"
 #include "arch/x86_64/memory/paging.hpp"
+#include "error.hpp"
 #include "scheduler.hpp"
 #include "string_util.hpp"
 #include "vm.hpp"
@@ -35,13 +36,13 @@ bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents);
 
 namespace {
 
-process::Process g_kernel_process{};
+process::Task g_kernel_process{};
 process::ProcessResources g_kernel_resources{};
 bool g_kernel_process_initialized = false;
-process::Process* g_waiter_worker = nullptr;
+process::Task* g_waiter_worker = nullptr;
 uint32_t g_waiters_pending = 0;
 
-process::Process& kernel_process() {
+process::Task& kernel_process() {
     if (!g_kernel_process_initialized) {
         memset(&g_kernel_process, 0, sizeof(g_kernel_process));
         memset(&g_kernel_resources, 0, sizeof(g_kernel_resources));
@@ -114,6 +115,10 @@ DescriptorEntry* lookup_entry(Table& table, uint32_t handle) {
     if (!entry.in_use) {
         return nullptr;
     }
+    KERNEL_ASSERT_MSG(entry.generation != 0,
+                      "live descriptor has a zero generation");
+    KERNEL_ASSERT_MSG(entry.refcount != 0,
+                      "live descriptor has a zero refcount");
     if (generation == 0 || entry.generation != generation) {
         return nullptr;
     }
@@ -130,6 +135,10 @@ const DescriptorEntry* lookup_entry(const Table& table, uint32_t handle) {
     if (!entry.in_use) {
         return nullptr;
     }
+    KERNEL_ASSERT_MSG(entry.generation != 0,
+                      "live descriptor has a zero generation");
+    KERNEL_ASSERT_MSG(entry.refcount != 0,
+                      "live descriptor has a zero refcount");
     if (generation == 0 || entry.generation != generation) {
         return nullptr;
     }
@@ -196,6 +205,10 @@ int evaluate_waits(Table& table,
 }
 
 void populate_entry(DescriptorEntry& entry, const Allocation& alloc) {
+    KERNEL_ASSERT_MSG(!entry.in_use,
+                      "descriptor population attempted on a live entry");
+    KERNEL_ASSERT_MSG(alloc.type != 0,
+                      "descriptor allocation has an invalid type");
     uint16_t generation = entry.generation;
     if (generation == 0) {
         generation = 1;
@@ -261,7 +274,7 @@ void init_table(Table& table) {
     }
 }
 
-void destroy_table(process::Process& proc, Table& table) {
+void destroy_table(process::Task& proc, Table& table) {
     (void)proc;
     for (size_t i = 0; i < kMaxDescriptors; ++i) {
         DescriptorEntry& entry = table.entries[i];
@@ -276,7 +289,7 @@ void destroy_table(process::Process& proc, Table& table) {
     }
 }
 
-uint32_t install(process::Process& proc,
+uint32_t install(process::Task& proc,
                  Table& table,
                  const Allocation& alloc) {
     size_t limit = proc.resources != nullptr
@@ -303,7 +316,7 @@ uint32_t install(process::Process& proc,
     return kInvalidHandle;
 }
 
-uint32_t install_at(process::Process& proc,
+uint32_t install_at(process::Task& proc,
                     Table& table,
                     uint16_t index,
                     const Allocation& alloc) {
@@ -336,7 +349,7 @@ uint32_t install_at(process::Process& proc,
     return make_handle(index, generation);
 }
 
-uint32_t open(process::Process& proc,
+uint32_t open(process::Task& proc,
               Table& table,
               uint32_t type,
               uint64_t arg0,
@@ -398,7 +411,7 @@ uint32_t open(process::Process& proc,
     return handle;
 }
 
-uint32_t open_at(process::Process& proc,
+uint32_t open_at(process::Task& proc,
                  Table& table,
                  uint16_t index,
                  uint32_t type,
@@ -461,7 +474,7 @@ uint32_t open_at(process::Process& proc,
     return handle;
 }
 
-int64_t read(process::Process& proc,
+int64_t read(process::Task& proc,
              Table& table,
              uint32_t handle,
              uint64_t user_address,
@@ -488,7 +501,7 @@ int64_t read(process::Process& proc,
     return entry->ops->read(proc, *entry, user_address, length, offset);
 }
 
-int64_t write(process::Process& proc,
+int64_t write(process::Task& proc,
               Table& table,
               uint32_t handle,
               uint64_t user_address,
@@ -515,7 +528,7 @@ int64_t write(process::Process& proc,
     return entry->ops->write(proc, *entry, user_address, length, offset);
 }
 
-bool close(process::Process& proc, Table& table, uint32_t handle) {
+bool close(process::Task& proc, Table& table, uint32_t handle) {
     (void)proc;
     DescriptorEntry* entry = lookup_entry(table, handle);
     if (entry == nullptr) {
@@ -600,7 +613,7 @@ int get_property_trusted(Table& table,
     return entry->ops->get_property(*entry, property, out, out_size);
 }
 
-int get_property(process::Process& proc,
+int get_property(process::Task& proc,
                  Table& table,
                  uint32_t handle,
                  uint32_t property,
@@ -618,7 +631,7 @@ int get_property(process::Process& proc,
                                 out_size);
 }
 
-int set_property(process::Process& proc,
+int set_property(process::Task& proc,
                  Table& table,
                  uint32_t handle,
                  uint32_t property,
@@ -645,7 +658,7 @@ int set_property(process::Process& proc,
     return entry->ops->set_property(*entry, property, in, static_cast<size_t>(size));
 }
 
-int wait(process::Process& proc,
+int wait(process::Task& proc,
          Table& table,
          uint64_t user_address,
          size_t count) {
@@ -712,8 +725,8 @@ int wait(process::Process& proc,
 }
 
 void service_waiters() {
-    for (size_t i = 0; i < process::kMaxProcesses; ++i) {
-        process::Process* proc = process::table_entry(i);
+    for (size_t i = 0; i < process::kMaxTasks; ++i) {
+        process::Task* proc = process::task_table_entry(i);
         if (proc == nullptr ||
             proc->wait_descriptor_count == 0) {
             continue;
@@ -753,7 +766,7 @@ void service_waiters() {
     }
 }
 
-void waiter_worker(process::Process& worker) {
+void waiter_worker(process::Task& worker) {
     while (__atomic_exchange_n(&g_waiters_pending,
                                static_cast<uint32_t>(0),
                                __ATOMIC_ACQ_REL) != 0) {
@@ -774,7 +787,7 @@ void wake_waiters() {
     __atomic_store_n(&g_waiters_pending,
                      static_cast<uint32_t>(1),
                      __ATOMIC_RELEASE);
-    process::Process* worker =
+    process::Task* worker =
         __atomic_load_n(&g_waiter_worker, __ATOMIC_ACQUIRE);
     if (worker != nullptr) {
         (void)process::wake(*worker);
@@ -785,7 +798,7 @@ void start_waiter_worker() {
     if (__atomic_load_n(&g_waiter_worker, __ATOMIC_ACQUIRE) != nullptr) {
         return;
     }
-    process::Process* worker = process::allocate_kernel_task(waiter_worker);
+    process::Task* worker = process::allocate_kernel_task(waiter_worker);
     if (worker == nullptr) {
         return;
     }
@@ -798,7 +811,7 @@ uint32_t open_kernel(uint32_t type,
                      uint64_t arg0,
                      uint64_t arg1,
                      uint64_t arg2) {
-    process::Process& proc = kernel_process();
+    process::Task& proc = kernel_process();
     sync::LockGuard guard(proc.resources->descriptor_lock);
     return open(proc, proc.resources->descriptors, type, arg0, arg1, arg2);
 }
@@ -807,7 +820,7 @@ int64_t read_kernel(uint32_t handle,
                     void* buffer,
                     uint64_t length,
                     uint64_t offset) {
-    process::Process& proc = kernel_process();
+    process::Task& proc = kernel_process();
     sync::LockGuard guard(proc.resources->descriptor_lock);
     return read(proc,
                 proc.resources->descriptors,
@@ -821,7 +834,7 @@ int64_t write_kernel(uint32_t handle,
                      const void* buffer,
                      uint64_t length,
                      uint64_t offset) {
-    process::Process& proc = kernel_process();
+    process::Task& proc = kernel_process();
     sync::LockGuard guard(proc.resources->descriptor_lock);
     return write(proc,
                  proc.resources->descriptors,
@@ -832,7 +845,7 @@ int64_t write_kernel(uint32_t handle,
 }
 
 bool close_kernel(uint32_t handle) {
-    process::Process& proc = kernel_process();
+    process::Task& proc = kernel_process();
     sync::LockGuard guard(proc.resources->descriptor_lock);
     return close(proc, proc.resources->descriptors, handle);
 }
@@ -841,7 +854,7 @@ int get_property_kernel(uint32_t handle,
                         uint32_t property,
                         void* out,
                         uint64_t size) {
-    process::Process& proc = kernel_process();
+    process::Task& proc = kernel_process();
     sync::LockGuard guard(proc.resources->descriptor_lock);
     return get_property(proc,
                         proc.resources->descriptors,
@@ -855,7 +868,7 @@ int set_property_kernel(uint32_t handle,
                         uint32_t property,
                         const void* in,
                         uint64_t size) {
-    process::Process& proc = kernel_process();
+    process::Task& proc = kernel_process();
     sync::LockGuard guard(proc.resources->descriptor_lock);
     return set_property(proc,
                         proc.resources->descriptors,
@@ -865,7 +878,7 @@ int set_property_kernel(uint32_t handle,
                         size);
 }
 
-bool is_kernel_process(const process::Process& proc) {
+bool is_kernel_process(const process::Task& proc) {
     return &proc == &kernel_process();
 }
 

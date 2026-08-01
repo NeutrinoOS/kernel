@@ -34,6 +34,7 @@
 #include "config.hpp"
 #include "descriptor.hpp"
 #include "capabilities.hpp"
+#include "cmdline.hpp"
 #include "debug_heartbeat.hpp"
 #include "users.hpp"
 #include "error.hpp"
@@ -52,7 +53,6 @@ static void hcf(void) {
     for (;;) asm("hlt");
 }
 
-constexpr size_t kMaxCmdline = 256;
 constexpr size_t kMaxMountSpecs = 16;
 constexpr size_t kMaxSpecLen = 32;
 
@@ -61,74 +61,45 @@ alignas(16) static uint8_t bootstrap_stack[BOOTSTRAP_STACK_SIZE];
 
 static void kernel_main_stage2();
 
-static void parse_boot_specs(const char* cmdline,
-                             char (&root_spec)[kMaxSpecLen],
-                             char (&mount_buffers)[kMaxMountSpecs][kMaxSpecLen],
-                             const char* (&mount_specs)[kMaxMountSpecs],
-                             size_t& mount_spec_count) {
-    if (cmdline == nullptr) {
-        return;
+static void collect_boot_specs(char (&root_spec)[kMaxSpecLen],
+                               char (&mount_buffers)[kMaxMountSpecs][kMaxSpecLen],
+                               const char* (&mount_specs)[kMaxMountSpecs],
+                               size_t& mount_spec_count) {
+    const size_t requested_root_count = kernel_cmdline::value_count("ROOT");
+    for (size_t requested = 0; requested < requested_root_count; ++requested) {
+        const char* value = kernel_cmdline::value_at("ROOT", requested);
+        if (value != nullptr && value[0] != '\0') {
+            string_util::copy(root_spec, kMaxSpecLen, value);
+        }
     }
 
-    char buffer[kMaxCmdline];
-    size_t len = string_util::length(cmdline);
-    if (len >= sizeof(buffer)) {
-        len = sizeof(buffer) - 1;
-    }
-    for (size_t i = 0; i < len; ++i) {
-        buffer[i] = cmdline[i];
-    }
-    buffer[len] = '\0';
-
-    char* ptr = buffer;
-    while (*ptr != '\0') {
-        while (*ptr == ' ' || *ptr == '\t' || *ptr == '\n' || *ptr == '\r') {
-            ++ptr;
+    const size_t requested_mount_count = kernel_cmdline::value_count("MOUNT");
+    for (size_t requested = 0; requested < requested_mount_count; ++requested) {
+        const char* value = kernel_cmdline::value_at("MOUNT", requested);
+        if (value == nullptr || value[0] == '\0') {
+            continue;
         }
-        if (*ptr == '\0') {
-            break;
+        bool duplicate = (root_spec[0] != '\0' &&
+                          string_util::equals(root_spec, value));
+        for (size_t i = 0; i < mount_spec_count && !duplicate; ++i) {
+            if (string_util::equals(mount_buffers[i], value)) {
+                duplicate = true;
+            }
         }
-        char* token = ptr;
-        while (*ptr != '\0' && *ptr != ' ' && *ptr != '\t' &&
-               *ptr != '\n' && *ptr != '\r') {
-            ++ptr;
+        if (duplicate) {
+            continue;
         }
-        if (*ptr != '\0') {
-            *ptr++ = '\0';
-        }
-
-        if (string_util::starts_with(token, "ROOT=")) {
-            const char* value = token + 5;
-            if (*value != '\0') {
-                string_util::copy(root_spec, kMaxSpecLen, value);
-            }
-        } else if (string_util::starts_with(token, "MOUNT=")) {
-            const char* value = token + 6;
-            if (*value == '\0') {
-                continue;
-            }
-            bool duplicate = (root_spec[0] != '\0' &&
-                              string_util::equals(root_spec, value));
-            for (size_t i = 0; i < mount_spec_count && !duplicate; ++i) {
-                if (string_util::equals(mount_buffers[i], value)) {
-                    duplicate = true;
-                }
-            }
-            if (duplicate) {
-                continue;
-            }
-            if (mount_spec_count < kMaxMountSpecs) {
-                string_util::copy(mount_buffers[mount_spec_count],
-                                  kMaxSpecLen,
-                                  value);
-                mount_specs[mount_spec_count] = mount_buffers[mount_spec_count];
-                ++mount_spec_count;
-            } else {
-                log_message(LogLevel::Warn,
-                            "Boot: ignoring extra MOUNT=%s (limit %zu)",
-                            value,
-                            static_cast<size_t>(kMaxMountSpecs));
-            }
+        if (mount_spec_count < kMaxMountSpecs) {
+            string_util::copy(mount_buffers[mount_spec_count],
+                              kMaxSpecLen,
+                              value);
+            mount_specs[mount_spec_count] = mount_buffers[mount_spec_count];
+            ++mount_spec_count;
+        } else {
+            log_message(LogLevel::Warn,
+                        "Boot: ignoring extra MOUNT=%s (limit %zu)",
+                        value,
+                        static_cast<size_t>(kMaxMountSpecs));
         }
     }
 }
@@ -408,7 +379,6 @@ static void kernel_main_stage2() {
     // physical allocator and PCI drivers can reuse bootloader-reclaimable
     // memory; losing this pointer later made ROOT= appear intermittently
     // absent on real machines.
-    char boot_cmdline[kMaxCmdline] = {0};
     const char* early_cmdline = nullptr;
     if (cmdline_request.response != nullptr &&
         cmdline_request.response->cmdline != nullptr) {
@@ -426,12 +396,9 @@ static void kernel_main_stage2() {
         }
 #endif
     }
-    if (early_cmdline != nullptr) {
-        string_util::copy(boot_cmdline, sizeof(boot_cmdline), early_cmdline);
-    }
-    const char* cmdline = boot_cmdline[0] != '\0' ? boot_cmdline : nullptr;
+    kernel_cmdline::initialize(early_cmdline);
     preserve_limine_modules();
-    intel_uhd::configure(cmdline);
+    intel_uhd::configure();
 
     auto fb = *framebuffer_request.response->framebuffers[0];
     uint8_t* fb_virtual = static_cast<uint8_t*>(fb.address);
@@ -457,7 +424,7 @@ static void kernel_main_stage2() {
                                fb.blue_mask_size,
                                fb.blue_mask_shift};
 
-    debug_heartbeat::init(cmdline, framebuffer);
+    debug_heartbeat::init(framebuffer);
 
     descriptor::init();
     descriptor::register_builtin_types();
@@ -477,6 +444,11 @@ static void kernel_main_stage2() {
     log_init();
 
     log_message(LogLevel::Info, "Console online");
+    if (kernel_cmdline::truncated()) {
+        log_message(
+            LogLevel::Warn,
+            "boot: kernel command line exceeded 255 bytes and was truncated");
+    }
 
     log_message(LogLevel::Info, "Welcome to Neutrino");
 
@@ -624,7 +596,7 @@ static void kernel_main_stage2() {
             static_cast<unsigned long long>(fb_length));
     }
 
-    net::init(cmdline);
+    net::init();
 
     log_message(LogLevel::Info, "Initializing PCI subsystem");
     pci::init();
@@ -645,8 +617,7 @@ static void kernel_main_stage2() {
     }
     size_t mount_spec_count = 0;
 
-    parse_boot_specs(cmdline,
-                     root_spec,
+    collect_boot_specs(root_spec,
                      mount_buffers,
                      mount_specs,
                      mount_spec_count);
@@ -823,7 +794,7 @@ static void kernel_main_stage2() {
     descriptor::start_waiter_worker();
     // Namespace initialization may install SCI handlers and queue deferred AML
     // work, so it must follow process and scheduler initialization.
-    if (!acpi::initialize(cmdline)) {
+    if (!acpi::initialize()) {
         log_message(LogLevel::Warn, "ACPI runtime unavailable");
     } else {
         acpi_thermal::init();
@@ -896,7 +867,7 @@ static void kernel_main_stage2() {
 
     if (init_loaded) {
         loader::ProgramImage image{init_buffer, init_size, 0};
-        process::Process* proc = process::allocate_init_task();
+        process::Task* proc = process::allocate_init_task();
         bool init_started = false;
         if (proc != nullptr) {
             string_util::copy(proc->resources->cwd, sizeof(proc->resources->cwd), boot_cwd);

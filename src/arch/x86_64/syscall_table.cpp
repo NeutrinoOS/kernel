@@ -28,19 +28,7 @@ namespace syscall {
 namespace {
 
 constexpr uint64_t kAbiMajor = 1;
-constexpr uint64_t kAbiMinor = 7;
-
-constexpr size_t kMaxExecImageSize = 512 * 1024;
-alignas(16) uint8_t g_exec_buffer[kMaxExecImageSize];
-sync::SpinLock g_exec_lock;
-
-class ExecImageGuard {
-public:
-    ExecImageGuard() { g_exec_lock.lock(); }
-    ~ExecImageGuard() { g_exec_lock.unlock(); }
-    ExecImageGuard(const ExecImageGuard&) = delete;
-    ExecImageGuard& operator=(const ExecImageGuard&) = delete;
-};
+constexpr uint64_t kAbiMinor = 10;
 
 class PrincipalRefGuard {
 public:
@@ -138,13 +126,13 @@ struct ProcessSpawnConfig {
 static_assert(sizeof(ProcessSpawnConfig) == 32,
               "ProcessSpawnConfig size mismatch");
 
-void snapshot_cwd(const process::Process& proc,
+void snapshot_cwd(const process::Task& proc,
                   char (&out)[path_util::kMaxPathLength]) {
     sync::LockGuard guard(proc.resources->lock);
     string_util::copy(out, sizeof(out), proc.resources->cwd);
 }
 
-bool build_process_path(const process::Process& proc,
+bool build_process_path(const process::Task& proc,
                         const char* path,
                         char (&out)[path_util::kMaxPathLength]) {
     char cwd[path_util::kMaxPathLength];
@@ -195,14 +183,14 @@ void request_cpu_reset() {
     }
 }
 
-uint64_t place_args_on_stack(process::Process& child, const char* args) {
+uint64_t place_args_on_stack(process::Task& child, const char* args) {
     if (args == nullptr) {
         return 0;
     }
 
     constexpr size_t kMaxArgBytes = 512;
     char arg_copy[kMaxArgBytes];
-    process::Process* parent = process::current();
+    process::Task* parent = process::current();
     if (parent == nullptr ||
         !vm::copy_user_string(parent->cr3,
                               args,
@@ -255,7 +243,7 @@ uint64_t place_args_on_stack(process::Process& child, const char* args) {
     return dest;
 }
 
-uint32_t pick_child_cpu(process::Process* parent) {
+uint32_t pick_child_cpu(process::Task* parent) {
     if (parent != nullptr && parent->preferred_cpu != UINT32_MAX) {
         return parent->preferred_cpu;
     }
@@ -265,7 +253,7 @@ uint32_t pick_child_cpu(process::Process* parent) {
     return UINT32_MAX;
 }
 
-bool mapping_within_limit(const process::Process& proc, size_t length) {
+bool mapping_within_limit(const process::Task& proc, size_t length) {
     if (proc.resources == nullptr || length == 0) {
         return false;
     }
@@ -278,7 +266,7 @@ bool mapping_within_limit(const process::Process& proc, size_t length) {
 // Validate that all capability handles provided in user memory correspond to
 // tokens permitting the requested kind. r12: pointer to handles array in user
 // space, r13: number of handles. We cap the number to avoid large copies.
-bool require_capability(process::Process& proc,
+bool require_capability(process::Task& proc,
                         capabilities::CapabilityKind kind,
                         const syscall::SyscallFrame& frame) {
     sync::LockGuard resource_guard(proc.resources->lock);
@@ -320,7 +308,7 @@ bool require_capability(process::Process& proc,
     return false;
 }
 
-bool prepare_spawn_config(process::Process& parent,
+bool prepare_spawn_config(process::Task& parent,
                           const SyscallFrame& frame,
                           uint64_t flags,
                           bool allow_stdio,
@@ -391,52 +379,6 @@ bool prepare_spawn_config(process::Process& parent,
     return true;
 }
 
-bool load_program_image(const char* path, loader::ProgramImage& out_image) {
-    if (path == nullptr) {
-        return false;
-    }
-
-    vfs::FileHandle handle{};
-    if (!vfs::open_file(path, handle)) {
-        return false;
-    }
-
-    if (handle.size == 0 || handle.size > kMaxExecImageSize) {
-        vfs::close_file(handle);
-        return false;
-    }
-
-    size_t total = static_cast<size_t>(handle.size);
-    size_t offset = 0;
-    while (offset < total) {
-        size_t chunk = total - offset;
-        size_t read = 0;
-        if (!vfs::read_file(handle,
-                            offset,
-                            g_exec_buffer + offset,
-                            chunk,
-                            read)) {
-            vfs::close_file(handle);
-            return false;
-        }
-        if (read == 0) {
-            break;
-        }
-        offset += read;
-    }
-
-    vfs::close_file(handle);
-
-    if (offset != total) {
-        return false;
-    }
-
-    out_image.data = g_exec_buffer;
-    out_image.size = total;
-    out_image.entry_offset = 0;
-    return true;
-}
-
 bool descriptor_type_requires_hardware_access(uint32_t type) {
     return type == descriptor::kTypeSerial ||
            type == descriptor::kTypeBlockDevice ||
@@ -475,8 +417,8 @@ bool console_property_requires_settings_access(uint32_t property) {
                            descriptor_defs::Property::ConsoleFont);
 }
 
-uint32_t duplicate_stream_descriptor(process::Process& from,
-                                     process::Process& to,
+uint32_t duplicate_stream_descriptor(process::Task& from,
+                                     process::Task& to,
                                      uint32_t handle,
                                      uint16_t target_index) {
     if (handle == descriptor::kInvalidHandle) {
@@ -570,8 +512,8 @@ uint32_t duplicate_stream_descriptor(process::Process& from,
     return descriptor::kInvalidHandle;
 }
 
-void inherit_standard_descriptors(process::Process& parent,
-                                  process::Process& child) {
+void inherit_standard_descriptors(process::Task& parent,
+                                  process::Task& child) {
     for (size_t i = 0; i < 3; ++i) {
         child.resources->standard_descriptors[i] =
             duplicate_stream_descriptor(parent,
@@ -581,8 +523,8 @@ void inherit_standard_descriptors(process::Process& parent,
     }
 }
 
-void install_standard_descriptors(process::Process& parent,
-                                  process::Process& child,
+void install_standard_descriptors(process::Task& parent,
+                                  process::Task& child,
                                   const ProcessStdioConfig& config) {
     const uint32_t handles[3] = {
         config.stdin_handle,
@@ -618,7 +560,7 @@ Result handle_syscall(SyscallFrame& frame) {
         }
         case SystemCall::Exit: {
             frame.rax = frame.rdi & 0xFFFFu;
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc != nullptr) {
                 process::terminate_group(
                     *proc,
@@ -630,7 +572,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Reschedule;
         }
         case SystemCall::Sleep: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -653,7 +595,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Reschedule;
         }
         case SystemCall::DescriptorOpen: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -703,7 +645,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DescriptorRead: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -725,7 +667,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DescriptorWrite: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -747,7 +689,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DescriptorClose: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -762,7 +704,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DescriptorGetType: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -779,7 +721,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DescriptorTestFlag: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -800,7 +742,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DescriptorGetFlags: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -818,7 +760,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DescriptorGetProperty: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -836,7 +778,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DescriptorSetProperty: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -875,7 +817,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DescriptorWait: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -895,7 +837,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::Mount: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -937,7 +879,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::RescanBlockDevices: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -954,7 +896,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::FileOpen: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -964,8 +906,73 @@ Result handle_syscall(SyscallFrame& frame) {
             frame.rax = static_cast<uint64_t>(static_cast<int64_t>(handle));
             return Result::Continue;
         }
+        case SystemCall::FileOpenFlags: {
+            process::Task* proc = process::current();
+            uint32_t flags = static_cast<uint32_t>(frame.rsi);
+            if (proc == nullptr ||
+                ((flags & (file_io::OpenWrite | file_io::OpenCreate)) != 0 &&
+                 !require_capability(
+                     *proc,
+                     capabilities::CapabilityKind::FileSystemWrite,
+                     frame))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            int32_t handle = file_io::open_file(
+                *proc,
+                reinterpret_cast<const char*>(frame.rdi),
+                flags);
+            frame.rax = static_cast<uint64_t>(static_cast<int64_t>(handle));
+            return Result::Continue;
+        }
+        case SystemCall::FileSeek: {
+            process::Task* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            int64_t result = file_io::seek_file(
+                *proc,
+                static_cast<uint32_t>(frame.rdi),
+                static_cast<int64_t>(frame.rsi),
+                static_cast<uint32_t>(frame.rdx));
+            frame.rax = static_cast<uint64_t>(result);
+            return Result::Continue;
+        }
+        case SystemCall::FileStat: {
+            process::Task* proc = process::current();
+            file_io::Metadata metadata{};
+            if (proc == nullptr || frame.rsi == 0 ||
+                !file_io::stat_file(
+                    *proc, static_cast<uint32_t>(frame.rdi), metadata) ||
+                !vm::copy_to_user(proc->cr3,
+                                  frame.rsi,
+                                  &metadata,
+                                  sizeof(metadata))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = 0;
+            return Result::Continue;
+        }
+        case SystemCall::PathStat: {
+            process::Task* proc = process::current();
+            file_io::Metadata metadata{};
+            if (proc == nullptr || frame.rsi == 0 ||
+                !file_io::stat_path(
+                    *proc, reinterpret_cast<const char*>(frame.rdi), metadata) ||
+                !vm::copy_to_user(proc->cr3,
+                                  frame.rsi,
+                                  &metadata,
+                                  sizeof(metadata))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = 0;
+            return Result::Continue;
+        }
         case SystemCall::FileClose: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -976,7 +983,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::FileSync: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -993,7 +1000,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::Sync: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc != nullptr &&
                 !require_capability(*proc,
                                     capabilities::CapabilityKind::FileSystemWrite,
@@ -1006,7 +1013,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::Shutdown: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc != nullptr &&
                 !require_capability(*proc,
                                     capabilities::CapabilityKind::SysSettingsWrite,
@@ -1025,7 +1032,7 @@ Result handle_syscall(SyscallFrame& frame) {
             halt_forever();
         }
         case SystemCall::ModuleLoad: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1071,7 +1078,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::ModuleInfo: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr || frame.rsi == 0) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1093,7 +1100,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::FileRead: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1106,8 +1113,23 @@ Result handle_syscall(SyscallFrame& frame) {
             frame.rax = static_cast<uint64_t>(static_cast<int64_t>(result));
             return Result::Continue;
         }
+        case SystemCall::FileReadAt: {
+            process::Task* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            int64_t result = file_io::read_file_at(
+                *proc,
+                static_cast<uint32_t>(frame.rdi),
+                frame.rsi,
+                frame.rdx,
+                frame.r10);
+            frame.rax = static_cast<uint64_t>(result);
+            return Result::Continue;
+        }
         case SystemCall::FileWrite: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1127,7 +1149,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::FileCreate: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1144,7 +1166,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::ProcessExec: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1191,14 +1213,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
 
-            ExecImageGuard exec_guard;
-            loader::ProgramImage image{};
-            if (!load_program_image(resolved_exec, image)) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
-
-            process::Process* child = process::allocate();
+            process::Task* child = process::allocate();
             if (child == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1208,7 +1223,7 @@ Result handle_syscall(SyscallFrame& frame) {
             child->waiting_on = nullptr;
             child->exit_code = 0;
             child->has_exited = false;
-            child->resources->parent_process_id = proc->process_id;
+            child->resources->parent_process_id = proc->pid;
             child->resources->process_group_id =
                 proc->resources->process_group_id;
             child->resources->session_id = proc->resources->session_id;
@@ -1234,7 +1249,7 @@ Result handle_syscall(SyscallFrame& frame) {
                               sizeof(child->image_path),
                               resolved_exec);
 
-            if (!loader::load_into_process(image, *child)) {
+            if (!loader::load_file_into_process(resolved_exec, *child)) {
                 process::reclaim(*child);
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1265,7 +1280,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Reschedule;
         }
         case SystemCall::Child: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1316,14 +1331,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
 
-            ExecImageGuard exec_guard;
-            loader::ProgramImage image{};
-            if (!load_program_image(resolved_exec, image)) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
-
-            process::Process* child = process::allocate();
+            process::Task* child = process::allocate();
             if (child == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1333,7 +1341,7 @@ Result handle_syscall(SyscallFrame& frame) {
             child->waiting_on = nullptr;
             child->exit_code = 0;
             child->has_exited = false;
-            child->resources->parent_process_id = proc->process_id;
+            child->resources->parent_process_id = proc->pid;
             child->resources->process_group_id =
                 proc->resources->process_group_id;
             child->resources->session_id = proc->resources->session_id;
@@ -1359,7 +1367,7 @@ Result handle_syscall(SyscallFrame& frame) {
                               sizeof(child->image_path),
                               resolved_exec);
 
-            if (!loader::load_into_process(image, *child)) {
+            if (!loader::load_file_into_process(resolved_exec, *child)) {
                 process::reclaim(*child);
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1387,11 +1395,11 @@ Result handle_syscall(SyscallFrame& frame) {
             process::store_state(*child, process::State::Ready);
             scheduler::enqueue(child);
 
-            frame.rax = static_cast<uint64_t>(child->pid);
+            frame.rax = static_cast<uint64_t>(child->tid);
             return Result::Continue;
         }
         case SystemCall::ProcessSetCwd: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1429,7 +1437,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::ProcessGetCwd: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1472,7 +1480,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DirectoryOpen: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1483,7 +1491,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DirectoryRead: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1496,7 +1504,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DirectoryClose: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1507,7 +1515,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DirectoryOpenRoot: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1517,7 +1525,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DirectoryOpenAt: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1529,7 +1537,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::FileOpenAt: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1541,7 +1549,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::FileCreateAt: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1559,7 +1567,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DirectoryCreate: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1577,7 +1585,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::FileRemove: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1595,7 +1603,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::FileGetAcl: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(
                     *proc,
@@ -1612,7 +1620,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::FileSetAcl: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(
                     *proc,
@@ -1635,7 +1643,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::DirectoryRemove: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1653,7 +1661,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::TimeGet: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 log_message(LogLevel::Warn,
                             "TimeGet: no current process");
@@ -1687,7 +1695,7 @@ Result handle_syscall(SyscallFrame& frame) {
                                   sizeof(snapshot))) {
                 log_message(LogLevel::Warn,
                             "TimeGet: copy_to_user failed pid=%u cr3=%llx ptr=%llx size=%zu",
-                            static_cast<unsigned>(proc->pid),
+                            static_cast<unsigned>(proc->tid),
                             static_cast<unsigned long long>(proc->cr3),
                             static_cast<unsigned long long>(frame.rdi),
                             sizeof(snapshot));
@@ -1698,8 +1706,28 @@ Result handle_syscall(SyscallFrame& frame) {
             frame.rax = 0;
             return Result::Continue;
         }
+        case SystemCall::ClockGet: {
+            if (frame.rdi == 0) {
+                frame.rax = timekeeping::nanoseconds_since_boot();
+                return Result::Continue;
+            }
+            if (frame.rdi == 1) {
+                NeutrinoWallTime snapshot{};
+                if (!timekeeping::snapshot(snapshot) ||
+                    snapshot.unix_seconds >
+                        (UINT64_MAX - snapshot.nanoseconds) / 1000000000ull) {
+                    frame.rax = static_cast<uint64_t>(-1);
+                    return Result::Continue;
+                }
+                frame.rax = snapshot.unix_seconds * 1000000000ull +
+                            snapshot.nanoseconds;
+                return Result::Continue;
+            }
+            frame.rax = static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
         case SystemCall::RandomGet: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             uint64_t user_address = frame.rdi;
             size_t length = static_cast<size_t>(frame.rsi);
             constexpr size_t kMaxRandomRequest = 1024 * 1024;
@@ -1740,7 +1768,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::MapAnonymous: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1754,7 +1782,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::MapAt: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1769,7 +1797,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::Unmap: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1780,8 +1808,27 @@ Result handle_syscall(SyscallFrame& frame) {
             frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
             return Result::Continue;
         }
+        case SystemCall::ProtectMemory: {
+            process::Task* proc = process::current();
+            uint64_t flags = frame.rdx;
+            if (proc == nullptr || frame.rsi == 0 ||
+                (flags & ~(vm::kMapWrite | vm::kMapExecute)) != 0 ||
+                (flags & (vm::kMapWrite | vm::kMapExecute)) ==
+                    (vm::kMapWrite | vm::kMapExecute) ||
+                !vm::set_user_region_writable(
+                    proc->cr3, frame.rdi, frame.rsi,
+                    (flags & vm::kMapWrite) != 0) ||
+                !vm::set_user_region_executable(
+                    proc->cr3, frame.rdi, frame.rsi,
+                    (flags & vm::kMapExecute) != 0)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = 0;
+            return Result::Continue;
+        }
         case SystemCall::MapFilePrivate: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1800,19 +1847,19 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::ThreadCreate: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            process::Process* thread = process::create_user_thread(
+            process::Task* thread = process::create_user_thread(
                 *proc,
                 frame.rdi,
                 frame.rsi,
                 static_cast<size_t>(frame.rdx),
                 frame.r10);
             frame.rax = thread != nullptr
-                            ? static_cast<uint64_t>(thread->pid)
+                            ? static_cast<uint64_t>(thread->tid)
                             : static_cast<uint64_t>(-1);
             return Result::Continue;
         }
@@ -1821,7 +1868,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Unschedule;
         }
         case SystemCall::ThreadJoin: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1842,8 +1889,16 @@ Result handle_syscall(SyscallFrame& frame) {
             frame.rax = static_cast<uint64_t>(result);
             return Result::Continue;
         }
+        case SystemCall::ThreadDetach: {
+            process::Task* proc = process::current();
+            frame.rax = proc != nullptr && process::detach_thread(
+                            *proc, static_cast<uint32_t>(frame.rdi))
+                            ? 0
+                            : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
         case SystemCall::FutexWait: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1856,7 +1911,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return result == 0 ? Result::Reschedule : Result::Continue;
         }
         case SystemCall::FutexWake: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1867,18 +1922,32 @@ Result handle_syscall(SyscallFrame& frame) {
                 static_cast<size_t>(frame.rsi));
             return Result::Continue;
         }
+        case SystemCall::FutexWaitTimed: {
+            process::Task* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            int64_t result = process::futex_wait_timed(
+                *proc,
+                frame.rdi,
+                static_cast<uint32_t>(frame.rsi),
+                frame.rdx);
+            frame.rax = static_cast<uint64_t>(result);
+            return result == 0 ? Result::Reschedule : Result::Continue;
+        }
         case SystemCall::ThreadId: {
-            process::Process* proc = process::current();
-            frame.rax = proc != nullptr ? proc->pid : 0;
+            process::Task* proc = process::current();
+            frame.rax = proc != nullptr ? proc->tid : 0;
             return Result::Continue;
         }
         case SystemCall::ProcessId: {
-            process::Process* proc = process::current();
-            frame.rax = proc != nullptr ? proc->process_id : 0;
+            process::Task* proc = process::current();
+            frame.rax = proc != nullptr ? proc->pid : 0;
             return Result::Continue;
         }
         case SystemCall::ThreadSetTls: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             frame.rax =
                 proc != nullptr && process::set_thread_tls(*proc, frame.rdi)
                     ? 0
@@ -1886,16 +1955,16 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::ThreadGetTls: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             frame.rax = proc != nullptr ? proc->fs_base : 0;
             return Result::Continue;
         }
         case SystemCall::ProcessEventSend: {
-            process::Process* proc = process::current();
-            process::Process* target =
-                process::find_by_pid(static_cast<uint32_t>(frame.rdi));
+            process::Task* proc = process::current();
+            process::Task* target =
+                process::find_by_tid(static_cast<uint32_t>(frame.rdi));
             if (proc == nullptr || target == nullptr ||
-                (target->process_id != proc->process_id &&
+                (target->pid != proc->pid &&
                  !require_capability(
                      *proc,
                      capabilities::CapabilityKind::ProcessControl,
@@ -1905,17 +1974,17 @@ Result handle_syscall(SyscallFrame& frame) {
             }
             process::ProcessEvent event{
                 .type = static_cast<uint32_t>(frame.rsi),
-                .sender_process_id = proc->process_id,
+                .sender_process_id = proc->pid,
                 .value = frame.rdx,
             };
             frame.rax =
-                process::send_event(*proc, target->pid, event)
+                process::send_event(*proc, target->tid, event)
                     ? 0
                     : static_cast<uint64_t>(-1);
             return Result::Continue;
         }
         case SystemCall::ProcessEventReceive: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr || frame.rdi == 0) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1936,32 +2005,32 @@ Result handle_syscall(SyscallFrame& frame) {
             return result == 1 ? Result::Reschedule : Result::Continue;
         }
         case SystemCall::ProcessControl: {
-            process::Process* proc = process::current();
-            process::Process* target =
-                process::find_by_pid(static_cast<uint32_t>(frame.rdi));
+            process::Task* proc = process::current();
+            process::Task* target =
+                process::find_by_tid(static_cast<uint32_t>(frame.rdi));
             uint32_t action = static_cast<uint32_t>(frame.rsi);
             if (proc == nullptr || target == nullptr ||
-                (target->process_id != proc->process_id &&
+                (target->pid != proc->pid &&
                  !require_capability(
                      *proc,
                      capabilities::CapabilityKind::ProcessControl,
                      frame)) ||
                 !process::control_group(
                     *proc,
-                    target->pid,
+                    target->tid,
                     action,
                     static_cast<uint16_t>(frame.rdx))) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
             frame.rax = 0;
-            return target->process_id == proc->process_id &&
+            return target->pid == proc->pid &&
                            (action == 1 || action == 2)
                        ? Result::Reschedule
                        : Result::Continue;
         }
         case SystemCall::ProcessWaitChild: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1974,18 +2043,18 @@ Result handle_syscall(SyscallFrame& frame) {
             return result == 0 ? Result::Reschedule : Result::Continue;
         }
         case SystemCall::ProcessSetGroup: {
-            process::Process* proc = process::current();
-            process::Process* target =
+            process::Task* proc = process::current();
+            process::Task* target =
                 frame.rdi == 0
                     ? proc
-                    : process::find_by_pid(
+                    : process::find_by_tid(
                           static_cast<uint32_t>(frame.rdi));
             bool own_child =
                 proc != nullptr && target != nullptr &&
                 target->resources != nullptr &&
-                target->resources->parent_process_id == proc->process_id;
+                target->resources->parent_process_id == proc->pid;
             if (proc == nullptr || target == nullptr ||
-                (target->process_id != proc->process_id && !own_child &&
+                (target->pid != proc->pid && !own_child &&
                  !require_capability(
                      *proc,
                      capabilities::CapabilityKind::ProcessControl,
@@ -1995,7 +2064,7 @@ Result handle_syscall(SyscallFrame& frame) {
             }
             frame.rax = process::set_process_group(
                             *proc,
-                            target->pid,
+                            target->tid,
                             static_cast<uint32_t>(frame.rsi))
                             ? 0
                             : static_cast<uint64_t>(-1);
@@ -2004,14 +2073,14 @@ Result handle_syscall(SyscallFrame& frame) {
         case SystemCall::ProcessGetGroup:
         case SystemCall::ProcessGetSession: {
             SystemCall operation = static_cast<SystemCall>(frame.rax);
-            process::Process* proc = process::current();
-            process::Process* target =
+            process::Task* proc = process::current();
+            process::Task* target =
                 frame.rdi == 0
                     ? proc
-                    : process::find_by_pid(
+                    : process::find_by_tid(
                           static_cast<uint32_t>(frame.rdi));
             if (proc == nullptr || target == nullptr ||
-                (target->process_id != proc->process_id &&
+                (target->pid != proc->pid &&
                  !require_capability(
                      *proc,
                      capabilities::CapabilityKind::Monitor,
@@ -2026,15 +2095,15 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::ProcessCreateSession: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             frame.rax =
                 proc != nullptr && process::create_session(*proc)
-                    ? static_cast<uint64_t>(proc->process_id)
+                    ? static_cast<uint64_t>(proc->pid)
                     : static_cast<uint64_t>(-1);
             return Result::Continue;
         }
         case SystemCall::ProcessSetForeground: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             frame.rax =
                 proc != nullptr &&
                         process::set_foreground_group(
@@ -2045,7 +2114,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::ProcessGetForeground: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             frame.rax =
                 proc != nullptr
                     ? process::foreground_group(*proc)
@@ -2055,16 +2124,16 @@ Result handle_syscall(SyscallFrame& frame) {
         case SystemCall::ProcessSetLimits:
         case SystemCall::ProcessGetLimits:
         case SystemCall::ProcessGetUsage: {
-            process::Process* proc = process::current();
-            process::Process* target =
+            process::Task* proc = process::current();
+            process::Task* target =
                 frame.rdi == 0
                     ? proc
-                    : process::find_by_pid(
+                    : process::find_by_tid(
                           static_cast<uint32_t>(frame.rdi));
             SystemCall operation = static_cast<SystemCall>(frame.rax);
             bool external =
                 proc != nullptr && target != nullptr &&
-                target->process_id != proc->process_id;
+                target->pid != proc->pid;
             capabilities::CapabilityKind permission =
                 operation == SystemCall::ProcessSetLimits
                     ? capabilities::CapabilityKind::ProcessControl
@@ -2126,7 +2195,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::ProcessTrace: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(
                     *proc,
@@ -2167,7 +2236,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::ChangeSlot: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(
                     *proc,
@@ -2184,7 +2253,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::PrincipalCreate: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
                                     capabilities::CapabilityKind::SecurityManage,
@@ -2204,7 +2273,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::PrincipalSet: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
                                     capabilities::CapabilityKind::SecurityManage,
@@ -2229,7 +2298,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::CapabilityGrant: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
                                     capabilities::CapabilityKind::SecurityManage,
@@ -2266,7 +2335,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::CapabilityPass: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
                                     capabilities::CapabilityKind::SecurityManage,
@@ -2274,7 +2343,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            process::Process* child = process::find_by_pid(static_cast<uint32_t>(frame.rdi));
+            process::Task* child = process::find_by_tid(static_cast<uint32_t>(frame.rdi));
             const uint64_t* user_handles = reinterpret_cast<const uint64_t*>(frame.rsi);
             size_t handle_count = static_cast<size_t>(frame.rdx & 0xFFFF);
             constexpr size_t kMaxHandles = 8;
@@ -2311,7 +2380,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::UserCreate: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
                                     capabilities::CapabilityKind::SecurityManage,
@@ -2333,7 +2402,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::UserFind: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
                                     capabilities::CapabilityKind::SecurityManage,
@@ -2354,7 +2423,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::UserBumpGeneration: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
                                     capabilities::CapabilityKind::SecurityManage,
@@ -2372,7 +2441,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::UserSetPassword: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
                                     capabilities::CapabilityKind::SecurityManage,
@@ -2403,7 +2472,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::UserInfo: {
-            process::Process* proc = process::current();
+            process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
                                     capabilities::CapabilityKind::SecurityManage,

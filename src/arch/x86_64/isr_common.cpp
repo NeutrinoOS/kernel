@@ -71,7 +71,7 @@ extern "C" void isr_validate_return(InterruptFrame* regs) {
         return;
     }
     if (!syscall::valid_user_return_state(regs->rip, regs->rsp)) {
-        process::Process* proc = process::current();
+        process::Task* proc = process::current();
         if (proc != nullptr) {
             process::terminate(*proc, exit_code_from_exception(13));
             scheduler::reschedule_from_interrupt(*regs);
@@ -89,9 +89,9 @@ extern "C" void isr_handler(InterruptFrame* regs) {
         uint64_t irq = regs->int_no - 32;
         if (irq == 0) {
             bool user_mode = (regs->cs & 0x3) != 0;
-            bool has_proc = process::current() != nullptr;
-            percpu::record_tick(user_mode, has_proc);
-            if (has_proc) {
+            bool has_task = process::current() != nullptr;
+            percpu::record_tick(user_mode, has_task);
+            if (has_task) {
                 process::record_tick(user_mode);
             }
             timekeeping::tick_pit();
@@ -101,9 +101,9 @@ extern "C" void isr_handler(InterruptFrame* regs) {
             return;
         } else if (regs->int_no == 0x40) {
             bool user_mode = (regs->cs & 0x3) != 0;
-            bool has_proc = process::current() != nullptr;
-            percpu::record_tick(user_mode, has_proc);
-            if (has_proc) {
+            bool has_task = process::current() != nullptr;
+            percpu::record_tick(user_mode, has_task);
+            if (has_task) {
                 process::record_tick(user_mode);
             }
             scheduler::tick(*regs);
@@ -137,7 +137,7 @@ extern "C" void isr_handler(InterruptFrame* regs) {
     if (regs->int_no == 14 && (regs->cs & 0x3) != 0) {
         uint64_t fault_address = 0;
         asm volatile("mov %%cr2, %0" : "=r"(fault_address));
-        process::Process* proc = process::current();
+        process::Task* proc = process::current();
         const bool write = (regs->err_code & (1u << 1)) != 0;
         const bool execute = (regs->err_code & (1u << 4)) != 0;
         const bool recoverable =
@@ -174,7 +174,8 @@ extern "C" void isr_handler(InterruptFrame* regs) {
     asm volatile("mov %%cr3, %0" : "=r"(cr3_reg));
     if (auto* cur = process::current()) {
         log_message(LogLevel::Error,
-                    "Faulting process pid=%u image=%s cr3=%016llx",
+                    "Faulting task tid=%u pid=%u image=%s cr3=%016llx",
+                    static_cast<unsigned int>(cur->tid),
                     static_cast<unsigned int>(cur->pid),
                     cur->image_path[0] != '\0' ? cur->image_path : "(unknown)",
                     static_cast<unsigned long long>(cr3_reg));
@@ -189,7 +190,7 @@ extern "C" void isr_handler(InterruptFrame* regs) {
                             regs->rsp >= stack_base &&
                             regs->rsp < stack_top;
         log_message(LogLevel::Debug,
-                    "Process layout code=%016llx+%llu stack=%016llx..%016llx rip_off=%s%llx rsp_in_stack=%u",
+                    "Task layout code=%016llx+%llu stack=%016llx..%016llx rip_off=%s%llx rsp_in_stack=%u",
                     static_cast<unsigned long long>(code_base),
                     static_cast<unsigned long long>(code_len),
                     static_cast<unsigned long long>(stack_base),
@@ -315,8 +316,8 @@ extern "C" void isr_handler(InterruptFrame* regs) {
     if ((regs->cs & 0x3) != 0) {
         uint16_t exit_code = exit_code_from_exception(regs->int_no);
         log_message(LogLevel::Error,
-                    "Terminating userspace pid=%u image=%s due to exception %s (#%u) rip=%016llx exit=%u",
-                    process::current() ? static_cast<unsigned int>(process::current()->pid) : 0,
+                    "Terminating userspace task tid=%u image=%s due to exception %s (#%u) rip=%016llx exit=%u",
+                    process::current() ? static_cast<unsigned int>(process::current()->tid) : 0,
                     (process::current() != nullptr &&
                      process::current()->image_path[0] != '\0')
                         ? process::current()->image_path
@@ -325,7 +326,7 @@ extern "C" void isr_handler(InterruptFrame* regs) {
                     static_cast<unsigned int>(regs->int_no),
                     static_cast<unsigned long long>(regs->rip),
                     static_cast<unsigned int>(exit_code));
-        if (process::Process* proc = process::current()) {
+        if (process::Task* proc = process::current()) {
             process::terminate(*proc, exit_code);
         }
         scheduler::reschedule_from_interrupt(*regs);

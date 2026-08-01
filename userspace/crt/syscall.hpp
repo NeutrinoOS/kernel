@@ -90,7 +90,37 @@ enum class SystemCall : long {
     ProcessGetLimits     = 80,
     ProcessGetUsage      = 81,
     ProcessTrace         = 82,
+    FileOpenFlags        = 83,
+    FileSeek             = 84,
+    FileStat             = 85,
+    PathStat             = 86,
+    FileReadAt           = 87,
+    ClockGet             = 88,
+    ThreadDetach         = 89,
+    FutexWaitTimed       = 90,
+    ProtectMemory        = 91,
 };
+
+enum : uint32_t {
+    FILE_OPEN_READ = 1u << 0,
+    FILE_OPEN_WRITE = 1u << 1,
+    FILE_OPEN_CREATE = 1u << 2,
+    FILE_OPEN_EXCLUSIVE = 1u << 3,
+    FILE_OPEN_APPEND = 1u << 4,
+};
+
+enum : uint32_t {
+    FILE_METADATA_DIRECTORY = 1u << 0,
+};
+
+struct FileMetadata {
+    uint64_t size;
+    uint64_t modified_nanoseconds;
+    uint32_t flags;
+    uint32_t reserved;
+};
+
+static_assert(sizeof(FileMetadata) == 24, "file metadata size mismatch");
 
 enum : uint32_t {
     DIR_ENTRY_FLAG_DIRECTORY = 1u << 0,

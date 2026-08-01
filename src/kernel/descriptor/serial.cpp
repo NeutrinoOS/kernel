@@ -6,7 +6,7 @@ namespace descriptor {
 
 namespace serial_descriptor {
 
-int64_t serial_read(process::Process&,
+int64_t serial_read(process::Task&,
                     DescriptorEntry&,
                     uint64_t user_address,
                     uint64_t length,
@@ -26,7 +26,7 @@ int64_t serial_read(process::Process&,
     return static_cast<int64_t>(read_count);
 }
 
-int64_t serial_write(process::Process&,
+int64_t serial_write(process::Task&,
                      DescriptorEntry&,
                      uint64_t user_address,
                      uint64_t length,
@@ -50,7 +50,7 @@ const Ops kSerialOps{
     .set_property = nullptr,
 };
 
-bool open_serial(process::Process&,
+bool open_serial(process::Task&,
                  uint64_t,
                  uint64_t,
                  uint64_t,
