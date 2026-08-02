@@ -16,6 +16,7 @@ constexpr size_t kPageSize = 4096;
 // provide more samples without starving the controller
 constexpr size_t kDmaPages = 64;
 constexpr size_t kDmaBytes = kDmaPages * kPageSize;
+constexpr size_t kSilenceGuardBytes = 8 * kPageSize;
 constexpr uint64_t kMmioVirtBase = 0xFFFFE50000000000ull;
 constexpr uint64_t kMmioLength = 0x4000;
 constexpr uint16_t kPcmFormat = 0x0011;  // 48 kHz, 16-bit, two channels.
@@ -41,6 +42,8 @@ struct [[gnu::packed]] BdlEntry {
     uint32_t length;
     uint32_t flags;
 };
+
+static_assert(kDmaPages * sizeof(BdlEntry) <= kPageSize);
 
 struct Widget {
     bool present;
@@ -423,13 +426,17 @@ bool setup_output() {
 
     size_t sd = stream_base();
     write16(sd + 0x12, kPcmFormat);
-    write16(sd + 0x0C, 0);  // One BDL entry.
     write32(sd + 0x18, static_cast<uint32_t>(g_state.bdl_phys));
     write32(sd + 0x1C, static_cast<uint32_t>(g_state.bdl_phys >> 32));
-    g_state.bdl[0].address_low = static_cast<uint32_t>(g_state.dma_phys);
-    g_state.bdl[0].address_high = static_cast<uint32_t>(g_state.dma_phys >> 32);
-    g_state.bdl[0].length = static_cast<uint32_t>(kDmaBytes);
-    g_state.bdl[0].flags = 1u;
+    for (size_t i = 0; i < kDmaPages; ++i) {
+        uint64_t address = g_state.dma_phys + i * kPageSize;
+        g_state.bdl[i].address_low = static_cast<uint32_t>(address);
+        g_state.bdl[i].address_high = static_cast<uint32_t>(address >> 32);
+        g_state.bdl[i].length = static_cast<uint32_t>(kPageSize);
+        g_state.bdl[i].flags = 0;
+    }
+    // LVI is the zero-based index of the final valid descriptor.
+    write16(sd + 0x0C, static_cast<uint16_t>(kDmaPages - 1));
     write32(sd + 0x08, static_cast<uint32_t>(kDmaBytes));
     uint32_t ctl = read_stream_ctl(sd);
     ctl &= ~(0xFu << 20);
@@ -536,6 +543,21 @@ void update_playback_position() {
     g_state.last_position = position;
 }
 
+void clear_silence_guard() {
+    size_t free_bytes = kDmaBytes - g_state.queued_bytes;
+    size_t bytes = free_bytes < kSilenceGuardBytes
+                       ? free_bytes
+                       : kSilenceGuardBytes;
+    size_t position = g_state.write_position;
+    while (bytes != 0) {
+        size_t chunk = kDmaBytes - position;
+        if (chunk > bytes) chunk = bytes;
+        memset(g_state.dma + position, 0, chunk);
+        position = (position + chunk) % kDmaBytes;
+        bytes -= chunk;
+    }
+}
+
 size_t write_pcm(const void* data, size_t bytes) {
     if (!g_state.active || data == nullptr || bytes < 4) return 0;
     bytes &= ~static_cast<size_t>(3);
@@ -566,6 +588,11 @@ size_t write_pcm(const void* data, size_t bytes) {
         g_state.write_position = (g_state.write_position + chunk) % kDmaBytes;
         g_state.queued_bytes += chunk;
         done += chunk;
+        // The hardware consumes a cyclic buffer and can pass the software
+        // queue boundary before the next status poll stops it.  Keep the free
+        // region after valid samples silent instead of exposing data left by
+        // an earlier trip around the ring.
+        clear_silence_guard();
         asm volatile("mfence" ::: "memory");
 
         if (g_state.stream_running) continue;

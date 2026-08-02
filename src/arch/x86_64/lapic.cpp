@@ -65,6 +65,16 @@ void eoi() {
     write(0xB0, 0);
 }
 
+void send_ipi(uint32_t lapic_id, uint8_t vector) {
+    if (g_lapic == nullptr || lapic_id > 0xFFu || vector < 0x20u) return;
+    for (uint32_t i = 0; i < 100000u; ++i) {
+        if ((read(0x300) & (1u << 12)) == 0) break;
+        asm volatile("pause");
+    }
+    write(0x310, lapic_id << 24);
+    write(0x300, vector);
+}
+
 void send_ipi_all_others(uint8_t vector) {
     if (g_lapic == nullptr) return;
     // all excluding self, shorthand=3

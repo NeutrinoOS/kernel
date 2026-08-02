@@ -23,13 +23,14 @@ different built sysroot or cross compiler. The driver also supports ordinary
 compile-only invocations such as `-c` and exposes its target sysroot through
 `--print-sysroot`.
 
-Production C programs under `userspace/programs` are built through this SDK and
-installed under their normal command names. For example, `ls.c` uses
-`opendir`, `readdir`, `printf`, and `closedir` without including the raw
-Neutrino syscall interface:
+Production C programs in the sibling `neutrino-packages` projects are built
+through this SDK and installed under their normal command names. For example,
+`coreutils/src/ls.c` uses `opendir`, `readdir`, `printf`, and `closedir`
+without including the raw Neutrino syscall interface. A package can ensure the
+SDK exists with:
 
 ```sh
-make -C userspace PROGRAMS="ls cat wc date sleep" all
+make -C ../neutrino/userspace newlib-sdk
 ```
 
 The first milestone supports:

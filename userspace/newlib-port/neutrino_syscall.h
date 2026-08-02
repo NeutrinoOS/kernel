@@ -46,6 +46,7 @@ enum neutrino_system_call {
     NEUTRINO_MAP_FILE_PRIVATE = 59,
     NEUTRINO_UNMAP = 36,
     NEUTRINO_PROTECT_MEMORY = 91,
+    NEUTRINO_SYSTEM_INFO = 92,
 };
 
 enum {

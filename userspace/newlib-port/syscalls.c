@@ -1,4 +1,5 @@
 #include "neutrino_syscall.h"
+#include "socket_internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -49,6 +50,8 @@ void _exit(int status) {
 
 ssize_t _read(int fd, void* buffer, size_t length) {
     long result;
+    if (neutrino_socket_is_fd(fd))
+        return neutrino_socket_read(fd, buffer, length);
     if (fd >= STDIN_FILENO && fd <= STDERR_FILENO) {
         result = neutrino_raw_syscall4(
             NEUTRINO_DESCRIPTOR_READ,
@@ -77,6 +80,8 @@ ssize_t _read(int fd, void* buffer, size_t length) {
 
 ssize_t _write(int fd, const void* buffer, size_t length) {
     long result;
+    if (neutrino_socket_is_fd(fd))
+        return neutrino_socket_write(fd, buffer, length);
     if (fd >= STDIN_FILENO && fd <= STDERR_FILENO) {
         result = neutrino_raw_syscall4(
             NEUTRINO_DESCRIPTOR_WRITE,
@@ -164,6 +169,8 @@ int _open(const char* path, int flags, ...) {
 }
 
 int _close(int fd) {
+    if (neutrino_socket_is_fd(fd))
+        return neutrino_socket_close(fd);
     if (fd >= STDIN_FILENO && fd <= STDERR_FILENO) {
         return 0;
     }
@@ -206,6 +213,15 @@ int _fstat(int fd, struct stat* status) {
     }
 
     *status = (struct stat){0};
+    if (neutrino_socket_is_fd(fd)) {
+#ifdef S_IFSOCK
+        status->st_mode = S_IFSOCK | 0600;
+#else
+        status->st_mode = 0140000 | 0600;
+#endif
+        status->st_blksize = 1460;
+        return 0;
+    }
     if (fd <= STDERR_FILENO) {
         status->st_mode = S_IFCHR | 0600;
         status->st_blksize = 512;
@@ -301,7 +317,11 @@ int clock_gettime(clockid_t clock_id, struct timespec* value) {
         return -1;
     }
     long clock_kind;
-    if (clock_id == CLOCK_MONOTONIC) {
+    if (clock_id == CLOCK_MONOTONIC
+#ifdef CLOCK_MONOTONIC_RAW
+        || clock_id == CLOCK_MONOTONIC_RAW
+#endif
+    ) {
         clock_kind = 0;
     } else if (clock_id == CLOCK_REALTIME) {
         clock_kind = 1;

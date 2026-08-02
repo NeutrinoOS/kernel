@@ -7,6 +7,7 @@
 #include "lib/mem.hpp"
 #include "arch/x86_64/cpu_features.hpp"
 #include "arch/x86_64/gdt.hpp"
+#include "arch/x86_64/lapic.hpp"
 #include "arch/x86_64/tss.hpp"
 #include "arch/x86_64/registers.hpp"
 #include "arch/x86_64/memory/paging.hpp"
@@ -477,13 +478,25 @@ void enqueue(process::Task* proc) {
     if (proc == nullptr) {
         return;
     }
-    QueueGuard guard;
-    process::State state = process::load_state(*proc);
-    if (state != process::State::Ready) {
-        return;
+    size_t target = percpu::kMaxCpus;
+    {
+        QueueGuard guard;
+        process::State state = process::load_state(*proc);
+        if (state != process::State::Ready) {
+            return;
+        }
+        if (!queue_contains(proc)) {
+            enqueue_locked(proc);
+            target = proc->preferred_cpu;
+        }
     }
-    if (!queue_contains(proc)) {
-        enqueue_locked(proc);
+
+    percpu::Cpu* current_cpu = percpu::current_cpu();
+    percpu::Cpu* target_cpu = percpu::cpu_from_index(target);
+    if (target_cpu != nullptr && target_cpu->registered &&
+        target_cpu != current_cpu) {
+        lapic::send_ipi(target_cpu->lapic_id,
+                        lapic::kSchedulerWakeVector);
     }
 }
 

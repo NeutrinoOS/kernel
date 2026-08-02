@@ -99,6 +99,7 @@ enum class SystemCall : uint64_t {
     ThreadDetach         = 89,
     FutexWaitTimed       = 90,
     ProtectMemory        = 91,
+    SystemInfo           = 92,
 };
 
 Result handle_syscall(SyscallFrame& frame);

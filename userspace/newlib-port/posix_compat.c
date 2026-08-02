@@ -1,4 +1,5 @@
 #include "neutrino_syscall.h"
+#include "socket_internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -12,6 +13,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #ifndef RUSAGE_THREAD
@@ -23,6 +25,23 @@ enum {
     kWaitRead = 1u << 0,
     kWaitWrite = 1u << 1,
 };
+
+_Static_assert(sizeof(struct utsname) == 325,
+               "Neutrino system-info ABI mismatch");
+
+int uname(struct utsname* information) {
+    if (information == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (neutrino_raw_syscall2(NEUTRINO_SYSTEM_INFO,
+                              (long)(uintptr_t)information,
+                              (long)sizeof(*information)) < 0) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
 
 void* mmap(void* address,
            size_t length,
@@ -157,6 +176,15 @@ int fcntl(int fd, int command, ...) {
         errno = EBADF;
         return -1;
     }
+    int value = 0;
+    if (command == F_SETFL || command == F_SETFD) {
+        va_list arguments;
+        va_start(arguments, command);
+        value = va_arg(arguments, int);
+        va_end(arguments);
+    }
+    if (neutrino_socket_is_fd(fd))
+        return neutrino_socket_fcntl(fd, command, value);
     switch (command) {
         case F_GETFD:
             return 0;
@@ -165,10 +193,6 @@ int fcntl(int fd, int command, ...) {
         case F_GETFL:
             return fd < kFileDescriptorOffset ? O_RDWR : O_RDWR;
         case F_SETFL: {
-            va_list arguments;
-            va_start(arguments, command);
-            int value = va_arg(arguments, int);
-            va_end(arguments);
             if ((value & ~(O_NONBLOCK)) != 0) {
                 errno = ENOTSUP;
                 return -1;
@@ -208,6 +232,28 @@ int poll(struct pollfd* descriptors, nfds_t count, int timeout) {
     for (nfds_t i = 0; i < count; ++i) {
         descriptors[i].revents = 0;
         if (descriptors[i].fd < 0) continue;
+        uint32_t socket_handle = 0;
+        int socket_connected = 0;
+        if (neutrino_socket_poll_handle(descriptors[i].fd,
+                                        &socket_handle,
+                                        &socket_connected)) {
+            if (!socket_connected) {
+                descriptors[i].revents = POLLERR;
+                ++ready;
+                continue;
+            }
+            if ((descriptors[i].events & POLLOUT) != 0) {
+                descriptors[i].revents |= POLLOUT;
+                ++ready;
+                continue;
+            }
+            if (wait_count >= 64) { errno = EINVAL; return -1; }
+            waits[wait_count].handle = socket_handle;
+            waits[wait_count].events = kWaitRead;
+            waits[wait_count].reserved = (uint32_t)i;
+            ++wait_count;
+            continue;
+        }
         if (descriptors[i].fd >= kFileDescriptorOffset) {
             descriptors[i].revents = descriptors[i].events & (POLLIN | POLLOUT);
             if (descriptors[i].revents != 0) ++ready;

@@ -20,6 +20,7 @@
 #include "../../kernel/string_util.hpp"
 #include "../../kernel/sync.hpp"
 #include "../../kernel/users.hpp"
+#include "../../kernel/version.hpp"
 #include "arch/x86_64/percpu.hpp"
 #include "arch/x86_64/io.hpp"
 
@@ -28,7 +29,7 @@ namespace syscall {
 namespace {
 
 constexpr uint64_t kAbiMajor = 1;
-constexpr uint64_t kAbiMinor = 10;
+constexpr uint64_t kAbiMinor = 11;
 
 class PrincipalRefGuard {
 public:
@@ -151,6 +152,16 @@ struct UserInfo {
 };
 
 static_assert(sizeof(UserInfo) == 72, "UserInfo size mismatch");
+
+struct SystemInfo {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+};
+
+static_assert(sizeof(SystemInfo) == 325, "SystemInfo size mismatch");
 
 constexpr uint64_t kProcessChildFlagStdioConfig = 1ull << 0;
 constexpr uint64_t kProcessSpawnFlagPrincipalConfig = 1ull << 1;
@@ -556,6 +567,31 @@ Result handle_syscall(SyscallFrame& frame) {
         }
         case SystemCall::AbiMinor: {
             frame.rax = kAbiMinor;
+            return Result::Continue;
+        }
+        case SystemCall::SystemInfo: {
+            process::Task* proc = process::current();
+            if (proc == nullptr || frame.rdi == 0 ||
+                frame.rsi < sizeof(SystemInfo)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            SystemInfo info{};
+            string_util::copy(info.sysname, sizeof(info.sysname), "Neutrino");
+            string_util::copy(info.nodename, sizeof(info.nodename), "neutrino");
+            string_util::copy(info.release,
+                              sizeof(info.release),
+                              kernel_version::release());
+            string_util::copy(info.version,
+                              sizeof(info.version),
+                              "Neutrino kernel");
+            string_util::copy(info.machine, sizeof(info.machine), "x86_64");
+            if (!vm::copy_to_user(proc->cr3, frame.rdi, &info, sizeof(info))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = 0;
             return Result::Continue;
         }
         case SystemCall::Exit: {

@@ -109,6 +109,12 @@ extern "C" void isr_handler(InterruptFrame* regs) {
             scheduler::tick(*regs);
             lapic::eoi();
             return;
+        } else if (regs->int_no == lapic::kSchedulerWakeVector) {
+            if ((regs->cs & 0x3) != 0) {
+                scheduler::reschedule_from_interrupt(*regs);
+            }
+            lapic::eoi();
+            return;
         }
         percpu::record_irq();
         if (interrupts::dispatch(static_cast<uint8_t>(regs->int_no))) {

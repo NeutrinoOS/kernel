@@ -8,6 +8,7 @@ neutrino_sysroot=${NEUTRINO_SYSROOT:-"$userspace_dir/build/newlib-pie-sysroot"}
 neutrino_target=${NEUTRINO_TARGET:-x86_64-elf}
 neutrino_cc=${NEUTRINO_CROSS_CC:-"$neutrino_target-gcc"}
 target_root="$neutrino_sysroot/$neutrino_target"
+compiler_include=$("$neutrino_cc" -print-file-name=include)
 
 if [ "${1:-}" = "--print-sysroot" ]; then
     printf '%s\n' "$target_root"
@@ -43,8 +44,10 @@ if [ "$compile_only" -eq 1 ]; then
     # Word splitting is intentional for this fixed, whitespace-only flag list.
     # shellcheck disable=SC2086
     exec "$neutrino_cc" $common_flags \
+        -nostdinc \
         -isystem "$neutrino_sysroot/include" \
         -isystem "$target_root/include" \
+        -isystem "$compiler_include" \
         "$@"
 fi
 
@@ -54,8 +57,10 @@ if [ "$shared_link" -eq 1 ]; then
     # second copy of libc into each DSO.
     # shellcheck disable=SC2086
     exec "$neutrino_cc" $common_flags \
+        -nostdinc \
         -isystem "$neutrino_sysroot/include" \
         -isystem "$target_root/include" \
+        -isystem "$compiler_include" \
         -L"$target_root/lib" -Wl,-shared,-z,noexecstack \
         "$@" -lgcc
 fi
@@ -75,8 +80,10 @@ done
 # Word splitting is intentional for this fixed, whitespace-only flag list.
 # shellcheck disable=SC2086
 exec "$neutrino_cc" $common_flags \
+    -nostdinc \
     -isystem "$neutrino_sysroot/include" \
     -isystem "$target_root/include" \
+    -isystem "$compiler_include" \
     -pie -Wl,--no-dynamic-linker,-z,noexecstack,-E \
     "$crt0" "$@" \
     -Wl,--start-group "$platform_library" "$libc" "$libm" -lgcc \

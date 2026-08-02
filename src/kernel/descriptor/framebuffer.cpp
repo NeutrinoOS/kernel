@@ -282,6 +282,19 @@ bool copy_rect_to_hardware(const FramebufferSlot& slot,
         return false;
     }
     size_t frame_bytes = usable_frame_bytes(slot);
+    if (x == 0 && width == fb->width) {
+        if (static_cast<size_t>(y) > static_cast<size_t>(-1) / fb->pitch ||
+            static_cast<size_t>(height) > static_cast<size_t>(-1) / fb->pitch) {
+            return false;
+        }
+        size_t offset = static_cast<size_t>(y) * fb->pitch;
+        size_t bytes = static_cast<size_t>(height) * fb->pitch;
+        if (offset > frame_bytes || bytes > frame_bytes - offset) {
+            return false;
+        }
+        memcpy_simd(g_hw_base + offset, slot.buffer + offset, bytes);
+        return true;
+    }
     for (uint32_t row = 0; row < height; ++row) {
         size_t row_index = static_cast<size_t>(y) + row;
         if (row_index > static_cast<size_t>(-1) / fb->pitch) {

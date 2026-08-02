@@ -48,6 +48,7 @@
 #include "settings.hpp"
 #include "string_util.hpp"
 #include "time.hpp"
+#include "version.hpp"
 
 static void hcf(void) {
     for (;;) asm("hlt");
@@ -451,6 +452,9 @@ static void kernel_main_stage2() {
     }
 
     log_message(LogLevel::Info, "Welcome to Neutrino");
+    log_message(LogLevel::Info,
+                "Kernel release: %s",
+                kernel_version::release());
 
     const char* compiler_string =
 #if defined(__clang__)

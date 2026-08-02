@@ -479,6 +479,9 @@ Task* create_user_thread(Task& owner,
     thread->resources = owner.resources;
 
     thread->is_thread = true;
+    // Keep cooperating userspace threads on the owning process's CPU until
+    // the SMP scheduler has a measured, workload-safe migration policy.
+    thread->preferred_cpu = owner.preferred_cpu;
     thread->fs_base = tls_base != 0 ? tls_base : owner.fs_base;
     string_util::copy(thread->image_path,
                       sizeof(thread->image_path),
@@ -495,7 +498,12 @@ Task* create_user_thread(Task& owner,
     }
 
     thread->user_ip = entry;
-    thread->user_sp = (thread->stack_region.top - 16ull) & ~0xFull;
+    // A userspace thread entry is an ordinary System V AMD64 function, but
+    // the scheduler enters it directly instead of using `call`. Emulate the
+    // call instruction's eight-byte return-address push so the function sees
+    // RSP % 16 == 8 on entry. Compilers rely on this for aligned SSE spills.
+    thread->user_sp =
+        ((thread->stack_region.top - 16ull) & ~0xFull) - sizeof(uint64_t);
     memset(&thread->context, 0, sizeof(thread->context));
     thread->context.user_rip = thread->user_ip;
     thread->context.user_rsp = thread->user_sp;

@@ -6,7 +6,17 @@
 #define CLOCK_REALTIME 0
 #endif
 #ifndef CLOCK_MONOTONIC
-#define CLOCK_MONOTONIC 1
+// Keep this distinct from Newlib's CLOCK_REALTIME value of 1.  This matches
+// the CLOCK_MONOTONIC value Newlib exposes when POSIX monotonic clocks are
+// enabled.
+#define CLOCK_MONOTONIC 4
+#endif
+#ifndef CLOCK_MONOTONIC_RAW
+#define CLOCK_MONOTONIC_RAW 5
+#endif
+
+#if CLOCK_REALTIME == CLOCK_MONOTONIC
+#error "CLOCK_REALTIME and CLOCK_MONOTONIC must have distinct IDs"
 #endif
 
 #ifdef __cplusplus

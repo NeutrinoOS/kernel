@@ -11,11 +11,13 @@ namespace {
 
 constexpr uint8_t kElfMagic[4] = {0x7F, 'E', 'L', 'F'};
 constexpr uint64_t kPageSize = 0x1000;
-// The main image plus FFmpeg's seven public DSOs fits within this bounded
-// graph while leaving room for ordinary package-level dependencies.
+// Keep the complete dependency graph bounded so malformed or unusually large
+// images cannot exhaust kernel resources while they are being loaded.
 constexpr size_t kMaxSharedObjects = 16;
 constexpr size_t kDefaultMainStackSize = 256 * 1024;
-constexpr size_t kMaxNeeded = 8;
+// A single object may name every other object in the graph.  Do not impose a
+// smaller, independent DT_NEEDED limit: it rejects otherwise valid graphs.
+constexpr size_t kMaxNeeded = kMaxSharedObjects - 1;
 constexpr size_t kMaxSharedObjectName = 64;
 constexpr size_t kMaxSharedObjectPath = 128;
 

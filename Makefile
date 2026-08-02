@@ -6,6 +6,7 @@ C_CC       := $(CROSS)gcc
 LD         := $(CROSS)ld
 AS         := nasm -f elf64
 OBJCOPY    := $(CROSS)objcopy
+KERNEL_VERSION ?= 0.0.0-dev
 
 OUT_DIR    := out
 BUILD_DIR  := build
@@ -104,8 +105,13 @@ TARGET_ISO_RAMFS := $(OUT_DIR)/neutrino_ramfs.iso
 ISO_ROOT_RAMFS := $(OUT_DIR)/iso_root_ramfs
 LIVE_ROOTFS_IMG ?= $(OUT_DIR)/live_rootfs.img
 LIVE_ROOTFS_SIZE ?= 128M
-LIVE_ROOTFS_PROGRAMS ?= init shell desktop neupak download networkd tcpd dhcp netctl ping netget browse lspci sensors installer shutdown dmesg lsdisk mount mkneufs mkpart ls cat cp mv rm mkdir rmdir pwd echo clear touch sync date wc sleep lsmod insmod
-LIVE_ROOTFS_CONFIG_DIR ?= config/live-base
+NEUTRINO_PACKAGES_ROOT ?= ../neutrino-packages
+LIVE_PACKAGE_NAMES := base-system bearssl coreutils neupak network-services \
+                      network-tools system-tools text-tools console-tools \
+                      editor-tools neutrino-installer neutrino-drivers neutrino-live
+LIVE_PACKAGE_ZIPS := $(foreach package,$(LIVE_PACKAGE_NAMES),$(NEUTRINO_PACKAGES_ROOT)/$(package)/out/$(package).zip)
+LIVE_REPO_DIR := $(OUT_DIR)/live-repo
+LIVE_ROOTFS_STAGE := $(BUILD_DIR)/live-rootfs
 LIVE_ESP_IMG ?= $(OUT_DIR)/esp.img
 LIVE_ESP_SIZE ?= 64M
 
@@ -114,12 +120,17 @@ KERNEL_MODULE_CPP := $(SRC_DIR)/drivers/net/e1000e.cpp
 KERNEL_MODULES := $(OUT_DIR)/modules/e1000e.ko
 KERNEL_MODULE_LOADS := $(OUT_DIR)/modules/loads.txt
 SRC_CPP_ALL := $(shell find $(SRC_DIR) -type f -name '*.cpp')
-SRC_CPP := $(filter-out $(KERNEL_MODULE_CPP),$(SRC_CPP_ALL))
+KERNEL_VERSION_CPP := $(SRC_DIR)/kernel/version.cpp
+KERNEL_VERSION_OBJ := $(BUILD_DIR)/kernel/version-$(KERNEL_VERSION).o
+KERNEL_VERSION_MARKER := $(BUILD_DIR)/kernel/.version-$(KERNEL_VERSION)
+OTHER_KERNEL_VERSION_MARKERS := $(filter-out $(KERNEL_VERSION_MARKER),$(wildcard $(BUILD_DIR)/kernel/.version-*))
+SRC_CPP := $(filter-out $(KERNEL_MODULE_CPP) $(KERNEL_VERSION_CPP),$(SRC_CPP_ALL))
 UACPI_C := $(shell find $(SRC_DIR)/third_party/uacpi/source -maxdepth 1 -type f -name '*.c')
 SRC_ASM := $(shell find $(SRC_DIR) -type f -name '*.S')
 OBJ     := $(SRC_CPP:$(SRC_DIR)/%.cpp=$(BUILD_DIR)/%.o) \
            $(UACPI_C:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o) \
-           $(SRC_ASM:$(SRC_DIR)/%.S=$(BUILD_DIR)/%.o)
+           $(SRC_ASM:$(SRC_DIR)/%.S=$(BUILD_DIR)/%.o) \
+           $(KERNEL_VERSION_OBJ)
 KERNEL_SIMD_CPP ?=
 KERNEL_SIMD_OBJ := $(KERNEL_SIMD_CPP:$(SRC_DIR)/%.cpp=$(BUILD_DIR)/%.o)
 KERNEL_SIMD_CFLAGS := $(filter-out -mno-mmx -mno-sse -mno-sse2,$(CFLAGS)) -mmmx -msse -msse2
@@ -134,6 +145,16 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
 	@echo "[C++] $<"
 	$(CC) $(CFLAGS) -c $< -o $@
+
+$(KERNEL_VERSION_OBJ): $(KERNEL_VERSION_CPP) $(SRC_DIR)/kernel/version.hpp
+	@mkdir -p $(dir $@)
+	@echo "[C++] $< ($(KERNEL_VERSION))"
+	$(CC) $(CFLAGS) -DNEUTRINO_KERNEL_VERSION='"$(KERNEL_VERSION)"' -c $< -o $@
+
+$(KERNEL_VERSION_MARKER):
+	@mkdir -p $(dir $@)
+	@rm -f $(OTHER_KERNEL_VERSION_MARKERS)
+	@touch $@
 
 $(BUILD_DIR)/third_party/uacpi/source/%.o: $(SRC_DIR)/third_party/uacpi/source/%.c
 	@mkdir -p $(dir $@)
@@ -159,7 +180,7 @@ $(KERNEL_MODULE_LOADS): $(KERNEL_MODULES)
 	done
 
 # === Link kernel ELF ===
-$(TARGET_ELF): $(OBJ)
+$(TARGET_ELF): $(KERNEL_VERSION_MARKER) $(OBJ)
 	@mkdir -p $(OUT_DIR)
 	@echo "[LD]   $@"
 	$(LD) $(LDFLAGS) -o $@ $(OBJ)
@@ -288,24 +309,31 @@ live-esp: $(LIVE_ESP_IMG)
 .PHONY: force-live-esp
 force-live-esp: $(LIVE_ESP_IMG)
 
-$(LIVE_ROOTFS_IMG): userspace/Makefile shared/include/TOSH-SAT.F14 $(KERNEL_MODULES) $(KERNEL_MODULE_LOADS) $(shell find userspace/programs userspace/crt userspace/libc userspace/newlib-port userspace/config -type f 2>/dev/null)
+.PHONY: userspace-sdk live-package-archives
+userspace-sdk:
+	$(MAKE) -C userspace newlib-sdk
+
+live-package-archives: userspace-sdk $(KERNEL_MODULES) $(KERNEL_MODULE_LOADS)
+	@set -euo pipefail; \
+	for package in $(LIVE_PACKAGE_NAMES); do \
+		$(MAKE) -C "$(NEUTRINO_PACKAGES_ROOT)/$$package" package; \
+	done
+
+$(LIVE_ROOTFS_IMG): live-package-archives $(NEUTRINO_PACKAGES_ROOT)/build-local-repo.sh $(NEUTRINO_PACKAGES_ROOT)/install-packages-root.sh
 	@mkdir -p $(dir $@)
-	rm -f $@
-	truncate -s $(LIVE_ROOTFS_SIZE) $@
-	mkfs.fat -F 32 --mbr=y $@
-	$(MAKE) -C userspace install-mtools HDD_IMAGE=$(abspath $@) PROGRAMS="$(LIVE_ROOTFS_PROGRAMS)" CONFIG_DIR="$(LIVE_ROOTFS_CONFIG_DIR)"
+	rm -rf $(LIVE_REPO_DIR) $(LIVE_ROOTFS_STAGE)
+	mkdir -p $(LIVE_REPO_DIR) $(LIVE_ROOTFS_STAGE)/packages $(LIVE_ROOTFS_STAGE)/system
+	$(NEUTRINO_PACKAGES_ROOT)/build-local-repo.sh $(LIVE_REPO_DIR) $(LIVE_PACKAGE_ZIPS)
+	$(NEUTRINO_PACKAGES_ROOT)/install-packages-root.sh $(LIVE_ROOTFS_STAGE) $(LIVE_PACKAGE_ZIPS)
+	cp -a $(LIVE_REPO_DIR)/. $(LIVE_ROOTFS_STAGE)/packages/
 	# The live medium uses an ephemeral RAM write overlay at runtime. Seed it
 	# with an explicit valid, empty v3 credential store so init can distinguish
 	# intentional bootstrap mode from a missing, truncated, or corrupt database.
-	mmd -i $@ ::/system
-	printf '\125\104\124\116\003\000\200\000\000\000\000\000\001\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\000\000\000\000' > $(OUT_DIR)/live-users.ntd
-	mcopy -i $@ $(OUT_DIR)/live-users.ntd ::/system/users.ntd
-	rm -f $(OUT_DIR)/live-users.ntd
-	mmd -i $@ ::/config/ssl
-	mcopy -i $@ userspace/config/ssl/cacert.pem ::/config/ssl/cacert.pem
-	mmd -i $@ ::/modules
-	mcopy -i $@ $(KERNEL_MODULES) ::/modules/
-	mcopy -i $@ $(KERNEL_MODULE_LOADS) ::/modules/loads.txt
+	printf '\125\104\124\116\003\000\200\000\000\000\000\000\001\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\000\000\000\000' > $(LIVE_ROOTFS_STAGE)/system/users.ntd
+	rm -f $@
+	truncate -s $(LIVE_ROOTFS_SIZE) $@
+	mkfs.fat -F 32 --mbr=y $@
+	mcopy -s -i $@ $(LIVE_ROOTFS_STAGE)/* ::/
 
 $(LIVE_ESP_IMG): $(TARGET_ELF) $(LIMINE_DIR)
 	@mkdir -p $(dir $@)

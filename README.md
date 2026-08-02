@@ -9,37 +9,39 @@ To get an ISO that runs on 64-bit machines via legacy or UEFI boot, run `make is
 To build the ISO and automatically run it in QEMU with OVMF firmware, run `make run`. This might require some tweaking as my machine uses Arch, which has a nonstandard location for OVMF firmware. It can also be run manually without providing an OVMF path to use legacy boot.
 ### Raw .elf
 To get only the raw kernel.elf file, you can run `make all`. This will produce out/kernel.elf, which is not very useful on its own, but I don't know your motivations.
+
+Installable kernel updates are packaged from the sibling
+`neutrino-packages/neutrino-kernel` project. Run `make package` there after
+bumping its semantic version. The package build embeds that manifest version in
+the kernel, and the running version is reported by `uname -r`. Direct builds use
+`0.0.0-dev` unless `KERNEL_VERSION` is supplied. Boot packages target the
+installed Neutrino EFI system partition and cannot be uninstalled; install a
+known-good replacement to roll back. Before replacement, neupak preserves the
+running kernel as
+`/boot/kernel.previous.elf`; new installations expose that copy as a recovery
+entry in the Limine boot menu.
+
+The live image also carries a complete, versioned userspace package set in
+`/packages`. Every live userspace file is preinstalled from the standalone
+projects in the sibling `neutrino-packages` repository; the main repository
+only retains the userspace SDK and platform headers. The bundled repository has
+a normal Neupak index and a `file:///packages/index.toml` source, so the NEUFS
+installer can use dependency resolution while completely offline. It installs
+the `neutrino-live` package set below `--root <mounted-root>` instead of cloning
+the live filesystem. Package archives are generated in each package project's
+`out` directory.
 ### Debugging
 You can use `make debug` to run in EFI mode with QEMU's debug mode enabled, allowing you to attach a debugger with e.g. `gdb -ex "target remote localhost:1234" -ex "symbol-file out/kernel.elf"`. The same considerations apply as with normal `make run.`
 ### Optimized builds
 There's no support right now for optimized builds out of the box, but you can run something like `make clean all EXTRA_CFLAGS="-O3 -DNDEBUG=1"` to pass -O3 -DNDEBUG=1 into CFLAGs.
 
-## Optional userspace dependencies
-Some userspace features may optionally depend on third-party libraries that are not stored in the repository.
+## Userspace SDK and packages
 
-### BearSSL
-If you want BearSSL available to userspace programs, provide your own BearSSL checkout at `userspace/deps/BearSSL`.
-
-Once present, you can build the archive with:
-
-```sh
-make -C userspace bearssl
-```
-
-You can also build a packageable shared object with:
-
-```sh
-make -C userspace bearssl-shared
-```
-
-That produces `userspace/out/libbearssl.so.0` and stages `libbearssl.so.0`
-plus the linker-name copy `libbearssl.so` under `userspace/library`. The
-userspace install target copies staged shared libraries into `/library` on
-the target filesystem, adjacent to `/binary` for package payloads and runtime
-lookup. Current programs still link BearSSL statically until Neutrino grows
-broader coverage for shared-library relocation and runtime conventions.
-
-The userspace build is configured such that individual programs can optionally link against that .a, but BearSSL is probably not required for normal kernel or userspace builds unless a program explicitly depends on it.
+Run `make -C userspace newlib-sdk` to build the Newlib sysroot used by C-based
+packages. Runnable programs, third-party libraries such as BearSSL, package
+manifests, and root configuration live in the sibling `neutrino-packages`
+repository. `make live-rootfs` builds the selected package set and assembles the
+live filesystem exclusively from those archives.
 
 ## Virtual memory
 

@@ -11,6 +11,7 @@ build_dir=$2
 thread_mode=${3:-pthread}
 port_dir=$(cd "$(dirname "$0")" && pwd)
 cc="$port_dir/neutrino-cc"
+bearssl_root=$(cd "$port_dir/../../../neutrino-packages/bearssl" && pwd)
 
 if [[ ! -x "$source_dir/configure" ]]; then
     echo "FFmpeg configure script not found under $source_dir" >&2
@@ -46,17 +47,23 @@ fi
     --disable-autodetect \
     --disable-doc \
     --disable-debug \
-    --disable-network \
+    --enable-network \
     --disable-devices \
     --disable-hwaccels \
-    --disable-x86asm \
+    --x86asmexe=nasm \
     --disable-everything \
     --enable-ffmpeg \
+    --enable-ffplay \
+    --enable-ffprobe \
+    --enable-sdl2 \
     --enable-avcodec \
+    --enable-avfilter \
     --enable-avformat \
     --enable-avutil \
+    --enable-swresample \
     --enable-swscale \
-    --enable-protocol=file \
+    --enable-bearssl \
+    --enable-protocol=file,http,https,tcp,tls \
     --enable-demuxer=aac,matroska,mov,mp3 \
     --enable-decoder=aac \
     --enable-decoder=h264 \
@@ -76,6 +83,10 @@ fi
     --enable-muxer=null \
     --enable-bsf=aac_adtstoasc \
     --enable-bsf=h264_mp4toannexb \
+    --enable-filter=aresample \
+    --enable-filter=format \
     --enable-filter=null \
+    --enable-filter=scale \
     "${thread_flags[@]}" \
-    --extra-cflags='-D_POSIX_THREADS=200809L'
+    --extra-cflags="-D_POSIX_THREADS=200809L -D_WANT_IO_C99_FORMATS -DFFPLAY_NEUTRINO_SOFTWARE_RENDERER -I$bearssl_root/include/bearssl" \
+    --extra-ldflags="-L$bearssl_root/library"
