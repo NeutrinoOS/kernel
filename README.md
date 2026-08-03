@@ -43,6 +43,23 @@ manifests, and root configuration live in the sibling `neutrino-packages`
 repository. `make live-rootfs` builds the selected package set and assembles the
 live filesystem exclusively from those archives.
 
+The default live package roots are `neutrino-installer` and `neutrino-live`.
+Their manifests expand to the complete live environment. Override
+`LIVE_PACKAGES` to stage a custom set into `make live-rootfs`, `make iso`, or
+`make run`; manifest dependencies are included automatically and ordered before
+the packages that require them. For example:
+
+```sh
+make print-live-packages LIVE_PACKAGES="network-tools editor-tools"
+make iso LIVE_PACKAGES="network-tools editor-tools"
+make run LIVE_PACKAGES="network-tools editor-tools"
+```
+
+`print-live-packages` previews the dependency-expanded package order without
+building the image. A custom set only contains the requested packages and their
+dependencies, so include `neutrino-installer` when the resulting live system
+should provide the installer.
+
 ## Virtual memory
 
 Neutrino tracks executable images, private loader allocations, guarded user

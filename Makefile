@@ -106,10 +106,10 @@ ISO_ROOT_RAMFS := $(OUT_DIR)/iso_root_ramfs
 LIVE_ROOTFS_IMG ?= $(OUT_DIR)/live_rootfs.img
 LIVE_ROOTFS_SIZE ?= 128M
 NEUTRINO_PACKAGES_ROOT ?= ../neutrino-packages
-LIVE_PACKAGE_NAMES := base-system bearssl coreutils neupak network-services \
-                      network-tools system-tools text-tools console-tools \
-                      editor-tools neutrino-installer neutrino-drivers neutrino-live
-LIVE_PACKAGE_ZIPS := $(foreach package,$(LIVE_PACKAGE_NAMES),$(NEUTRINO_PACKAGES_ROOT)/$(package)/out/$(package).zip)
+DEFAULT_LIVE_PACKAGES := neutrino-installer neutrino-live
+LIVE_PACKAGES ?= $(DEFAULT_LIVE_PACKAGES)
+LIVE_PACKAGE_NAMES = $(shell $(NEUTRINO_PACKAGES_ROOT)/resolve-package-deps.sh $(LIVE_PACKAGES))
+LIVE_PACKAGE_ZIPS = $(foreach package,$(LIVE_PACKAGE_NAMES),$(NEUTRINO_PACKAGES_ROOT)/$(package)/out/$(package).zip)
 LIVE_REPO_DIR := $(OUT_DIR)/live-repo
 LIVE_ROOTFS_STAGE := $(BUILD_DIR)/live-rootfs
 LIVE_ESP_IMG ?= $(OUT_DIR)/esp.img
@@ -309,11 +309,18 @@ live-esp: $(LIVE_ESP_IMG)
 .PHONY: force-live-esp
 force-live-esp: $(LIVE_ESP_IMG)
 
-.PHONY: userspace-sdk live-package-archives
+.PHONY: userspace-sdk check-live-packages live-package-archives print-live-packages
 userspace-sdk:
 	$(MAKE) -C userspace newlib-sdk
 
-live-package-archives: userspace-sdk $(KERNEL_MODULES) $(KERNEL_MODULE_LOADS)
+check-live-packages:
+	@$(NEUTRINO_PACKAGES_ROOT)/resolve-package-deps.sh $(LIVE_PACKAGES) >/dev/null
+
+print-live-packages: check-live-packages
+	@echo "Requested live packages: $(LIVE_PACKAGES)"
+	@echo "Resolved live packages:  $(LIVE_PACKAGE_NAMES)"
+
+live-package-archives: check-live-packages userspace-sdk $(KERNEL_MODULES) $(KERNEL_MODULE_LOADS)
 	@set -euo pipefail; \
 	for package in $(LIVE_PACKAGE_NAMES); do \
 		$(MAKE) -C "$(NEUTRINO_PACKAGES_ROOT)/$$package" package; \
