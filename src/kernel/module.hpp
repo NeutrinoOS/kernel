@@ -23,7 +23,7 @@ struct PciMatch {
     uint8_t prog_if;
 };
 
-constexpr uint32_t kDescriptorAbiVersion = 1;
+constexpr uint32_t kDescriptorAbiVersion = 2;
 constexpr uint16_t kAnyVendor = 0xFFFFu;
 constexpr uint16_t kAnyDevice = 0xFFFFu;
 constexpr uint8_t kAnyClass = 0xFFu;
@@ -80,4 +80,17 @@ bool info_at(size_t index, ModuleInfo& out_info);
         .init = module_init,                                                   \
         .pci_matches = module_pci_matches,                                    \
         .pci_match_count = module_pci_match_count,                            \
+    }
+
+#define KERNEL_DYNAMIC_MODULE_DESCRIPTOR(module_name, module_phase,            \
+                                         module_pci_matches,                   \
+                                         module_pci_match_count)               \
+    extern "C" [[gnu::used, gnu::visibility("default")]]                     \
+    const kernel_module::Descriptor neutrino_module_descriptor = {             \
+        .abi_version = kernel_module::kDescriptorAbiVersion,                   \
+        .name = module_name,                                                   \
+        .phase = module_phase,                                                 \
+        .init = nullptr,                                                       \
+        .pci_matches = module_pci_matches,                                     \
+        .pci_match_count = module_pci_match_count,                             \
     }

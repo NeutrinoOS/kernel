@@ -106,7 +106,7 @@ ISO_ROOT_RAMFS := $(OUT_DIR)/iso_root_ramfs
 LIVE_ROOTFS_IMG ?= $(OUT_DIR)/live_rootfs.img
 LIVE_ROOTFS_SIZE ?= 128M
 NEUTRINO_PACKAGES_ROOT ?= ../neutrino-packages
-DEFAULT_LIVE_PACKAGES := neutrino-installer neutrino-live
+DEFAULT_LIVE_PACKAGES := neutrino-installer neutrino-live neutrino-drivers
 LIVE_PACKAGES ?= $(DEFAULT_LIVE_PACKAGES)
 LIVE_PACKAGE_NAMES = $(shell $(NEUTRINO_PACKAGES_ROOT)/resolve-package-deps.sh $(LIVE_PACKAGES))
 LIVE_PACKAGE_ZIPS = $(foreach package,$(LIVE_PACKAGE_NAMES),$(NEUTRINO_PACKAGES_ROOT)/$(package)/out/$(package).zip)
@@ -116,15 +116,14 @@ LIVE_ESP_IMG ?= $(OUT_DIR)/esp.img
 LIVE_ESP_SIZE ?= 64M
 
 # === Source discovery ===
-KERNEL_MODULE_CPP := $(SRC_DIR)/drivers/net/e1000e.cpp
-KERNEL_MODULES := $(OUT_DIR)/modules/e1000e.ko
+KERNEL_MODULE_NAMES := e1000e.ko virtio-net.ko intel-hda.ko intel-uhd-gemini-lake.ko
 KERNEL_MODULE_LOADS := $(OUT_DIR)/modules/loads.txt
 SRC_CPP_ALL := $(shell find $(SRC_DIR) -type f -name '*.cpp')
 KERNEL_VERSION_CPP := $(SRC_DIR)/kernel/version.cpp
 KERNEL_VERSION_OBJ := $(BUILD_DIR)/kernel/version-$(KERNEL_VERSION).o
 KERNEL_VERSION_MARKER := $(BUILD_DIR)/kernel/.version-$(KERNEL_VERSION)
 OTHER_KERNEL_VERSION_MARKERS := $(filter-out $(KERNEL_VERSION_MARKER),$(wildcard $(BUILD_DIR)/kernel/.version-*))
-SRC_CPP := $(filter-out $(KERNEL_MODULE_CPP) $(KERNEL_VERSION_CPP),$(SRC_CPP_ALL))
+SRC_CPP := $(filter-out $(KERNEL_VERSION_CPP),$(SRC_CPP_ALL))
 UACPI_C := $(shell find $(SRC_DIR)/third_party/uacpi/source -maxdepth 1 -type f -name '*.c')
 SRC_ASM := $(shell find $(SRC_DIR) -type f -name '*.S')
 OBJ     := $(SRC_CPP:$(SRC_DIR)/%.cpp=$(BUILD_DIR)/%.o) \
@@ -136,7 +135,7 @@ KERNEL_SIMD_OBJ := $(KERNEL_SIMD_CPP:$(SRC_DIR)/%.cpp=$(BUILD_DIR)/%.o)
 KERNEL_SIMD_CFLAGS := $(filter-out -mno-mmx -mno-sse -mno-sse2,$(CFLAGS)) -mmmx -msse -msse2
 
 # === Default target ===
-all: $(TARGET_ELF) $(KERNEL_MODULES)
+all: $(TARGET_ELF)
 
 # === Object build rules ===
 $(KERNEL_SIMD_OBJ): CFLAGS := $(KERNEL_SIMD_CFLAGS)
@@ -166,17 +165,12 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.S
 	@echo "[ASM]  $<"
 	$(AS) $< -o $@
 
-$(OUT_DIR)/modules/e1000e.ko: $(SRC_DIR)/drivers/net/e1000e.cpp $(SRC_DIR)/kernel/module.hpp
-	@mkdir -p $(dir $@)
-	@echo "[KO]   $@"
-	$(CC) $(CFLAGS) -DNEUTRINO_DYNAMIC_MODULE_E1000E -c $< -o $@
-
-$(KERNEL_MODULE_LOADS): $(KERNEL_MODULES)
+$(KERNEL_MODULE_LOADS): Makefile
 	@mkdir -p $(dir $@)
 	@echo "[MODS] $@"
 	@rm -f $@
-	@for module in $(KERNEL_MODULES); do \
-		printf '%s\n' "$${module##*/}" >> $@; \
+	@for module in $(KERNEL_MODULE_NAMES); do \
+		printf '%s\n' "$$module" >> $@; \
 	done
 
 # === Link kernel ELF ===
@@ -320,7 +314,7 @@ print-live-packages: check-live-packages
 	@echo "Requested live packages: $(LIVE_PACKAGES)"
 	@echo "Resolved live packages:  $(LIVE_PACKAGE_NAMES)"
 
-live-package-archives: check-live-packages userspace-sdk $(KERNEL_MODULES) $(KERNEL_MODULE_LOADS)
+live-package-archives: check-live-packages userspace-sdk $(KERNEL_MODULE_LOADS)
 	@set -euo pipefail; \
 	for package in $(LIVE_PACKAGE_NAMES); do \
 		$(MAKE) -C "$(NEUTRINO_PACKAGES_ROOT)/$$package" package; \
@@ -332,6 +326,8 @@ $(LIVE_ROOTFS_IMG): live-package-archives $(NEUTRINO_PACKAGES_ROOT)/build-local-
 	mkdir -p $(LIVE_REPO_DIR) $(LIVE_ROOTFS_STAGE)/packages $(LIVE_ROOTFS_STAGE)/system
 	$(NEUTRINO_PACKAGES_ROOT)/build-local-repo.sh $(LIVE_REPO_DIR) $(LIVE_PACKAGE_ZIPS)
 	$(NEUTRINO_PACKAGES_ROOT)/install-packages-root.sh $(LIVE_ROOTFS_STAGE) $(LIVE_PACKAGE_ZIPS)
+	mkdir -p $(LIVE_ROOTFS_STAGE)/modules
+	cp $(KERNEL_MODULE_LOADS) $(LIVE_ROOTFS_STAGE)/modules/loads.txt
 	cp -a $(LIVE_REPO_DIR)/. $(LIVE_ROOTFS_STAGE)/packages/
 	# The live medium uses an ephemeral RAM write overlay at runtime. Seed it
 	# with an explicit valid, empty v3 credential store so init can distinguish

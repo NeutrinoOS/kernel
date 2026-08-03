@@ -1,11 +1,11 @@
 #include "kernel/descriptor.hpp"
 
-#include "drivers/audio/hda.hpp"
+#include "drivers/audio/audio_output.hpp"
 
 namespace descriptor {
 namespace audio_output_descriptor {
 
-void close(DescriptorEntry&) { hda::drain(); }
+void close(DescriptorEntry&) { audio_output::drain(); }
 
 int64_t read(process::Task&, DescriptorEntry&, uint64_t, uint64_t, uint64_t) {
     return -1;
@@ -17,7 +17,8 @@ int64_t write(process::Task&, DescriptorEntry&, uint64_t address,
     if (length == 0) return 0;
     const void* samples = reinterpret_cast<const void*>(address);
     if (samples == nullptr) return -1;
-    return static_cast<int64_t>(hda::write_pcm(samples, static_cast<size_t>(length)));
+    return static_cast<int64_t>(
+        audio_output::write_pcm(samples, static_cast<size_t>(length)));
 }
 
 int get_property(DescriptorEntry&, uint32_t property, void* out, size_t size) {
@@ -37,7 +38,7 @@ int get_property(DescriptorEntry&, uint32_t property, void* out, size_t size) {
         bool running = false;
         bool paused = false;
         uint8_t volume = 0;
-        hda::get_status(queued, running, paused, volume);
+        audio_output::get_status(queued, running, paused, volume);
         auto* status = static_cast<descriptor_defs::AudioStatusInfo*>(out);
         status->queued_bytes = queued;
         status->flags =
@@ -62,18 +63,20 @@ int set_property(DescriptorEntry&, uint32_t property, const void* in,
         static_cast<const descriptor_defs::AudioControlInfo*>(in);
     switch (control->command) {
         case descriptor_defs::kAudioCommandPause:
-            hda::set_paused(true);
+            audio_output::set_paused(true);
             return 0;
         case descriptor_defs::kAudioCommandResume:
-            hda::set_paused(false);
+            audio_output::set_paused(false);
             return 0;
         case descriptor_defs::kAudioCommandFlush:
-            hda::flush();
+            audio_output::flush();
             return 0;
         case descriptor_defs::kAudioCommandSetVolume:
             if (control->value < 0 || control->value > 100) return -1;
-            return hda::set_volume(static_cast<uint8_t>(control->value)) ? 0
-                                                                          : -1;
+            return audio_output::set_volume(
+                       static_cast<uint8_t>(control->value))
+                       ? 0
+                       : -1;
         default:
             return -1;
     }
@@ -88,7 +91,7 @@ const Ops kOps{
 
 bool open(process::Task&, uint64_t selector, uint64_t, uint64_t,
           Allocation& allocation) {
-    if (selector != 0 || !hda::available()) return false;
+    if (selector != 0 || !audio_output::available()) return false;
     allocation.type = kTypeAudioOutput;
     allocation.flags = static_cast<uint64_t>(Flag::Writable) |
                        static_cast<uint64_t>(Flag::Device) |

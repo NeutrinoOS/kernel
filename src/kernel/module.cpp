@@ -2,11 +2,15 @@
 
 #include "arch/x86_64/memory/paging.hpp"
 #include "arch/x86_64/lapic.hpp"
+#include "drivers/audio/audio_output.hpp"
+#include "drivers/console/console.hpp"
 #include "drivers/driver_registry.hpp"
 #include "drivers/log/logging.hpp"
 #include "drivers/pci/pci.hpp"
 #include "fs/vfs.hpp"
 #include "kernel/error.hpp"
+#include "kernel/cmdline.hpp"
+#include "kernel/descriptor.hpp"
 #include "kernel/interrupts.hpp"
 #include "kernel/memory/physical_allocator.hpp"
 #include "kernel/scheduler.hpp"
@@ -250,6 +254,12 @@ bool api_register_pci_driver(const char* name,
                                                 matches,
                                                 match_count,
                                                 init);
+}
+
+void module_console_present(Console* console) {
+    if (console != nullptr) {
+        console->present();
+    }
 }
 
 const Api g_disk_module_api{
@@ -628,6 +638,14 @@ bool resolve_external_symbol(const char* name, uint64_t& out_value) {
          reinterpret_cast<uint64_t>(&paging_map_page)},
         {"_Z19paging_phys_to_virtm",
          reinterpret_cast<uint64_t>(&paging_phys_to_virt)},
+        {"_Z14paging_mark_wcmm",
+         reinterpret_cast<uint64_t>(&paging_mark_wc)},
+        {"_ZN12audio_output17register_providerEPKcPKNS_3OpsE",
+         reinterpret_cast<uint64_t>(&audio_output::register_provider)},
+        {"_ZN14kernel_cmdline8has_flagEPKc",
+         reinterpret_cast<uint64_t>(&kernel_cmdline::has_flag)},
+        {"_ZN14kernel_cmdline9has_valueEPKcS1_",
+         reinterpret_cast<uint64_t>(&kernel_cmdline::has_value)},
         {"_ZN10interrupts15allocate_vectorEv",
          reinterpret_cast<uint64_t>(&interrupts::allocate_vector)},
         {"_ZN10interrupts15register_vectorEhPFvvE",
@@ -642,6 +660,10 @@ bool resolve_external_symbol(const char* name, uint64_t& out_value) {
          reinterpret_cast<uint64_t>(&pci::enable_msi)},
         {"_ZN3pci12device_countEv",
          reinterpret_cast<uint64_t>(&pci::device_count)},
+        {"_ZN3pci12read_config8ERKNS_9PciDeviceEh",
+         reinterpret_cast<uint64_t>(
+             static_cast<uint8_t (*)(const pci::PciDevice&, uint8_t)>(
+                 &pci::read_config8))},
         {"_ZN3pci13read_config16ERKNS_9PciDeviceEh",
          reinterpret_cast<uint64_t>(
              static_cast<uint16_t (*)(const pci::PciDevice&, uint8_t)>(
@@ -656,8 +678,17 @@ bool resolve_external_symbol(const char* name, uint64_t& out_value) {
          reinterpret_cast<uint64_t>(
              static_cast<void (*)(const pci::PciDevice&, uint8_t, uint16_t)>(
                  &pci::write_config16))},
+        {"_ZN3pci14write_config32ERKNS_9PciDeviceEhj",
+         reinterpret_cast<uint64_t>(
+             static_cast<void (*)(const pci::PciDevice&, uint8_t, uint32_t)>(
+                 &pci::write_config32))},
         {"_ZN3pci7devicesEv",
          reinterpret_cast<uint64_t>(&pci::devices)},
+        {"_ZN10descriptor27register_framebuffer_deviceER11Framebufferm",
+         reinterpret_cast<uint64_t>(&descriptor::register_framebuffer_device)},
+        {"_ZN7Console7presentEv",
+         reinterpret_cast<uint64_t>(&module_console_present)},
+        {"kconsole", reinterpret_cast<uint64_t>(&kconsole)},
         {"_ZN5lapic2idEv",
          reinterpret_cast<uint64_t>(&lapic::id)},
         {"_ZN6memory17alloc_kernel_pageEv",
@@ -872,6 +903,7 @@ bool find_symbol(const uint8_t* data,
                  const Elf64Ehdr& header,
                  const uint64_t (&section_addrs)[kMaxSections],
                  const char* name,
+                 bool require_executable,
                  uint64_t& out_value) {
     for (size_t i = 0; i < header.shnum; ++i) {
         const Elf64Shdr* symtab = section_at(data, header, i);
@@ -903,8 +935,9 @@ bool find_symbol(const uint8_t* data,
             }
             const Elf64Shdr* target = section_at(data, header, sym->shndx);
             if (target == nullptr ||
-                (target->flags & (SHF_ALLOC | SHF_EXECINSTR)) !=
-                    (SHF_ALLOC | SHF_EXECINSTR) ||
+                (target->flags & SHF_ALLOC) == 0 ||
+                (require_executable &&
+                 (target->flags & SHF_EXECINSTR) == 0) ||
                 sym->value >= target->size) {
                 return false;
             }
@@ -1090,12 +1123,46 @@ bool load_from_file(const char* path) {
         return false;
     }
 
+    uint64_t descriptor_addr = 0;
+    if (!find_symbol(data,
+                     image_size,
+                     *header,
+                     section_addrs,
+                     "neutrino_module_descriptor",
+                     false,
+                     descriptor_addr)) {
+        log_message(LogLevel::Warn,
+                    "Module: %s does not export neutrino_module_descriptor",
+                    path);
+        release_module_image(*loaded);
+        return false;
+    }
+    const auto* descriptor =
+        reinterpret_cast<const Descriptor*>(descriptor_addr);
+    if (descriptor->abi_version != kDescriptorAbiVersion ||
+        descriptor->name == nullptr || descriptor->name[0] == '\0' ||
+        descriptor->phase != Phase::Driver) {
+        log_message(LogLevel::Warn,
+                    "Module: %s has an invalid descriptor",
+                    path);
+        release_module_image(*loaded);
+        return false;
+    }
+    if (!module_matches_any_pci_device(*descriptor)) {
+        log_message(LogLevel::Debug,
+                    "Module: %s is not applicable to detected PCI hardware",
+                    descriptor->name);
+        release_module_image(*loaded);
+        return true;
+    }
+
     uint64_t init_addr = 0;
     if (!find_symbol(data,
                      image_size,
                      *header,
                      section_addrs,
                      "neutrino_module_init",
+                     true,
                      init_addr)) {
         log_message(LogLevel::Warn,
                     "Module: %s does not export neutrino_module_init",

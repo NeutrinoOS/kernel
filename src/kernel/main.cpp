@@ -5,7 +5,6 @@
 #include "../drivers/console/console.hpp"
 #include "../drivers/driver_registry.hpp"
 #include "../drivers/fs/mount_manager.hpp"
-#include "../drivers/gpu/intel_uhd.hpp"
 #include "../drivers/input/keyboard.hpp"
 #include "../drivers/input/mouse.hpp"
 #include "../drivers/interrupts/ioapic.hpp"
@@ -399,7 +398,6 @@ static void kernel_main_stage2() {
     }
     kernel_cmdline::initialize(early_cmdline);
     preserve_limine_modules();
-    intel_uhd::configure();
 
     auto fb = *framebuffer_request.response->framebuffers[0];
     uint8_t* fb_virtual = static_cast<uint8_t*>(fb.address);

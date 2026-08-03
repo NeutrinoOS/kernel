@@ -43,7 +43,8 @@ manifests, and root configuration live in the sibling `neutrino-packages`
 repository. `make live-rootfs` builds the selected package set and assembles the
 live filesystem exclusively from those archives.
 
-The default live package roots are `neutrino-installer` and `neutrino-live`.
+The default live package roots are `neutrino-installer`, `neutrino-live`, and
+the `neutrino-drivers` metapackage.
 Their manifests expand to the complete live environment. Override
 `LIVE_PACKAGES` to stage a custom set into `make live-rootfs`, `make iso`, or
 `make run`; manifest dependencies are included automatically and ordered before
@@ -59,6 +60,25 @@ make run LIVE_PACKAGES="network-tools editor-tools"
 building the image. A custom set only contains the requested packages and their
 dependencies, so include `neutrino-installer` when the resulting live system
 should provide the installer.
+
+## Loadable hardware drivers
+
+Hardware that is not common to every PC is shipped outside the kernel as
+loadable modules. The live image includes the `e1000e`, `virtio-net`,
+`intel-hda`, and `intel-uhd-gemini-lake` packages through the
+`neutrino-drivers` metapackage. At boot, the module loader reads each module's
+PCI match table and keeps only drivers that apply to detected hardware.
+
+Each standalone driver package owns its implementation, private headers, and
+`.ko` build. The Neutrino source tree contains only the shared module loader and
+kernel-side provider interfaces; it does not retain copies of those hardware
+driver sources.
+
+The NEUFS installer queries that loaded-module set and installs only the
+matching driver packages on the target. It also writes the installed system's
+`/modules/loads.txt` from that set. The legacy FAT32 clone path removes
+nonmatching driver packages after cloning and generates the same tailored load
+list.
 
 ## Virtual memory
 
