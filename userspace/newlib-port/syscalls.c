@@ -378,6 +378,22 @@ void* _sbrk(ptrdiff_t increment) {
     return previous;
 }
 
+int brk(void* address) {
+    if (g_heap_base == NULL && _sbrk(0) == (void*)-1) {
+        return -1;
+    }
+
+    uintptr_t base = (uintptr_t)g_heap_base;
+    uintptr_t requested = (uintptr_t)address;
+    if (requested < base || requested - base > kHeapCapacity) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    g_heap_size = (size_t)(requested - base);
+    return 0;
+}
+
 int _gettimeofday(struct timeval* time_value, void* timezone_value) {
     (void)timezone_value;
     if (time_value == NULL) {

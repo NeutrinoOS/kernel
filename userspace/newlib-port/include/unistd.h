@@ -7,6 +7,7 @@ extern "C" {
 #endif
 
 void sync(void);
+int brk(void* address);
 
 #ifdef __cplusplus
 }
