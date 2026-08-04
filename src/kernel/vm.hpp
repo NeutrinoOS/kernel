@@ -20,6 +20,8 @@ struct Stack {
     size_t length;
 };
 
+inline constexpr size_t kMaxAutomaticStackSize = 8 * 1024 * 1024;
+
 enum MapFlags : uint64_t {
     kMapWrite = 1ull << 0,
     kMapExecute = 1ull << 1,
@@ -70,7 +72,10 @@ bool unmap_region(uint64_t cr3, uint64_t addr, size_t length);
 bool handle_page_fault(uint64_t cr3,
                        uint64_t address,
                        bool write,
-                       bool execute);
+                       bool execute,
+                       Stack* current_stack,
+                       uint64_t stack_pointer,
+                       size_t max_stack_length);
 bool set_user_region_writable(uint64_t cr3,
                               uint64_t addr,
                               size_t length,

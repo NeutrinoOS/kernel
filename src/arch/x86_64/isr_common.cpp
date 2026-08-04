@@ -148,11 +148,31 @@ extern "C" void isr_handler(InterruptFrame* regs) {
         const bool execute = (regs->err_code & (1u << 4)) != 0;
         const bool recoverable =
             (regs->err_code & 0x1u) == 0 || write;
+        size_t max_stack_length = process::kMaxThreadStackSize;
+        if (proc != nullptr && proc->resources != nullptr) {
+            const vm::Usage memory_usage = vm::usage(proc->cr3);
+            const uint64_t virtual_limit =
+                proc->resources->limits.max_virtual_bytes;
+            uint64_t available = 0;
+            if (memory_usage.virtual_bytes < virtual_limit) {
+                available = virtual_limit - memory_usage.virtual_bytes;
+            }
+            const uint64_t permitted =
+                available > UINT64_MAX - proc->stack_region.length
+                    ? UINT64_MAX
+                    : available + proc->stack_region.length;
+            if (permitted < max_stack_length) {
+                max_stack_length = static_cast<size_t>(permitted);
+            }
+        }
         if (recoverable && proc != nullptr &&
             vm::handle_page_fault(proc->cr3,
                                   fault_address,
                                   write,
-                                  execute)) {
+                                  execute,
+                                  &proc->stack_region,
+                                  regs->rsp,
+                                  max_stack_length)) {
             return;
         }
     }

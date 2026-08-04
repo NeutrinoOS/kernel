@@ -21,7 +21,7 @@ constexpr size_t kMaxDirectoryHandles = 8;
 constexpr size_t kMaxProcessEvents = 32;
 constexpr size_t kDefaultThreadStackSize = 64 * 1024;
 constexpr size_t kMinThreadStackSize = 16 * 1024;
-constexpr size_t kMaxThreadStackSize = 8 * 1024 * 1024;
+constexpr size_t kMaxThreadStackSize = vm::kMaxAutomaticStackSize;
 
 struct AddressSpace;
 struct ProcessResources;

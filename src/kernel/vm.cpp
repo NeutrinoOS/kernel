@@ -25,6 +25,8 @@ struct VmArea {
     uint64_t length;
     uint64_t flags;
     uint64_t resident_pages;
+    uint64_t reservation_base;
+    uint64_t reservation_length;
     vm::MappingKind kind;
     bool in_use;
 };
@@ -119,8 +121,14 @@ bool area_range_available_locked(const AddressSpaceState& state,
                                  uint64_t base,
                                  uint64_t length) {
     for (const auto& area : state.areas) {
+        const uint64_t occupied_base =
+            area.reservation_length != 0 ? area.reservation_base
+                                         : area.base;
+        const uint64_t occupied_length =
+            area.reservation_length != 0 ? area.reservation_length
+                                         : area.length;
         if (area.in_use &&
-            ranges_overlap(base, length, area.base, area.length)) {
+            ranges_overlap(base, length, occupied_base, occupied_length)) {
             return false;
         }
     }
@@ -140,12 +148,20 @@ bool register_area(uint64_t cr3,
                    uint64_t base,
                    uint64_t length,
                    uint64_t flags,
-                   vm::MappingKind kind) {
+                   vm::MappingKind kind,
+                   uint64_t reservation_base = 0,
+                   uint64_t reservation_length = 0) {
     sync::IrqLockGuard guard(g_address_space_state_lock);
     AddressSpaceState* state =
         find_address_space_state_locked(cr3, true);
+    const uint64_t occupied_base =
+        reservation_length != 0 ? reservation_base : base;
+    const uint64_t occupied_length =
+        reservation_length != 0 ? reservation_length : length;
     if (state == nullptr ||
-        !area_range_available_locked(*state, base, length)) {
+        !area_range_available_locked(*state,
+                                     occupied_base,
+                                     occupied_length)) {
         return false;
     }
     VmArea* area = allocate_area_locked(*state);
@@ -156,6 +172,8 @@ bool register_area(uint64_t cr3,
     area->length = length;
     area->flags = flags;
     area->resident_pages = 0;
+    area->reservation_base = reservation_base;
+    area->reservation_length = reservation_length;
     area->kind = kind;
     area->in_use = true;
     return true;
@@ -300,6 +318,91 @@ bool copy_private_file_page_locked(AddressSpaceState& state,
     return true;
 }
 
+bool grow_stack_locked(AddressSpaceState& state,
+                       uint64_t address,
+                       bool write,
+                       bool execute,
+                       vm::Stack& stack,
+                       uint64_t stack_pointer,
+                       size_t max_stack_length) {
+    if (!write || execute || stack.base == 0 || stack.top <= stack.base ||
+        stack.length != stack.top - stack.base ||
+        (stack.base & kPageMask) != 0 ||
+        (stack.top & kPageMask) != 0 || address >= stack.base ||
+        stack_pointer < kUserCodeBase || stack_pointer >= stack.top) {
+        return false;
+    }
+
+    // Accept ordinary pushes, the System V red zone, and a stack pointer that
+    // has already been moved into a larger frame. Reject unrelated accesses
+    // far below RSP so an arbitrary bad pointer cannot grow the stack.
+    if ((address <= stack_pointer &&
+         stack_pointer - address > kPageSize) ||
+        (address > stack_pointer && address - stack_pointer > 128)) {
+        return false;
+    }
+
+    const uint64_t new_base = align_down(address, kPageSize);
+    if (new_base < kUserCodeBase + kPageSize) {
+        return false;
+    }
+    const uint64_t new_length = stack.top - new_base;
+    if (new_length <= stack.length || new_length > max_stack_length) {
+        return false;
+    }
+
+    VmArea* area = find_area_locked(state, stack.base);
+    if (area == nullptr || area->base != stack.base ||
+        area->length != stack.length ||
+        area->kind != vm::MappingKind::Stack ||
+        area->reservation_length == 0 ||
+        area->reservation_base > UINT64_MAX - kPageSize ||
+        new_base < area->reservation_base + kPageSize) {
+        return false;
+    }
+
+    const uint64_t guard_base = new_base - kPageSize;
+    for (uint64_t page = guard_base; page < stack.base;
+         page += kPageSize) {
+        uint64_t ignored_phys = 0;
+        if (paging_resolve_cr3(state.cr3, page, ignored_phys)) {
+            return false;
+        }
+    }
+
+    const uint64_t added_length = stack.base - new_base;
+    const size_t added_pages =
+        static_cast<size_t>(added_length / kPageSize);
+    for (size_t i = 0; i < added_pages; ++i) {
+        uint64_t phys = memory::alloc_user_page();
+        if (phys == 0) {
+            rollback_user_pages(state.cr3, new_base, i);
+            return false;
+        }
+        auto* page_data = static_cast<uint8_t*>(paging_phys_to_virt(phys));
+        memset(page_data, 0, kPageSize);
+        const uint64_t virt =
+            new_base + static_cast<uint64_t>(i) * kPageSize;
+        if (!paging_map_page_cr3(state.cr3,
+                                 virt,
+                                 phys,
+                                 PAGE_FLAG_WRITE | PAGE_FLAG_USER |
+                                     PAGE_FLAG_MANAGED |
+                                     PAGE_FLAG_NO_EXECUTE)) {
+            memory::free_user_page(phys);
+            rollback_user_pages(state.cr3, new_base, i);
+            return false;
+        }
+    }
+
+    area->base = new_base;
+    area->length = new_length;
+    area->resident_pages += added_pages;
+    stack.base = new_base;
+    stack.length = static_cast<size_t>(new_length);
+    return true;
+}
+
 bool resolve_managed_fault(uint64_t cr3,
                            uint64_t address,
                            bool write,
@@ -364,14 +467,23 @@ vm::Region reserve_private_region(uint64_t cr3, size_t length) {
     for (;;) {
         bool advanced = false;
         for (const auto& area : state->areas) {
+            const uint64_t occupied_base =
+                area.reservation_length != 0 ? area.reservation_base
+                                             : area.base;
+            const uint64_t occupied_length =
+                area.reservation_length != 0 ? area.reservation_length
+                                             : area.length;
             if (!area.in_use ||
-                !ranges_overlap(base, total, area.base, area.length)) {
+                !ranges_overlap(base,
+                                total,
+                                occupied_base,
+                                occupied_length)) {
                 continue;
             }
-            if (area.base > UINT64_MAX - area.length) {
+            if (occupied_base > UINT64_MAX - occupied_length) {
                 return vm::Region{0, 0};
             }
-            base = align_up(area.base + area.length, kPageSize);
+            base = align_up(occupied_base + occupied_length, kPageSize);
             advanced = true;
             break;
         }
@@ -639,16 +751,25 @@ Stack allocate_user_stack(uint64_t cr3, size_t length) {
     if (total > static_cast<size_t>(-1) - kPageSize) {
         return Stack{0, 0, 0};
     }
-    Stack reservation = reserve_private_stack(cr3, total + kPageSize);
+    size_t capacity = total;
+    if (capacity < kMaxAutomaticStackSize) {
+        capacity = kMaxAutomaticStackSize;
+    }
+    if (capacity > static_cast<size_t>(-1) - kPageSize) {
+        return Stack{0, 0, 0};
+    }
+    Stack reservation =
+        reserve_private_stack(cr3, capacity + kPageSize);
     if (reservation.base == 0) {
         log_message(LogLevel::Error,
                     "VM: stack alloc failed (state unavailable)");
         return Stack{0, 0, 0};
     }
-    // Leave the lowest page deliberately unmapped. Downward stack overflow
-    // reaches this guard page before it can corrupt the next VM area.
+    // Reserve room below the initial mapping for page-fault-driven growth.
+    // The page immediately below the mapped portion remains the moving guard;
+    // the lowest page of the reservation is the final overflow guard.
     Stack stack{
-        reservation.base + kPageSize,
+        reservation.top - total,
         reservation.top,
         total,
     };
@@ -656,7 +777,9 @@ Stack allocate_user_stack(uint64_t cr3, size_t length) {
                        stack.base,
                        stack.length,
                        kMapWrite,
-                       MappingKind::Stack)) {
+                       MappingKind::Stack,
+                       reservation.base,
+                       reservation.length)) {
         cancel_private_stack(cr3, reservation);
         return Stack{0, 0, 0};
     }
@@ -964,11 +1087,30 @@ bool unmap_region(uint64_t cr3, uint64_t addr, size_t length) {
 bool handle_page_fault(uint64_t cr3,
                        uint64_t address,
                        bool write,
-                       bool execute) {
+                       bool execute,
+                       Stack* current_stack,
+                       uint64_t stack_pointer,
+                       size_t max_stack_length) {
     if (cr3 == 0 || !is_user_range(address, 1)) {
         return false;
     }
-    return resolve_managed_fault(cr3, address, write, execute);
+    if (resolve_managed_fault(cr3, address, write, execute)) {
+        return true;
+    }
+    if (current_stack == nullptr) {
+        return false;
+    }
+    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceState* state =
+        find_address_space_state_locked(cr3, false);
+    return state != nullptr &&
+           grow_stack_locked(*state,
+                             address,
+                             write,
+                             execute,
+                             *current_stack,
+                             stack_pointer,
+                             max_stack_length);
 }
 
 bool set_user_region_writable(uint64_t cr3,

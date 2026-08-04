@@ -20,6 +20,8 @@ constexpr size_t kDefaultMainStackSize = 256 * 1024;
 constexpr size_t kMaxNeeded = kMaxSharedObjects - 1;
 constexpr size_t kMaxSharedObjectName = 64;
 constexpr size_t kMaxSharedObjectPath = 128;
+constexpr size_t kMaxDynamicSymbolName = 256;
+constexpr uint16_t kMaxProgramHeaders = 128;
 
 enum class ElfIdent : size_t {
     Class = 4,
@@ -146,6 +148,8 @@ struct DynamicInfo {
 };
 
 struct LoadedObject {
+    // Main images supplied by the caller retain their source image here.
+    // Streamed shared objects use their mapped user image instead.
     const uint8_t* data;
     size_t size;
     char name[kMaxSharedObjectName];
@@ -157,6 +161,16 @@ struct LoadedObject {
     DynamicInfo dynamic;
     bool main_object;
 };
+
+bool read_exact(vfs::FileHandle& file,
+                uint64_t offset,
+                void* buffer,
+                size_t length);
+bool read_object_vaddr(const LoadedObject& object,
+                       process::Task& proc,
+                       uint64_t vaddr,
+                       void* out,
+                       size_t length);
 
 constexpr uint64_t align_up(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -258,87 +272,6 @@ const Elf64Phdr* program_header_at(const loader::ProgramImage& image,
     return reinterpret_cast<const Elf64Phdr*>(image.data + ph_offset);
 }
 
-const uint8_t* image_ptr_at_vaddr(const loader::ProgramImage& image,
-                                  const Elf64Ehdr& header,
-                                  uint64_t vaddr,
-                                  size_t length) {
-    for (uint16_t i = 0; i < header.phnum; ++i) {
-        const Elf64Phdr* ph = program_header_at(image, header, i);
-        if (ph == nullptr || ph->type != PT_LOAD) {
-            continue;
-        }
-        if (vaddr < ph->vaddr) {
-            continue;
-        }
-        uint64_t offset_in_segment = vaddr - ph->vaddr;
-        if (offset_in_segment > ph->filesz) {
-            continue;
-        }
-        if (length > ph->filesz - offset_in_segment) {
-            continue;
-        }
-        uint64_t file_offset = ph->offset + offset_in_segment;
-        if (file_offset + length > image.size ||
-            file_offset + length < file_offset) {
-            return nullptr;
-        }
-        return image.data + file_offset;
-    }
-    return nullptr;
-}
-
-bool read_shared_object_image(const char* path,
-                              loader::ProgramImage& out_image,
-                              uint8_t*& out_buffer) {
-    out_image = {};
-    out_buffer = nullptr;
-    if (path == nullptr) {
-        return false;
-    }
-    vfs::FileHandle handle{};
-    if (!vfs::open_file(path, handle)) {
-        return false;
-    }
-    if (handle.size == 0 || handle.size > SIZE_MAX) {
-        vfs::close_file(handle);
-        return false;
-    }
-
-    size_t total = static_cast<size_t>(handle.size);
-    auto* buffer = static_cast<uint8_t*>(memory::alloc_kernel(total, 16));
-    if (buffer == nullptr) {
-        vfs::close_file(handle);
-        return false;
-    }
-    size_t offset = 0;
-    while (offset < total) {
-        size_t read = 0;
-        if (!vfs::read_file(handle,
-                            offset,
-                            buffer + offset,
-                            total - offset,
-                            read)) {
-            vfs::close_file(handle);
-            memory::free_kernel(buffer);
-            return false;
-        }
-        if (read == 0) {
-            break;
-        }
-        offset += read;
-    }
-    vfs::close_file(handle);
-    if (offset != total) {
-        memory::free_kernel(buffer);
-        return false;
-    }
-    out_buffer = buffer;
-    out_image.data = buffer;
-    out_image.size = total;
-    out_image.entry_offset = 0;
-    return true;
-}
-
 bool looks_like_elf(const uint8_t* data, size_t size) {
     if (data == nullptr || size < sizeof(Elf64Ehdr)) {
         return false;
@@ -425,6 +358,37 @@ bool validate_elf_header(const Elf64Ehdr& header) {
     return true;
 }
 
+bool validate_dynamic_info(DynamicInfo& info) {
+    if (info.syment == 0) {
+        info.syment = sizeof(Elf64Sym);
+    }
+    if (info.rela_ent == 0) {
+        info.rela_ent = sizeof(Elf64Rela);
+    }
+    if (info.syment < sizeof(Elf64Sym) ||
+        info.rela_ent < sizeof(Elf64Rela)) {
+        log_message(LogLevel::Error,
+                    "Loader: dynamic entry sizes are too small");
+        return false;
+    }
+
+    if (info.symtab_addr != 0 && info.strtab_addr > info.symtab_addr) {
+        uint64_t count =
+            (info.strtab_addr - info.symtab_addr) / info.syment;
+        if (count > SIZE_MAX) {
+            return false;
+        }
+        info.dynsym_count = static_cast<size_t>(count);
+    }
+
+    if (info.needed_count != 0 && info.strtab_addr == 0) {
+        log_message(LogLevel::Error,
+                    "Loader: dependencies require a dynamic string table");
+        return false;
+    }
+    return true;
+}
+
 bool parse_dynamic_info(const loader::ProgramImage& image,
                         const Elf64Ehdr& header,
                         const Elf64Phdr* dynamic_phdr,
@@ -490,33 +454,85 @@ bool parse_dynamic_info(const loader::ProgramImage& image,
         }
     }
 
-    if (info.syment == 0) {
-        info.syment = sizeof(Elf64Sym);
-    }
-    if (info.rela_ent == 0) {
-        info.rela_ent = sizeof(Elf64Rela);
-    }
-    if (info.syment < sizeof(Elf64Sym) ||
-        info.rela_ent < sizeof(Elf64Rela)) {
-        log_message(LogLevel::Error,
-                    "Loader: dynamic entry sizes are too small");
-        return false;
-    }
-
-    if (info.symtab_addr != 0 && info.strtab_addr > info.symtab_addr) {
-        info.dynsym_count =
-            static_cast<size_t>((info.strtab_addr - info.symtab_addr) /
-                                info.syment);
-    }
-
-    if (info.needed_count != 0 && info.strtab_addr == 0) {
-        log_message(LogLevel::Error,
-                    "Loader: dependencies require a dynamic string table");
-        return false;
-    }
-
     (void)header;
-    return true;
+    return validate_dynamic_info(info);
+}
+
+bool parse_mapped_dynamic_info(const Elf64Phdr* dynamic_phdr,
+                               LoadedObject& object,
+                               process::Task& proc) {
+    memset(&object.dynamic, 0, sizeof(object.dynamic));
+    if (dynamic_phdr == nullptr || dynamic_phdr->filesz == 0) {
+        return true;
+    }
+    if (dynamic_phdr->filesz > dynamic_phdr->memsz ||
+        dynamic_phdr->filesz / sizeof(Elf64Dyn) > SIZE_MAX) {
+        log_message(LogLevel::Error,
+                    "Loader: invalid mapped dynamic table");
+        return false;
+    }
+
+    size_t dyn_count =
+        static_cast<size_t>(dynamic_phdr->filesz / sizeof(Elf64Dyn));
+    for (size_t i = 0; i < dyn_count; ++i) {
+        if (i > (UINT64_MAX - dynamic_phdr->vaddr) / sizeof(Elf64Dyn)) {
+            return false;
+        }
+        Elf64Dyn dyn{};
+        if (!read_object_vaddr(object,
+                               proc,
+                               dynamic_phdr->vaddr + i * sizeof(Elf64Dyn),
+                               &dyn,
+                               sizeof(dyn))) {
+            log_message(LogLevel::Error,
+                        "Loader: failed to read mapped dynamic table");
+            return false;
+        }
+        if (dyn.tag == DT_NULL) {
+            break;
+        }
+        switch (dyn.tag) {
+            case DT_NEEDED:
+                if (object.dynamic.needed_count >= kMaxNeeded) {
+                    log_message(LogLevel::Error,
+                                "Loader: too many shared library dependencies");
+                    return false;
+                }
+                object.dynamic.needed_offsets[
+                    object.dynamic.needed_count++] = dyn.val;
+                break;
+            case DT_RELA:
+                object.dynamic.rela_addr = dyn.val;
+                break;
+            case DT_RELASZ:
+                object.dynamic.rela_size = dyn.val;
+                break;
+            case DT_RELAENT:
+                object.dynamic.rela_ent = dyn.val;
+                break;
+            case DT_JMPREL:
+                object.dynamic.jmprel_addr = dyn.val;
+                break;
+            case DT_PLTRELSZ:
+                object.dynamic.pltrel_size = dyn.val;
+                break;
+            case DT_STRTAB:
+                object.dynamic.strtab_addr = dyn.val;
+                break;
+            case DT_STRSZ:
+                object.dynamic.strsz = dyn.val;
+                break;
+            case DT_SYMTAB:
+                object.dynamic.symtab_addr = dyn.val;
+                break;
+            case DT_SYMENT:
+                object.dynamic.syment = dyn.val;
+                break;
+            default:
+                break;
+        }
+    }
+    return validate_dynamic_info(object.dynamic);
 }
 
 bool image_has_needed_dependencies(const loader::ProgramImage& image) {
@@ -543,81 +559,118 @@ bool image_has_needed_dependencies(const loader::ProgramImage& image) {
     return info.needed_count != 0;
 }
 
-const char* dynamic_string_at(const LoadedObject& object,
-                              uint64_t string_offset,
-                              size_t& out_length) {
-    out_length = 0;
+bool object_vaddr_to_user(const LoadedObject& object,
+                          uint64_t vaddr,
+                          size_t length,
+                          uint64_t& out_address) {
+    out_address = 0;
+    if (vaddr < object.min_vaddr || vaddr > object.max_vaddr ||
+        length > object.max_vaddr - vaddr ||
+        object.load_bias > UINT64_MAX - vaddr) {
+        return false;
+    }
+    out_address = object.load_bias + vaddr;
+    return true;
+}
+
+bool read_object_vaddr(const LoadedObject& object,
+                       process::Task& proc,
+                       uint64_t vaddr,
+                       void* out,
+                       size_t length) {
+    uint64_t address = 0;
+    return object_vaddr_to_user(object, vaddr, length, address) &&
+           vm::copy_from_user(proc.cr3, out, address, length);
+}
+
+bool copy_dynamic_string(const LoadedObject& object,
+                         uint64_t string_offset,
+                         process::Task& proc,
+                         char* out,
+                         size_t out_size) {
+    if (out == nullptr || out_size == 0) {
+        return false;
+    }
+    out[0] = '\0';
     if (object.dynamic.strtab_addr == 0 ||
         string_offset >= object.dynamic.strsz ||
         object.dynamic.strtab_addr > UINT64_MAX - string_offset) {
-        return nullptr;
+        return false;
     }
     uint64_t remaining64 = object.dynamic.strsz - string_offset;
-    if (remaining64 > static_cast<uint64_t>(SIZE_MAX)) {
-        return nullptr;
+    uint64_t string_vaddr = object.dynamic.strtab_addr + string_offset;
+    size_t copy_length = out_size;
+    if (remaining64 < copy_length) {
+        copy_length = static_cast<size_t>(remaining64);
     }
-    size_t remaining = static_cast<size_t>(remaining64);
-    loader::ProgramImage image{object.data, object.size, 0};
-    const auto* header = reinterpret_cast<const Elf64Ehdr*>(object.data);
-    const uint8_t* ptr =
-        image_ptr_at_vaddr(image,
-                           *header,
-                           object.dynamic.strtab_addr + string_offset,
-                           remaining);
-    if (ptr == nullptr) {
-        return nullptr;
+    if (copy_length == 0 ||
+        !read_object_vaddr(object,
+                           proc,
+                           string_vaddr,
+                           out,
+                           copy_length)) {
+        return false;
     }
-    while (out_length < remaining) {
-        if (ptr[out_length] == '\0') {
-            return reinterpret_cast<const char*>(ptr);
+    for (size_t i = 0; i < copy_length; ++i) {
+        if (out[i] == '\0') {
+            return true;
         }
-        ++out_length;
     }
-    return nullptr;
+    out[0] = '\0';
+    return false;
 }
 
 bool needed_name_at(const LoadedObject& object,
                     uint64_t needed_offset,
+                    process::Task& proc,
                     char* out,
                     size_t out_size) {
-    size_t length = 0;
-    const char* value = dynamic_string_at(object, needed_offset, length);
-    if (value == nullptr || length + 1 > out_size) {
-        return false;
-    }
-    memcpy(out, value, length + 1);
-    return true;
+    return copy_dynamic_string(object,
+                               needed_offset,
+                               proc,
+                               out,
+                               out_size);
 }
 
-bool symbol_name_at(const LoadedObject& object,
-                    const Elf64Sym& sym,
-                    const char*& out_name) {
-    out_name = nullptr;
-    size_t ignored_length = 0;
-    out_name = dynamic_string_at(object, sym.name, ignored_length);
-    return out_name != nullptr;
-}
-
-const Elf64Sym* dynsym_at(const LoadedObject& object, size_t index) {
+bool read_dynsym(const LoadedObject& object,
+                 size_t index,
+                 process::Task& proc,
+                 Elf64Sym& out_sym) {
     if (object.dynamic.symtab_addr == 0 ||
         object.dynamic.syment < sizeof(Elf64Sym) ||
-        index >= object.dynamic.dynsym_count) {
-        return nullptr;
+        index >= object.dynamic.dynsym_count ||
+        index > (UINT64_MAX - object.dynamic.symtab_addr) /
+                    object.dynamic.syment) {
+        return false;
     }
-    loader::ProgramImage image{object.data, object.size, 0};
-    const auto* header = reinterpret_cast<const Elf64Ehdr*>(object.data);
-    const uint8_t* ptr =
-        image_ptr_at_vaddr(image,
-                           *header,
-                           object.dynamic.symtab_addr +
-                               index * object.dynamic.syment,
-                           sizeof(Elf64Sym));
-    return reinterpret_cast<const Elf64Sym*>(ptr);
+    return read_object_vaddr(object,
+                             proc,
+                             object.dynamic.symtab_addr +
+                                 index * object.dynamic.syment,
+                             &out_sym,
+                             sizeof(out_sym));
+}
+
+bool dynamic_string_equals(const LoadedObject& object,
+                           uint64_t string_offset,
+                           const char* expected,
+                           process::Task& proc) {
+    if (expected == nullptr) {
+        return false;
+    }
+    char candidate[kMaxDynamicSymbolName];
+    return copy_dynamic_string(object,
+                               string_offset,
+                               proc,
+                               candidate,
+                               sizeof(candidate)) &&
+           cstring_equal(candidate, expected);
 }
 
 bool resolve_symbol(const char* name,
                     const LoadedObject* objects,
                     size_t object_count,
+                    process::Task& proc,
                     uint64_t& out_value) {
     if (name == nullptr || name[0] == '\0') {
         return false;
@@ -627,23 +680,22 @@ bool resolve_symbol(const char* name,
         for (size_t sym_index = 0;
              sym_index < object.dynamic.dynsym_count;
              ++sym_index) {
-            const Elf64Sym* sym = dynsym_at(object, sym_index);
-            if (sym == nullptr || sym->shndx == SHN_UNDEF ||
-                sym->name == 0) {
+            Elf64Sym sym{};
+            if (!read_dynsym(object, sym_index, proc, sym) ||
+                sym.shndx == SHN_UNDEF || sym.name == 0) {
                 continue;
             }
-            uint32_t bind = elf_symbol_bind(*sym);
+            uint32_t bind = elf_symbol_bind(sym);
             if (bind != STB_GLOBAL && bind != STB_WEAK) {
                 continue;
             }
-            const char* candidate = nullptr;
-            if (!symbol_name_at(object, *sym, candidate)) {
+            if (!dynamic_string_equals(object, sym.name, name, proc)) {
                 continue;
             }
-            if (!cstring_equal(name, candidate)) {
-                continue;
+            if (object.load_bias > UINT64_MAX - sym.value) {
+                return false;
             }
-            out_value = object.load_bias + sym->value;
+            out_value = object.load_bias + sym.value;
             return true;
         }
     }
@@ -793,10 +845,187 @@ bool map_elf_object(const loader::ProgramImage& image,
     return true;
 }
 
-bool protect_elf_object_pages(const LoadedObject& object,
-                              process::Task& proc) {
-    loader::ProgramImage image{object.data, object.size, 0};
-    const auto* header = reinterpret_cast<const Elf64Ehdr*>(object.data);
+bool map_elf_object_file(const char* path,
+                         process::Task& proc,
+                         const char* name,
+                         LoadedObject& object) {
+    vfs::FileHandle file{};
+    if (path == nullptr || !vfs::open_file(path, file)) {
+        log_message(LogLevel::Error,
+                    "Loader: failed to open shared object %s",
+                    path != nullptr ? path : "(null)");
+        return false;
+    }
+
+    Elf64Phdr* phdrs = nullptr;
+    uint8_t* buffer = nullptr;
+    bool loaded = false;
+    do {
+        Elf64Ehdr header{};
+        if (file.size < sizeof(header) ||
+            !read_exact(file, 0, &header, sizeof(header)) ||
+            !looks_like_elf(reinterpret_cast<const uint8_t*>(&header),
+                            sizeof(header)) ||
+            !validate_elf_header(header) ||
+            header.phnum > kMaxProgramHeaders ||
+            header.phoff > file.size ||
+            static_cast<uint64_t>(header.phnum) >
+                (file.size - header.phoff) / sizeof(Elf64Phdr)) {
+            log_message(LogLevel::Error,
+                        "Loader: invalid shared object header %s",
+                        path);
+            break;
+        }
+
+        size_t phdr_bytes =
+            static_cast<size_t>(header.phnum) * sizeof(Elf64Phdr);
+        phdrs = static_cast<Elf64Phdr*>(
+            memory::alloc_kernel(phdr_bytes, alignof(Elf64Phdr)));
+        if (phdrs == nullptr ||
+            !read_exact(file, header.phoff, phdrs, phdr_bytes)) {
+            log_message(LogLevel::Error,
+                        "Loader: failed to read shared object headers %s",
+                        path);
+            break;
+        }
+
+        uint64_t min_vaddr = UINT64_MAX;
+        uint64_t max_vaddr = 0;
+        size_t loadable_segments = 0;
+        const Elf64Phdr* dynamic_phdr = nullptr;
+        bool valid = true;
+        for (uint16_t i = 0; i < header.phnum; ++i) {
+            const Elf64Phdr& ph = phdrs[i];
+            if (ph.type == PT_DYNAMIC) {
+                dynamic_phdr = &ph;
+            }
+            if (ph.type != PT_LOAD) {
+                continue;
+            }
+            ++loadable_segments;
+            if (ph.filesz > ph.memsz || ph.offset > file.size ||
+                ph.filesz > file.size - ph.offset ||
+                ph.vaddr > UINT64_MAX - ph.memsz) {
+                valid = false;
+                break;
+            }
+            if (ph.memsz == 0) {
+                continue;
+            }
+            if (ph.vaddr < min_vaddr) {
+                min_vaddr = ph.vaddr;
+            }
+            if (ph.vaddr + ph.memsz > max_vaddr) {
+                max_vaddr = ph.vaddr + ph.memsz;
+            }
+        }
+        if (!valid || loadable_segments == 0 || min_vaddr == UINT64_MAX ||
+            max_vaddr <= min_vaddr) {
+            log_message(LogLevel::Error,
+                        "Loader: invalid shared object segments %s",
+                        path);
+            break;
+        }
+
+        uint64_t aligned_min = align_down(min_vaddr, kPageSize);
+        uint64_t aligned_max = align_up(max_vaddr, kPageSize);
+        if (aligned_max < max_vaddr || aligned_max <= aligned_min ||
+            aligned_max - aligned_min > SIZE_MAX) {
+            break;
+        }
+        vm::Region region = vm::allocate_user_region(
+            proc.cr3,
+            static_cast<size_t>(aligned_max - aligned_min));
+        if (region.base == 0) {
+            log_message(LogLevel::Error,
+                        "Loader: failed to allocate shared object region %s",
+                        path);
+            break;
+        }
+        uint64_t load_bias = region.base - aligned_min;
+
+        constexpr size_t kStreamChunk = 4096;
+        buffer = static_cast<uint8_t*>(
+            memory::alloc_kernel(kStreamChunk, alignof(uint64_t)));
+        if (buffer == nullptr) {
+            log_message(LogLevel::Error,
+                        "Loader: failed to allocate shared object stream buffer");
+            break;
+        }
+
+        bool copied = true;
+        for (uint16_t i = 0; i < header.phnum && copied; ++i) {
+            const Elf64Phdr& ph = phdrs[i];
+            if (ph.type != PT_LOAD || ph.memsz == 0) {
+                continue;
+            }
+            uint64_t copied_bytes = 0;
+            while (copied_bytes < ph.filesz) {
+                size_t chunk = static_cast<size_t>(ph.filesz - copied_bytes);
+                if (chunk > kStreamChunk) {
+                    chunk = kStreamChunk;
+                }
+                if (!read_exact(file,
+                                ph.offset + copied_bytes,
+                                buffer,
+                                chunk) ||
+                    !vm::copy_to_user(proc.cr3,
+                                      load_bias + ph.vaddr + copied_bytes,
+                                      buffer,
+                                      chunk)) {
+                    copied = false;
+                    break;
+                }
+                copied_bytes += chunk;
+            }
+            if (copied && ph.memsz > ph.filesz &&
+                !vm::fill_user(proc.cr3,
+                               load_bias + ph.vaddr + ph.filesz,
+                               0,
+                               static_cast<size_t>(ph.memsz - ph.filesz))) {
+                copied = false;
+            }
+        }
+        memory::free_kernel(buffer);
+        buffer = nullptr;
+        if (!copied) {
+            log_message(LogLevel::Error,
+                        "Loader: failed to stream shared object %s",
+                        path);
+            break;
+        }
+
+        memset(&object, 0, sizeof(object));
+        object.data = nullptr;
+        object.size = static_cast<size_t>(file.size);
+        object.region = region;
+        object.load_bias = load_bias;
+        object.min_vaddr = min_vaddr;
+        object.max_vaddr = max_vaddr;
+        object.entry = header.entry;
+        object.main_object = false;
+        if (!copy_cstring(object.name,
+                          sizeof(object.name),
+                          name != nullptr ? name : "(shared)") ||
+            !parse_mapped_dynamic_info(dynamic_phdr, object, proc)) {
+            break;
+        }
+        loaded = true;
+    } while (false);
+
+    memory::free_kernel(buffer);
+    memory::free_kernel(phdrs);
+    vfs::close_file(file);
+    return loaded;
+}
+
+bool protect_object_pages_from_headers(const LoadedObject& object,
+                                       const Elf64Phdr* phdrs,
+                                       uint16_t phnum,
+                                       process::Task& proc) {
+    if (phdrs == nullptr || phnum == 0) {
+        return false;
+    }
     uint64_t aligned_min = align_down(object.min_vaddr, kPageSize);
     uint64_t aligned_max = align_up(object.max_vaddr, kPageSize);
 
@@ -805,21 +1034,21 @@ bool protect_elf_object_pages(const LoadedObject& object,
         bool executable = false;
         bool covered = false;
 
-        for (uint16_t i = 0; i < header->phnum; ++i) {
-            const Elf64Phdr* ph = program_header_at(image, *header, i);
-            if (ph == nullptr || ph->type != PT_LOAD || ph->memsz == 0) {
+        for (uint16_t i = 0; i < phnum; ++i) {
+            const Elf64Phdr& ph = phdrs[i];
+            if (ph.type != PT_LOAD || ph.memsz == 0) {
                 continue;
             }
-            uint64_t seg_start = align_down(ph->vaddr, kPageSize);
-            uint64_t seg_end = align_up(ph->vaddr + ph->memsz, kPageSize);
+            uint64_t seg_start = align_down(ph.vaddr, kPageSize);
+            uint64_t seg_end = align_up(ph.vaddr + ph.memsz, kPageSize);
             if (page < seg_start || page >= seg_end) {
                 continue;
             }
             covered = true;
-            if ((ph->flags & PF_W) != 0) {
+            if ((ph.flags & PF_W) != 0) {
                 writable = true;
             }
-            if ((ph->flags & PF_X) != 0) {
+            if ((ph.flags & PF_X) != 0) {
                 executable = true;
             }
         }
@@ -848,6 +1077,72 @@ bool protect_elf_object_pages(const LoadedObject& object,
     return true;
 }
 
+bool protect_elf_object_pages(const LoadedObject& object,
+                              process::Task& proc) {
+    if (object.data != nullptr) {
+        loader::ProgramImage image{object.data, object.size, 0};
+        const auto* header = reinterpret_cast<const Elf64Ehdr*>(object.data);
+        if (header->phnum > kMaxProgramHeaders) {
+            return false;
+        }
+        size_t bytes =
+            static_cast<size_t>(header->phnum) * sizeof(Elf64Phdr);
+        auto* phdrs = static_cast<Elf64Phdr*>(
+            memory::alloc_kernel(bytes, alignof(Elf64Phdr)));
+        if (phdrs == nullptr) {
+            return false;
+        }
+        bool headers_ok = true;
+        for (uint16_t i = 0; i < header->phnum; ++i) {
+            const Elf64Phdr* ph = program_header_at(image, *header, i);
+            if (ph == nullptr) {
+                headers_ok = false;
+                break;
+            }
+            phdrs[i] = *ph;
+        }
+        bool protected_ok =
+            headers_ok && protect_object_pages_from_headers(object,
+                                                             phdrs,
+                                                             header->phnum,
+                                                             proc);
+        memory::free_kernel(phdrs);
+        return protected_ok;
+    }
+
+    char path[kMaxSharedObjectPath];
+    if (!build_library_path(object.name, path, sizeof(path))) {
+        return false;
+    }
+    vfs::FileHandle file{};
+    if (!vfs::open_file(path, file)) {
+        return false;
+    }
+    Elf64Ehdr header{};
+    Elf64Phdr* phdrs = nullptr;
+    bool protected_ok = false;
+    if (read_exact(file, 0, &header, sizeof(header)) &&
+        validate_elf_header(header) &&
+        header.phnum <= kMaxProgramHeaders &&
+        header.phoff <= file.size &&
+        static_cast<uint64_t>(header.phnum) <=
+            (file.size - header.phoff) / sizeof(Elf64Phdr)) {
+        size_t bytes = static_cast<size_t>(header.phnum) * sizeof(Elf64Phdr);
+        phdrs = static_cast<Elf64Phdr*>(
+            memory::alloc_kernel(bytes, alignof(Elf64Phdr)));
+        if (phdrs != nullptr &&
+            read_exact(file, header.phoff, phdrs, bytes)) {
+            protected_ok = protect_object_pages_from_headers(object,
+                                                              phdrs,
+                                                              header.phnum,
+                                                              proc);
+        }
+    }
+    memory::free_kernel(phdrs);
+    vfs::close_file(file);
+    return protected_ok;
+}
+
 bool apply_relocation(const LoadedObject& object,
                       const Elf64Rela& rela,
                       const LoadedObject* objects,
@@ -864,20 +1159,24 @@ bool apply_relocation(const LoadedObject& object,
         case R_X86_64_64:
         case R_X86_64_GLOB_DAT:
         case R_X86_64_JUMP_SLOT: {
-            const Elf64Sym* sym = dynsym_at(object, sym_index);
-            if (sym == nullptr) {
+            Elf64Sym sym{};
+            if (!read_dynsym(object, sym_index, proc, sym)) {
                 log_message(LogLevel::Error,
                             "Loader: relocation references missing symbol");
                 return false;
             }
-            const char* name = nullptr;
-            if (!symbol_name_at(object, *sym, name)) {
+            char name[kMaxDynamicSymbolName];
+            if (!copy_dynamic_string(object,
+                                     sym.name,
+                                     proc,
+                                     name,
+                                     sizeof(name))) {
                 log_message(LogLevel::Error,
                             "Loader: relocation symbol has no name");
                 return false;
             }
-            if (!resolve_symbol(name, objects, object_count, value)) {
-                if (elf_symbol_bind(*sym) == STB_WEAK) {
+            if (!resolve_symbol(name, objects, object_count, proc, value)) {
+                if (elf_symbol_bind(sym) == STB_WEAK) {
                     value = 0;
                 } else {
                     log_message(LogLevel::Error,
@@ -924,23 +1223,25 @@ bool apply_relocation_table(const LoadedObject& object,
         return false;
     }
 
-    loader::ProgramImage image{object.data, object.size, 0};
-    const auto* header = reinterpret_cast<const Elf64Ehdr*>(object.data);
     size_t rela_count = static_cast<size_t>(rela_size / rela_ent);
     for (size_t i = 0; i < rela_count; ++i) {
-        const uint8_t* ptr =
-            image_ptr_at_vaddr(image,
-                               *header,
-                               rela_addr + i * rela_ent,
-                               sizeof(Elf64Rela));
-        if (ptr == nullptr) {
+        if (i > (UINT64_MAX - rela_addr) / rela_ent) {
             log_message(LogLevel::Error,
                         "Loader: relocation table exceeds image");
             return false;
         }
-        const auto* rela = reinterpret_cast<const Elf64Rela*>(ptr);
+        Elf64Rela rela{};
+        if (!read_object_vaddr(object,
+                               proc,
+                               rela_addr + i * rela_ent,
+                               &rela,
+                               sizeof(rela))) {
+            log_message(LogLevel::Error,
+                        "Loader: relocation table exceeds mapped object");
+            return false;
+        }
         if (!apply_relocation(object,
-                              *rela,
+                              rela,
                               objects,
                               object_count,
                               proc)) {
@@ -1011,25 +1312,11 @@ bool load_needed_object(const char* name,
         return false;
     }
 
-    loader::ProgramImage image{};
-    uint8_t* image_buffer = nullptr;
-    if (!read_shared_object_image(path, image, image_buffer)) {
-        log_message(LogLevel::Error,
-                    "Loader: failed to read shared object %s",
-                    path);
-        return false;
-    }
-    if (!looks_like_elf(image.data, image.size)) {
-        log_message(LogLevel::Error,
-                    "Loader: shared object is not ELF: %s",
-                    path);
-        memory::free_kernel(image_buffer);
-        return false;
-    }
-
     LoadedObject object{};
-    if (!map_elf_object(image, proc, name, false, object)) {
-        memory::free_kernel(image_buffer);
+    if (!map_elf_object_file(path, proc, name, object)) {
+        log_message(LogLevel::Error,
+                    "Loader: failed to load shared object %s",
+                    path);
         return false;
     }
     objects[object_count++] = object;
@@ -1039,6 +1326,7 @@ bool load_needed_object(const char* name,
         char needed[kMaxSharedObjectName];
         if (!needed_name_at(loaded,
                             loaded.dynamic.needed_offsets[i],
+                            proc,
                             needed,
                             sizeof(needed))) {
             log_message(LogLevel::Error,
@@ -1074,6 +1362,7 @@ bool load_dynamic_elf_binary(const loader::ProgramImage& image,
         char needed[kMaxSharedObjectName];
         if (!needed_name_at(objects[0],
                             objects[0].dynamic.needed_offsets[i],
+                            proc,
                             needed,
                             sizeof(needed))) {
             log_message(LogLevel::Error,
