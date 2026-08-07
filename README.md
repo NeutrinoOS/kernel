@@ -32,6 +32,20 @@ the live filesystem. Package archives are generated in each package project's
 `out` directory.
 ### Debugging
 You can use `make debug` to run in EFI mode with QEMU's debug mode enabled, allowing you to attach a debugger with e.g. `gdb -ex "target remote localhost:1234" -ex "symbol-file out/kernel.elf"`. The same considerations apply as with normal `make run.`
+
+### Userspace core dumps
+
+Add `COREDUMP=ON` (or the bare `COREDUMP` token) to the kernel command line to
+write an ELF64 core file when a userspace task terminates because of a CPU
+exception such as #DE, #UD, #GP, or an unrecoverable #PF. Dumps are written to
+`/cores/core.<pid>.<tid>.<sequence>`, exclude shared and device mappings, and
+include at most 64 MiB of private process memory. When the root filesystem
+supports ACLs, the dump is restricted to the user that owned the crashed task;
+if that protection cannot be applied, the incomplete dump is removed.
+
+Load the executable and dump in GDB with, for example,
+`gdb /path/to/program /cores/core.12.12.1`. Core dumping is disabled by default
+because dumps contain private memory and consume persistent storage.
 ### Optimized builds
 There's no support right now for optimized builds out of the box, but you can run something like `make clean all EXTRA_CFLAGS="-O3 -DNDEBUG=1"` to pass -O3 -DNDEBUG=1 into CFLAGs.
 
@@ -119,6 +133,12 @@ identity, and current directory. Table operations, shared file offsets, CWD
 updates, and credential changes are serialized across the thread group; the
 resources are closed only after its final thread is reclaimed.
 
+On x86-64 systems with PCID support, each process address space receives a
+hardware context identifier. Threads inherit the identifier with their shared
+address space, allowing context switches to retain tagged TLB entries. Page
+table changes and identifier reuse use targeted SMP shootdowns; CPUs without
+PCID support continue to use ordinary flushing CR3 switches.
+
 Syscall ABI 1.7 completes the native process-control layer. It adds per-thread
 TLS base management and TLS-aware thread creation; bounded asynchronous event
 queues; process-group kill, suspend, and resume; arbitrary-child waiting with
@@ -128,6 +148,13 @@ usage accounting; and a capability-gated tracer that can stop a process,
 inspect or modify its memory, and read a stopped thread's registers. External
 control requires the `ProcessControl` capability, while cross-process
 observation continues to require `Monitor`.
+
+Syscall ABI 2.0 renumbers the complete syscall table into contiguous subsystem
+groups. ABI discovery remains at calls 0 and 1; core system services,
+descriptors, filesystem operations, virtual memory, threads, processes,
+security, and privileged administration follow in that order. All userspace
+must be rebuilt against the ABI 2.0 headers because the remaining numeric call
+identifiers are intentionally incompatible with ABI 1.x.
 
 ## Debug heartbeat
 
