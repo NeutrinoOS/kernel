@@ -9,6 +9,8 @@ struct FeatureState {
     bool mmx;
     bool sse;
     bool sse2;
+    bool pge;
+    bool pcid;
 };
 
 const FeatureState& feature_state();

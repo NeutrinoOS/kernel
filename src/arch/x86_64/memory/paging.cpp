@@ -44,6 +44,11 @@ constexpr uint64_t PTE_GLOBAL = 1ull << 8;
 constexpr uint64_t PTE_MANAGED = PAGE_FLAG_MANAGED;
 constexpr uint64_t PTE_NX = 1ull << 63;
 constexpr uint64_t CR0_WRITE_PROTECT = 1ull << 16;
+constexpr uint64_t CR4_PAGE_GLOBAL_ENABLE = 1ull << 7;
+constexpr uint64_t CR4_PCID_ENABLE = 1ull << 17;
+constexpr uint64_t CR3_NO_FLUSH = 1ull << 63;
+constexpr uint64_t PCID_MASK = 0xfffull;
+constexpr size_t PCID_COUNT = 4096;
 constexpr uint32_t MSR_EFER = 0xC0000080;
 constexpr uint64_t EFER_NXE = 1ull << 11;
 
@@ -72,19 +77,154 @@ uint64_t g_kernel_cr3 = 0;
 uint64_t* pml4_table = nullptr;
 uint64_t* g_address_space_roots[MAX_ADDRESS_SPACES];
 size_t g_address_space_count = 0;
+bool g_pcid_in_use[PCID_COUNT]{};
 sync::SpinLock g_address_space_registry_lock;
 
 sync::SpinLock g_tlb_shootdown_lock;
 uint8_t g_tlb_shootdown_vector = 0;
 volatile size_t g_tlb_shootdown_acks = 0;
+enum class TlbShootdownKind : uint8_t {
+    All,
+    Context,
+    Page,
+};
+volatile TlbShootdownKind g_tlb_shootdown_kind = TlbShootdownKind::All;
+volatile uint64_t g_tlb_shootdown_cr3 = 0;
+volatile uint64_t g_tlb_shootdown_address = 0;
+
+uint64_t read_cr3() {
+    uint64_t value = 0;
+    asm volatile("mov %%cr3, %0" : "=r"(value));
+    return value;
+}
+
+uint64_t read_cr4() {
+    uint64_t value = 0;
+    asm volatile("mov %%cr4, %0" : "=r"(value));
+    return value;
+}
+
+bool pcid_enabled() {
+    return (read_cr4() & CR4_PCID_ENABLE) != 0;
+}
+
+uint64_t cr3_context(uint64_t cr3) {
+    return cr3 & (PHYSICAL_ADDRESS_MASK | PCID_MASK);
+}
+
+void flush_all_local() {
+    uint64_t cr4 = read_cr4();
+    uint64_t toggled = cr4 ^ CR4_PAGE_GLOBAL_ENABLE;
+    asm volatile("mov %0, %%cr4" : : "r"(toggled) : "memory");
+    asm volatile("mov %0, %%cr4" : : "r"(cr4) : "memory");
+}
+
+void with_context_local(uint64_t target_cr3,
+                        uint64_t address,
+                        bool single_page) {
+    uint64_t current = read_cr3();
+    target_cr3 = cr3_context(target_cr3);
+    if (cr3_context(current) == target_cr3) {
+        if (single_page) {
+            asm volatile("invlpg (%0)"
+                         :
+                         : "r"(reinterpret_cast<void*>(address))
+                         : "memory");
+        } else {
+            asm volatile("mov %0, %%cr3" : : "r"(current) : "memory");
+        }
+        return;
+    }
+    if (!pcid_enabled()) {
+        return;
+    }
+
+    // Every process root shares the kernel half. Temporarily entering the
+    // target context lets CPUs without INVPCID invalidate a dormant PCID.
+    asm volatile("mov %0, %%cr3" : : "r"(target_cr3) : "memory");
+    if (single_page) {
+        asm volatile("invlpg (%0)"
+                     :
+                     : "r"(reinterpret_cast<void*>(address))
+                     : "memory");
+    }
+    asm volatile("mov %0, %%cr3"
+                 :
+                 : "r"(cr3_context(current) | CR3_NO_FLUSH)
+                 : "memory");
+}
 
 void tlb_shootdown_handler() {
-    uint64_t cr3 = 0;
-    asm volatile("mov %%cr3, %0" : "=r"(cr3));
-    asm volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    TlbShootdownKind kind = g_tlb_shootdown_kind;
+    if (kind == TlbShootdownKind::All) {
+        flush_all_local();
+    } else {
+        with_context_local(g_tlb_shootdown_cr3,
+                           g_tlb_shootdown_address,
+                           kind == TlbShootdownKind::Page);
+    }
     __atomic_fetch_add(&g_tlb_shootdown_acks,
                        static_cast<size_t>(1),
                        __ATOMIC_RELEASE);
+}
+
+uint16_t allocate_pcid_locked() {
+    if (!pcid_enabled()) {
+        return 0;
+    }
+    for (size_t pcid = 1; pcid < PCID_COUNT; ++pcid) {
+        if (!g_pcid_in_use[pcid]) {
+            g_pcid_in_use[pcid] = true;
+            return static_cast<uint16_t>(pcid);
+        }
+    }
+    return 0;
+}
+
+void release_pcid_locked(uint16_t pcid) {
+    if (pcid != 0) {
+        g_pcid_in_use[pcid] = false;
+    }
+}
+
+bool shootdown_all_cpus(TlbShootdownKind kind,
+                        uint64_t cr3 = 0,
+                        uint64_t address = 0) {
+    sync::IrqLockGuard guard(g_tlb_shootdown_lock);
+    if (g_tlb_shootdown_vector == 0) {
+        uint8_t vector = interrupts::allocate_vector();
+        if (vector == 0 ||
+            !interrupts::register_vector(vector, tlb_shootdown_handler)) {
+            if (vector != 0) {
+                interrupts::free_vector(vector);
+            }
+            return false;
+        }
+        g_tlb_shootdown_vector = vector;
+    }
+
+    g_tlb_shootdown_kind = kind;
+    g_tlb_shootdown_cr3 = cr3_context(cr3);
+    g_tlb_shootdown_address = address;
+    if (kind == TlbShootdownKind::All) {
+        flush_all_local();
+    } else {
+        with_context_local(cr3, address, kind == TlbShootdownKind::Page);
+    }
+
+    size_t online = smp::online_cpus();
+    if (online <= 1) {
+        return true;
+    }
+    __atomic_store_n(&g_tlb_shootdown_acks,
+                     static_cast<size_t>(0),
+                     __ATOMIC_RELEASE);
+    lapic::send_ipi_all_others(g_tlb_shootdown_vector);
+    while (__atomic_load_n(&g_tlb_shootdown_acks, __ATOMIC_ACQUIRE) <
+           online - 1) {
+        asm volatile("pause");
+    }
+    return true;
 }
 
 constexpr uint64_t align_down(uint64_t value, uint64_t alignment) {
@@ -555,6 +695,12 @@ void paging_init() {
     asm volatile("mov %%cr0, %0" : "=r"(cr0));
     cr0 |= CR0_WRITE_PROTECT;
     asm volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
+
+    // Reserve the shootdown vector before address spaces begin retaining
+    // tagged translations. Failure here would make safe PCID reuse impossible.
+    if (!shootdown_all_cpus(TlbShootdownKind::All)) {
+        error_screen::display("PAGING_", "TLB_SHOOTDOWN_INIT_FAILED", nullptr);
+    }
 }
 
 bool paging_finish_smp_bootstrap() {
@@ -711,13 +857,13 @@ void paging_switch_cr3(uint64_t new_cr3) {
     if (new_cr3 == 0) {
         return;
     }
-    uint64_t current_cr3 = 0;
-    asm volatile("mov %%cr3, %0" : "=r"(current_cr3));
-    if ((current_cr3 & PHYSICAL_ADDRESS_MASK) ==
-        (new_cr3 & PHYSICAL_ADDRESS_MASK)) {
+    uint64_t current_cr3 = read_cr3();
+    new_cr3 = cr3_context(new_cr3);
+    if (cr3_context(current_cr3) == new_cr3) {
         return;
     }
-    asm volatile("mov %0, %%cr3" : : "r"(new_cr3) : "memory");
+    uint64_t value = pcid_enabled() ? new_cr3 | CR3_NO_FLUSH : new_cr3;
+    asm volatile("mov %0, %%cr3" : : "r"(value) : "memory");
 }
 
 uint64_t paging_create_address_space() {
@@ -731,6 +877,11 @@ uint64_t paging_create_address_space() {
     }
     memset(new_root, 0, PAGE_SIZE);
     sync::IrqLockGuard guard(g_address_space_registry_lock);
+    uint16_t pcid = allocate_pcid_locked();
+    if (pcid_enabled() && pcid == 0) {
+        memory::free_kernel_page(root_page.phys);
+        return 0;
+    }
     constexpr size_t kKernelStart = PAGE_TABLE_ENTRIES / 2;
     for (size_t i = kKernelStart; i < PAGE_TABLE_ENTRIES; ++i) {
         new_root[i] = pml4_table[i];
@@ -744,13 +895,14 @@ uint64_t paging_create_address_space() {
     }
     if (registry_slot == MAX_ADDRESS_SPACES) {
         if (g_address_space_count >= MAX_ADDRESS_SPACES) {
+            release_pcid_locked(pcid);
             memory::free_kernel_page(root_page.phys);
             return 0;
         }
         registry_slot = g_address_space_count++;
     }
     g_address_space_roots[registry_slot] = new_root;
-    return root_page.phys;
+    return root_page.phys | pcid;
 }
 
 void paging_destroy_address_space(uint64_t cr3) {
@@ -758,9 +910,17 @@ void paging_destroy_address_space(uint64_t cr3) {
         return;
     }
 
-    uint64_t root_phys = cr3 & ~PAGE_MASK;
+    uint16_t pcid = static_cast<uint16_t>(cr3 & PCID_MASK);
+    uint64_t root_phys = cr3 & PHYSICAL_ADDRESS_MASK;
     auto* root = reinterpret_cast<uint64_t*>(table_phys_to_virt(root_phys));
     if (root == nullptr) {
+        return;
+    }
+
+    // Purge the tag on every CPU before its page tables or PCID can be reused.
+    if (!shootdown_all_cpus(TlbShootdownKind::Context, cr3)) {
+        // Leaking an unreachable address space is safer than freeing page
+        // tables or reusing a PCID that another CPU may still have cached.
         return;
     }
 
@@ -794,6 +954,10 @@ void paging_destroy_address_space(uint64_t cr3) {
     }
 
     memory::free_kernel_page(root_phys);
+    {
+        sync::IrqLockGuard guard(g_address_space_registry_lock);
+        release_pcid_locked(pcid);
+    }
 }
 
 bool paging_map_page_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags) {
@@ -803,8 +967,7 @@ bool paging_map_page_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fl
     uint64_t root_phys = cr3 & ~PAGE_MASK;
     auto* root = reinterpret_cast<uint64_t*>(table_phys_to_virt(root_phys));
     map_page_with_root(root, virt, phys, flags);
-    asm volatile("invlpg (%0)" : : "r"(reinterpret_cast<void*>(virt)) : "memory");
-    return true;
+    return shootdown_all_cpus(TlbShootdownKind::Page, cr3, virt);
 }
 
 bool paging_unmap_page_cr3(uint64_t cr3, uint64_t virt, uint64_t& phys_out) {
@@ -849,6 +1012,8 @@ bool paging_unmap_page_cr3(uint64_t cr3, uint64_t virt, uint64_t& phys_out) {
     }
     phys_out = pt_entry & PHYSICAL_ADDRESS_MASK;
     pt[pt_index] = 0;
+    bool flushed =
+        shootdown_all_cpus(TlbShootdownKind::Page, cr3, virt);
     if (pml4_index < PAGE_TABLE_ENTRIES / 2) {
         if (table_empty(pt)) {
             pd[pd_index] = 0;
@@ -863,8 +1028,7 @@ bool paging_unmap_page_cr3(uint64_t cr3, uint64_t virt, uint64_t& phys_out) {
             }
         }
     }
-    asm volatile("invlpg (%0)" : : "r"(reinterpret_cast<void*>(virt)) : "memory");
-    return true;
+    return flushed;
 }
 
 bool paging_resolve_cr3(uint64_t cr3, uint64_t virt, uint64_t& phys_out) {
@@ -1011,8 +1175,7 @@ bool paging_set_writable_cr3(uint64_t cr3, uint64_t virt, bool writable) {
         entry &= ~PTE_WRITE;
     }
     pt[pt_index] = entry;
-    asm volatile("invlpg (%0)" : : "r"(reinterpret_cast<void*>(virt)) : "memory");
-    return true;
+    return shootdown_all_cpus(TlbShootdownKind::Page, cr3, virt);
 }
 
 bool paging_set_executable_cr3(uint64_t cr3,
@@ -1055,44 +1218,11 @@ bool paging_set_executable_cr3(uint64_t cr3,
         entry |= PTE_NX;
     }
     pt[pt_index] = entry;
-    asm volatile("invlpg (%0)"
-                 :
-                 : "r"(reinterpret_cast<void*>(virt))
-                 : "memory");
-    return true;
+    return shootdown_all_cpus(TlbShootdownKind::Page, cr3, virt);
 }
 
 bool paging_flush_tlb_all_cpus() {
-    sync::IrqLockGuard guard(g_tlb_shootdown_lock);
-    if (g_tlb_shootdown_vector == 0) {
-        uint8_t vector = interrupts::allocate_vector();
-        if (vector == 0 ||
-            !interrupts::register_vector(vector, tlb_shootdown_handler)) {
-            if (vector != 0) {
-                interrupts::free_vector(vector);
-            }
-            return false;
-        }
-        g_tlb_shootdown_vector = vector;
-    }
-
-    uint64_t cr3 = 0;
-    asm volatile("mov %%cr3, %0" : "=r"(cr3));
-    asm volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
-
-    size_t online = smp::online_cpus();
-    if (online <= 1) {
-        return true;
-    }
-    __atomic_store_n(&g_tlb_shootdown_acks,
-                     static_cast<size_t>(0),
-                     __ATOMIC_RELEASE);
-    lapic::send_ipi_all_others(g_tlb_shootdown_vector);
-    while (__atomic_load_n(&g_tlb_shootdown_acks, __ATOMIC_ACQUIRE) <
-           online - 1) {
-        asm volatile("pause");
-    }
-    return true;
+    return shootdown_all_cpus(TlbShootdownKind::All);
 }
 
 void* paging_phys_to_virt(uint64_t phys) {
