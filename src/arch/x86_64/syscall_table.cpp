@@ -28,8 +28,8 @@ namespace syscall {
 
 namespace {
 
-constexpr uint64_t kAbiMajor = 1;
-constexpr uint64_t kAbiMinor = 11;
+constexpr uint64_t kAbiMajor = 2;
+constexpr uint64_t kAbiMinor = 0;
 
 class PrincipalRefGuard {
 public:
