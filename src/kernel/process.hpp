@@ -148,6 +148,7 @@ struct Task {
     bool is_thread;
     bool thread_join_claimed;
     bool child_wait_claimed;
+    bool core_dump_pending;
     bool reclaim_pending;
     uint32_t reclaim_cpu;
     void (*kernel_entry)(Task&);

@@ -7,6 +7,7 @@
 #include "../../drivers/interrupts/pic.hpp"
 #include "../../drivers/log/logging.hpp"
 #include "../../kernel/error.hpp"
+#include "../../kernel/core_dump.hpp"
 #include "../../kernel/descriptor.hpp"
 #include "../../kernel/interrupts.hpp"
 #include "../../kernel/process.hpp"
@@ -73,7 +74,11 @@ extern "C" void isr_validate_return(InterruptFrame* regs) {
     if (!syscall::valid_user_return_state(regs->rip, regs->rsp)) {
         process::Task* proc = process::current();
         if (proc != nullptr) {
-            process::terminate(*proc, exit_code_from_exception(13));
+            InterruptFrame fault = *regs;
+            fault.int_no = 13;
+            fault.err_code = 0;
+            (void)core_dump::schedule(*proc, fault, 0);
+            process::terminate_group(*proc, exit_code_from_exception(13));
             scheduler::reschedule_from_interrupt(*regs);
         }
     }
@@ -353,7 +358,12 @@ extern "C" void isr_handler(InterruptFrame* regs) {
                     static_cast<unsigned long long>(regs->rip),
                     static_cast<unsigned int>(exit_code));
         if (process::Task* proc = process::current()) {
-            process::terminate(*proc, exit_code);
+            uint64_t fault_address = 0;
+            if (regs->int_no == 14) {
+                asm volatile("mov %%cr2, %0" : "=r"(fault_address));
+            }
+            (void)core_dump::schedule(*proc, *regs, fault_address);
+            process::terminate_group(*proc, exit_code);
         }
         scheduler::reschedule_from_interrupt(*regs);
         return;

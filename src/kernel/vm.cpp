@@ -1476,6 +1476,42 @@ bool fill_user(uint64_t cr3,
     return true;
 }
 
+bool copy_from_user_present(uint64_t cr3,
+                            void* dest,
+                            uint64_t src,
+                            size_t length) {
+    if (length == 0) {
+        return true;
+    }
+    if (cr3 == 0 || dest == nullptr || src == 0 ||
+        !is_user_range(src, static_cast<uint64_t>(length))) {
+        return false;
+    }
+    auto* dest_bytes = static_cast<uint8_t*>(dest);
+    size_t offset = 0;
+    while (offset < length) {
+        const uint64_t address = src + offset;
+        uint64_t phys = 0;
+        uint64_t flags = 0;
+        if (!paging_resolve_cr3(cr3, address, phys) ||
+            !paging_flags_cr3(cr3, address, flags) ||
+            (flags & PAGE_FLAG_USER) == 0) {
+            return false;
+        }
+        const size_t page_offset =
+            static_cast<size_t>(address & kPageMask);
+        size_t chunk = kPageSize - page_offset;
+        if (chunk > length - offset) {
+            chunk = length - offset;
+        }
+        const auto* source = static_cast<const uint8_t*>(
+            paging_phys_to_virt(phys));
+        memcpy(dest_bytes + offset, source, chunk);
+        offset += chunk;
+    }
+    return true;
+}
+
 Usage usage(uint64_t cr3) {
     Usage result{};
     if (cr3 == 0) {
@@ -1501,6 +1537,31 @@ Usage usage(uint64_t cr3) {
         }
     }
     return result;
+}
+
+size_t snapshot_areas(uint64_t cr3, AreaInfo* out, size_t max_areas) {
+    if (cr3 == 0 || out == nullptr || max_areas == 0) {
+        return 0;
+    }
+    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceState* state =
+        find_address_space_state_locked(cr3, false);
+    if (state == nullptr) {
+        return 0;
+    }
+    size_t count = 0;
+    for (const auto& area : state->areas) {
+        if (!area.in_use || count == max_areas) {
+            continue;
+        }
+        out[count++] = AreaInfo{
+            area.base,
+            area.length,
+            area.flags,
+            area.kind,
+        };
+    }
+    return count;
 }
 
 }  // namespace vm

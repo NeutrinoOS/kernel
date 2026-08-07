@@ -44,6 +44,13 @@ struct Usage {
     uint64_t file_bytes;
 };
 
+struct AreaInfo {
+    uint64_t base;
+    uint64_t length;
+    uint64_t flags;
+    MappingKind kind;
+};
+
 Region map_user_code(uint64_t cr3,
                      const uint8_t* data,
                      size_t length,
@@ -99,7 +106,14 @@ bool copy_user_string(uint64_t cr3,
                       size_t dest_size);
 bool copy_to_user(uint64_t cr3, uint64_t dest, const void* src, size_t length);
 bool copy_from_user(uint64_t cr3, void* dest, uint64_t src, size_t length);
+// Copies only pages which are already present. Unlike copy_from_user(), this
+// never services demand faults or changes the target address space.
+bool copy_from_user_present(uint64_t cr3,
+                            void* dest,
+                            uint64_t src,
+                            size_t length);
 bool fill_user(uint64_t cr3, uint64_t dest, uint8_t value, size_t length);
 Usage usage(uint64_t cr3);
+size_t snapshot_areas(uint64_t cr3, AreaInfo* out, size_t max_areas);
 
 }  // namespace vm

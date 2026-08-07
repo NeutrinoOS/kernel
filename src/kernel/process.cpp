@@ -84,6 +84,7 @@ void reset_task(process::Task& proc) {
     proc.is_thread = false;
     proc.thread_join_claimed = false;
     proc.child_wait_claimed = false;
+    proc.core_dump_pending = false;
     proc.reclaim_pending = false;
     proc.reclaim_cpu = UINT32_MAX;
     proc.kernel_entry = nullptr;
@@ -1498,6 +1499,7 @@ void reap_deferred() {
     for (size_t i = 0; i < kMaxTasks; ++i) {
         Task& proc = g_task_table[i];
         if (!__atomic_load_n(&proc.reclaim_pending, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&proc.core_dump_pending, __ATOMIC_ACQUIRE) ||
             __atomic_load_n(&proc.reclaim_cpu, __ATOMIC_RELAXED) != cpu->index ||
             running_on_task_stack(proc)) {
             continue;
@@ -1538,6 +1540,10 @@ Task* allocate_kernel_task(void (*entry)(Task&)) {
 }
 
 void reclaim(Task& proc) {
+    if (__atomic_load_n(&proc.core_dump_pending, __ATOMIC_ACQUIRE)) {
+        defer_reclaim(proc);
+        return;
+    }
     if (running_on_task_stack(proc)) {
         defer_reclaim(proc);
         return;
