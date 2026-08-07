@@ -43,6 +43,8 @@ struct NetEndpoint {
     Ring service_to_app;
     size_t app_handles;
     size_t service_handles;
+    bool app_ever_attached;
+    bool service_ever_attached;
     size_t refcount;
     uint32_t id;
     bool in_use;
@@ -127,6 +129,16 @@ size_t peer_handles(const NetEndpoint& endpoint, Role role) {
                              : endpoint.app_handles;
 }
 
+bool peer_ever_attached(const NetEndpoint& endpoint, Role role) {
+    return role == Role::App ? endpoint.service_ever_attached
+                             : endpoint.app_ever_attached;
+}
+
+bool peer_closed(const NetEndpoint& endpoint, Role role) {
+    return peer_handles(endpoint, role) == 0 &&
+           peer_ever_attached(endpoint, role);
+}
+
 EndpointWaiter*& read_waiters(NetEndpoint& endpoint, Role role) {
     return role == Role::App ? endpoint.app_read_waiters
                              : endpoint.service_read_waiters;
@@ -148,6 +160,8 @@ NetEndpoint* allocate_endpoint_locked() {
         reset_ring(endpoint.service_to_app);
         endpoint.app_handles = 0;
         endpoint.service_handles = 0;
+        endpoint.app_ever_attached = false;
+        endpoint.service_ever_attached = false;
         endpoint.refcount = 0;
         endpoint.lock = 0;
         endpoint.app_read_waiters = nullptr;
@@ -318,7 +332,7 @@ bool service_read_waiters_locked(NetEndpoint& endpoint, Role role) {
     bool progressed = false;
     while (waiters != nullptr) {
         EndpointWaiter* waiter = waiters;
-        if (ring.count == 0 && peer_handles(endpoint, role) == 0) {
+        if (ring.count == 0 && peer_closed(endpoint, role)) {
             waiters = waiter->next;
             waiter->next = nullptr;
             complete_waiter(waiter, 0);
@@ -354,7 +368,7 @@ bool service_write_waiters_locked(NetEndpoint& endpoint, Role role) {
     bool progressed = false;
     while (waiters != nullptr) {
         EndpointWaiter* waiter = waiters;
-        if (peer_handles(endpoint, role) == 0) {
+        if (peer_closed(endpoint, role)) {
             waiters = waiter->next;
             waiter->next = nullptr;
             complete_waiter(waiter, -1);
@@ -435,7 +449,7 @@ int64_t endpoint_read(process::Task& proc,
         descriptor::wake_waiters();
         return copied;
     }
-    if (peer_handles(endpoint, handle->role) == 0) {
+    if (peer_closed(endpoint, handle->role)) {
         unlock_endpoint(endpoint, irq_flags);
         return 0;
     }
@@ -486,7 +500,7 @@ int64_t endpoint_write(process::Task& proc,
         return -1;
     }
     NetEndpoint& endpoint = *endpoint_ptr;
-    if (peer_handles(endpoint, handle->role) == 0) {
+    if (peer_closed(endpoint, handle->role)) {
         unlock_endpoint(endpoint, irq_flags);
         return -1;
     }
@@ -656,13 +670,13 @@ bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents) {
     }
     Ring& incoming = incoming_ring(*endpoint, handle->role);
     Ring& outgoing = outgoing_ring(*endpoint, handle->role);
-    size_t peers = peer_handles(*endpoint, handle->role);
+    bool closed = peer_closed(*endpoint, handle->role);
     if ((events & descriptor_defs::kWaitRead) != 0 &&
-        (incoming.count > 0 || peers == 0)) {
+        (incoming.count > 0 || closed)) {
         revents |= descriptor_defs::kWaitRead;
     }
     if ((events & descriptor_defs::kWaitWrite) != 0 &&
-        peers != 0 &&
+        !closed &&
         outgoing.count < kEndpointBufferSize) {
         revents |= descriptor_defs::kWaitWrite;
     }
@@ -715,8 +729,10 @@ bool open_endpoint(process::Task& proc,
         ++endpoint->refcount;
         if (role == Role::App) {
             ++endpoint->app_handles;
+            endpoint->app_ever_attached = true;
         } else {
             ++endpoint->service_handles;
+            endpoint->service_ever_attached = true;
         }
         unlock_endpoint(*endpoint, irq_flags);
     }
