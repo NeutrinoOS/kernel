@@ -637,13 +637,6 @@ int set_property(process::Task& proc,
                  uint32_t property,
                  uint64_t in_ptr,
                  uint64_t size) {
-    DescriptorEntry* entry = lookup_entry(table, handle);
-    if (entry == nullptr) {
-        return -1;
-    }
-    if (entry->ops == nullptr || entry->ops->set_property == nullptr) {
-        return -1;
-    }
     const void* in = reinterpret_cast<const void*>(in_ptr);
     if (in == nullptr && size != 0) {
         return -1;
@@ -655,7 +648,25 @@ int set_property(process::Task& proc,
                                   false)) {
         return -1;
     }
-    return entry->ops->set_property(*entry, property, in, static_cast<size_t>(size));
+    return set_property_trusted(table,
+                                handle,
+                                property,
+                                in,
+                                static_cast<size_t>(size));
+}
+
+int set_property_trusted(Table& table,
+                         uint32_t handle,
+                         uint32_t property,
+                         const void* in,
+                         size_t size) {
+    DescriptorEntry* entry = lookup_entry(table, handle);
+    if (entry == nullptr || entry->ops == nullptr ||
+        entry->ops->set_property == nullptr ||
+        (in == nullptr && size != 0)) {
+        return -1;
+    }
+    return entry->ops->set_property(*entry, property, in, size);
 }
 
 int wait(process::Task& proc,

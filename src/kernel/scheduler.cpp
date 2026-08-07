@@ -4,6 +4,7 @@
 
 #include "drivers/fs/block_cache.hpp"
 #include "drivers/log/logging.hpp"
+#include "drivers/console/console.hpp"
 #include "lib/mem.hpp"
 #include "arch/x86_64/cpu_features.hpp"
 #include "arch/x86_64/gdt.hpp"
@@ -703,8 +704,12 @@ void reschedule_from_interrupt(InterruptFrame& frame) {
 void tick(InterruptFrame& frame) {
     percpu::Cpu* cpu = percpu::current_cpu();
     if (cpu != nullptr && cpu->index == 0) {
-        debug_heartbeat::tick(timekeeping::tick_count());
-        process::wake_ready_sleepers(timekeeping::tick_count());
+        const uint64_t tick = timekeeping::tick_count();
+        debug_heartbeat::tick(tick);
+        if (kconsole != nullptr) {
+            kconsole->tick_cursor(tick);
+        }
+        process::wake_ready_sleepers(tick);
     }
     if ((frame.cs & 0x3) != 0) {
         process::Task* current_proc = process::current();

@@ -226,6 +226,13 @@ int set_property(process::Task& proc,
                  uint32_t property,
                  uint64_t in_ptr,
                  uint64_t size);
+// Set a property from an already validated kernel buffer. Descriptor adapters
+// use this to forward properties without treating kernel memory as user input.
+int set_property_trusted(Table& table,
+                         uint32_t handle,
+                         uint32_t property,
+                         const void* in,
+                         size_t size);
 int wait(process::Task& proc,
          Table& table,
          uint64_t user_address,

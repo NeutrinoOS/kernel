@@ -5,6 +5,7 @@
 #include "lib/mem.hpp"
 #include "../../arch/x86_64/memory/paging.hpp"
 #include "kernel/memory/physical_allocator.hpp"
+#include "kernel/time.hpp"
 
 namespace {
 
@@ -14,6 +15,7 @@ constexpr uint16_t kDefaultGlyphHeight = 8;
 constexpr uint16_t kDefaultGlyphCount = 128;
 constexpr uint8_t kMemoryModelRgb = 1;
 constexpr size_t kPageSize = 0x1000;
+constexpr uint64_t kCursorBlinkMilliseconds = 500;
 
 size_t bytes_per_pixel(const Framebuffer* fb) {
     if (fb == nullptr || fb->bpp == 0) {
@@ -299,6 +301,7 @@ void Console::get_dimensions(size_t& out_cols, size_t& out_rows) const {
 }
 
 void Console::set_cursor(size_t x, size_t y) {
+    begin_cursor_update();
     if (x >= columns) {
         x = columns ? columns - 1 : 0;
     }
@@ -307,6 +310,7 @@ void Console::set_cursor(size_t x, size_t y) {
     }
     cursor_x = x;
     cursor_y = y;
+    end_cursor_update();
 }
 
 bool Console::refresh_framebuffer_info() {
@@ -370,7 +374,11 @@ Console::Console(uint32_t framebuffer_handle)
       back_buffer(nullptr),
       frame_bytes(0),
       back_buffer_capacity(0),
-      update_depth(0) {  // white on black
+      update_depth(0),
+      cursor_blink_enabled(false),
+      cursor_drawn(false),
+      cursor_last_toggle_tick(0),
+      cursor_update_depth(0) {  // white on black
     refresh_framebuffer_info();
 
     update_geometry();
@@ -556,8 +564,10 @@ bool Console::set_scale(uint32_t new_scale) {
     if (font_scale == new_scale) {
         return true;
     }
+    begin_cursor_update();
     font_scale = new_scale;
     update_geometry();
+    end_cursor_update();
     return true;
 }
 
@@ -605,6 +615,7 @@ bool Console::set_font(const descriptor_defs::ConsoleFont& new_font,
     auto* new_data = static_cast<uint8_t*>(paging_phys_to_virt(new_phys));
     memcpy(new_data, data, expected_size);
 
+    begin_cursor_update();
     uint64_t old_phys = font_data_phys;
     font_info = new_font;
     font_data = new_data;
@@ -613,6 +624,7 @@ bool Console::set_font(const descriptor_defs::ConsoleFont& new_font,
     if (old_phys != 0) {
         memory::free_kernel_block(old_phys);
     }
+    end_cursor_update();
     return true;
 }
 
@@ -637,11 +649,12 @@ void Console::redraw_cells(const descriptor_defs::VtyCell* cells,
         return;
     }
 
+    begin_cursor_update();
     set_update_deferred(true);
     fg_color = final_fg;
     bg_color = final_bg;
     text_flags = final_flags;
-    clear();
+    clear_without_cursor();
 
     size_t draw_rows = source_rows < rows ? source_rows : rows;
     size_t source_start_y = 0;
@@ -676,6 +689,7 @@ void Console::redraw_cells(const descriptor_defs::VtyCell* cells,
         cursor_y = rows ? rows - 1 : 0;
     }
     set_update_deferred(false);
+    end_cursor_update();
 }
 
 void Console::scroll() {
@@ -723,7 +737,7 @@ void Console::scroll() {
     }
 }
 
-void Console::putc(char c) {
+void Console::putc_without_cursor(char c) {
     Framebuffer* target = draw_target();
     if (c == '\n') {
         cursor_x = 0;
@@ -762,11 +776,36 @@ void Console::putc(char c) {
     }
 }
 
+void Console::putc(char c) {
+    begin_cursor_update();
+    putc_without_cursor(c);
+    end_cursor_update();
+}
+
 void Console::puts(const char* s) {
-    while (*s) putc(*s++);
+    begin_cursor_update();
+    while (*s) putc_without_cursor(*s++);
+    end_cursor_update();
+}
+
+void Console::write(const char* data, size_t length) {
+    if (data == nullptr || length == 0) {
+        return;
+    }
+    begin_cursor_update();
+    for (size_t i = 0; i < length; ++i) {
+        putc_without_cursor(data[i]);
+    }
+    end_cursor_update();
 }
 
 void Console::clear() {
+    begin_cursor_update();
+    clear_without_cursor();
+    end_cursor_update();
+}
+
+void Console::clear_without_cursor() {
     Framebuffer* target = draw_target();
     if (target == nullptr || target->base == nullptr) {
         return;
@@ -778,18 +817,114 @@ void Console::clear() {
     cursor_x = cursor_y = 0;
 }
 
+void Console::toggle_cursor() {
+    Framebuffer* target = draw_target();
+    if (target == nullptr || target->base == nullptr || columns == 0 ||
+        rows == 0 || cursor_x >= columns || cursor_y >= rows) {
+        cursor_drawn = false;
+        return;
+    }
+
+    const size_t width = cell_width_px();
+    size_t height = font_scale;
+    const size_t base_x = cursor_x * width;
+    const size_t glyph_height = static_cast<size_t>(font_info.height) * font_scale;
+    const size_t base_y = cursor_y * cell_height_px() + glyph_height - height;
+    if (base_x >= target->width || base_y >= target->height) {
+        cursor_drawn = false;
+        return;
+    }
+    size_t draw_width = width;
+    if (draw_width > target->width - base_x) {
+        draw_width = target->width - base_x;
+    }
+    if (height > target->height - base_y) {
+        height = target->height - base_y;
+    }
+    const size_t bpp = bytes_per_pixel(target);
+    if (bpp == 0 || base_x > target->pitch / bpp ||
+        draw_width > target->pitch / bpp - base_x) {
+        cursor_drawn = false;
+        return;
+    }
+    for (size_t row = 0; row < height; ++row) {
+        uint8_t* pixel = target->base + (base_y + row) * target->pitch +
+                         base_x * bpp;
+        for (size_t byte = 0; byte < draw_width * bpp; ++byte) {
+            pixel[byte] ^= 0xFFu;
+        }
+    }
+    cursor_drawn = !cursor_drawn;
+    if (back_buffer != nullptr) {
+        if (descriptor::framebuffer_is_active(0) && primary_fb.base != nullptr &&
+            primary_fb.pitch == target->pitch &&
+            base_y + height <= primary_fb.height) {
+            const size_t row_bytes = draw_width * bpp;
+            for (size_t row = 0; row < height; ++row) {
+                const size_t offset = (base_y + row) * target->pitch +
+                                      base_x * bpp;
+                memcpy_simd(primary_fb.base + offset,
+                            target->base + offset,
+                            row_bytes);
+            }
+        }
+    }
+}
+
+void Console::begin_cursor_update() {
+    while (__atomic_exchange_n(&cursor_update_depth,
+                               1,
+                               __ATOMIC_ACQUIRE) != 0) {
+        asm volatile("pause");
+    }
+    if (cursor_drawn) {
+        toggle_cursor();
+    }
+}
+
+void Console::end_cursor_update() {
+    if (cursor_blink_enabled && !cursor_drawn) {
+        toggle_cursor();
+        cursor_last_toggle_tick = timekeeping::tick_count();
+    }
+    __atomic_store_n(&cursor_update_depth, 0, __ATOMIC_RELEASE);
+}
+
+void Console::set_cursor_blink(bool enabled) {
+    begin_cursor_update();
+    cursor_blink_enabled = enabled;
+    end_cursor_update();
+}
+
+void Console::tick_cursor(uint64_t tick) {
+    if (!cursor_blink_enabled || update_depth != 0 ||
+        __atomic_exchange_n(&cursor_update_depth,
+                            1,
+                            __ATOMIC_ACQUIRE) != 0) {
+        return;
+    }
+    const uint64_t interval = timekeeping::ticks_for_duration_ns(
+        kCursorBlinkMilliseconds * 1000000ull);
+    if (cursor_blink_enabled && update_depth == 0 &&
+        tick - cursor_last_toggle_tick >= interval) {
+        toggle_cursor();
+        cursor_last_toggle_tick = tick;
+    }
+    __atomic_store_n(&cursor_update_depth, 0, __ATOMIC_RELEASE);
+}
+
 void Console::print_dec(uint64_t n) {
     char buf[21];
     int i = 0;
     if (n == 0) {
-        putc('0');
+        putc_without_cursor('0');
         return;
     }
     while (n > 0) {
         buf[i++] = '0' + (n % 10);
         n /= 10;
     }
-    while (i--) putc(buf[i]);
+    while (i--) putc_without_cursor(buf[i]);
 }
 
 void Console::print_hex(uint64_t n, bool pad16) {
@@ -798,10 +933,10 @@ void Console::print_hex(uint64_t n, bool pad16) {
 
     // handle zero explicitly
     if (n == 0) {
-        if (pad16)
-            puts("0x0000000000000000");
-        else
-            puts("0x0");
+        const char* zero = pad16 ? "0x0000000000000000" : "0x0";
+        while (*zero != '\0') {
+            putc_without_cursor(*zero++);
+        }
         return;
     }
 
@@ -812,26 +947,31 @@ void Console::print_hex(uint64_t n, bool pad16) {
         n >>= 4;
     }
 
-    puts("0x");
+    putc_without_cursor('0');
+    putc_without_cursor('x');
 
     // pad to 16 digits if requested
     if (pad16 && i < 16) {
         for (int j = 0; j < 16 - i; j++)
-            putc('0');
+            putc_without_cursor('0');
     }
 
     // print reversed buffer
     while (i--)
-        putc(buf[i]);
+        putc_without_cursor(buf[i]);
 }
 
 
 void Console::printf(const char* fmt, ...) {
+    if (fmt == nullptr) {
+        return;
+    }
+    begin_cursor_update();
     va_list args;
     va_start(args, fmt);
     while (*fmt) {
         if (*fmt != '%') {
-            putc(*fmt++);
+            putc_without_cursor(*fmt++);
             continue;
         }
         fmt++;
@@ -854,18 +994,23 @@ void Console::printf(const char* fmt, ...) {
                 print_hex(va_arg(args, unsigned long long), pad16);
                 break;
             case 's':
-                puts(va_arg(args, const char*));
+                if (const char* text = va_arg(args, const char*)) {
+                    while (*text != '\0') {
+                        putc_without_cursor(*text++);
+                    }
+                }
                 break;
             case 'c':
-                putc((char)va_arg(args, int));
+                putc_without_cursor((char)va_arg(args, int));
                 break;
             case '%':
-                putc('%');
+                putc_without_cursor('%');
                 break;
             default:
-                putc('?');
+                putc_without_cursor('?');
                 break;
         }
     }
     va_end(args);
+    end_cursor_update();
 }

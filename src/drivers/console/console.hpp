@@ -26,9 +26,12 @@ public:
 
     void putc(char c);
     void puts(const char* s);
+    void write(const char* data, size_t length);
     void printf(const char* fmt, ...);
     void clear();
     void set_cursor(size_t x, size_t y);
+    void set_cursor_blink(bool enabled);
+    void tick_cursor(uint64_t tick);
     void get_dimensions(size_t& out_cols, size_t& out_rows) const;
 
     void set_color(uint32_t fg, uint32_t bg);
@@ -73,6 +76,10 @@ private:
     size_t frame_bytes;
     size_t back_buffer_capacity;
     size_t update_depth;
+    bool cursor_blink_enabled;
+    bool cursor_drawn;
+    uint64_t cursor_last_toggle_tick;
+    size_t cursor_update_depth;
 
     bool refresh_framebuffer_info();
     bool allocate_back_buffer();
@@ -86,6 +93,11 @@ private:
     bool font_pixel(uint8_t glyph, size_t x, size_t y) const;
 
     void draw_char(char c, size_t x, size_t y);
+    void clear_without_cursor();
+    void toggle_cursor();
+    void begin_cursor_update();
+    void end_cursor_update();
+    void putc_without_cursor(char c);
     void scroll();
     void print_dec(uint64_t n);
     void print_hex(uint64_t n, bool pad16);

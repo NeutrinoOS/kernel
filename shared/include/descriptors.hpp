@@ -50,6 +50,7 @@ enum class Property : uint32_t {
     ConsoleUpdate     = 0x00000007,
     ConsoleScale      = 0x00000008,
     ConsoleFont       = 0x00000009,
+    ConsoleCursorBlink= 0x0000000A,
     FramebufferInfo   = 0x00010001,
     FramebufferPresent= 0x00010002,
     GraphicalSessionInfo = 0x00011001,
@@ -66,6 +67,7 @@ enum class Property : uint32_t {
     VtyClear          = 0x00050005,
     VtyColor          = 0x00050006,
     VtyTextFlags      = 0x00050007,
+    VtyCursorBlink    = 0x00050008,
     NetDeviceInfo     = 0x00060001,
     NetIpv4Config     = 0x00060002,
     NetDeviceDebug    = 0x00060003,
@@ -324,6 +326,10 @@ struct VtyCell {
 
 enum TextCellFlag : uint8_t {
     kTextCellUnderline = 1u << 0,
+};
+
+enum VtyFlag : uint32_t {
+    kVtyCursorBlink = 1u << 0,
 };
 
 struct CursorPosition {

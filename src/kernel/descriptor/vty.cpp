@@ -429,6 +429,20 @@ int vty_set_property(DescriptorEntry& entry,
         unlock_vty(*vty);
         return ok ? 0 : -1;
     }
+    if (property == static_cast<uint32_t>(
+                        descriptor_defs::Property::VtyCursorBlink)) {
+        if (in == nullptr || size != sizeof(uint8_t)) {
+            return -1;
+        }
+        lock_vty(*vty);
+        if (*reinterpret_cast<const uint8_t*>(in) != 0) {
+            vty->flags |= descriptor_defs::kVtyCursorBlink;
+        } else {
+            vty->flags &= ~descriptor_defs::kVtyCursorBlink;
+        }
+        unlock_vty(*vty);
+        return 0;
+    }
     if (property ==
         static_cast<uint32_t>(descriptor_defs::Property::VtyClear)) {
         lock_vty(*vty);
@@ -579,6 +593,8 @@ bool vty_redraw_console(uint32_t id, Console& console) {
                          vty->fg,
                          vty->bg,
                          vty->text_flags);
+    console.set_cursor_blink(
+        (vty->flags & descriptor_defs::kVtyCursorBlink) != 0);
     unlock_vty(*vty);
     return true;
 }
@@ -626,6 +642,20 @@ int vty_set_property(uint32_t id,
         bool ok = set_cursor(*vty, pos->x, pos->y);
         unlock_vty(*vty);
         return ok ? 0 : -1;
+    }
+    if (property == static_cast<uint32_t>(
+                        descriptor_defs::Property::VtyCursorBlink)) {
+        if (in == nullptr || size != sizeof(uint8_t)) {
+            return -1;
+        }
+        lock_vty(*vty);
+        if (*reinterpret_cast<const uint8_t*>(in) != 0) {
+            vty->flags |= descriptor_defs::kVtyCursorBlink;
+        } else {
+            vty->flags &= ~descriptor_defs::kVtyCursorBlink;
+        }
+        unlock_vty(*vty);
+        return 0;
     }
     if (property ==
         static_cast<uint32_t>(descriptor_defs::Property::VtyClear)) {

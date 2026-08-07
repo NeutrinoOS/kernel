@@ -68,6 +68,38 @@ int console_set_property(DescriptorEntry& entry,
                          const void* in,
                          size_t size) {
     if (is_stdout_redirect(entry)) {
+        if (property == static_cast<uint32_t>(
+                            descriptor_defs::Property::ConsoleCursorBlink)) {
+            if (in == nullptr || size != sizeof(uint8_t)) {
+                return -1;
+            }
+            process::Task* proc = process::current();
+            if (proc == nullptr || proc->resources == nullptr) {
+                return -1;
+            }
+            const uint32_t target = stdout_redirect_handle(entry);
+            uint16_t target_type = 0;
+            if (!get_type(proc->resources->descriptors,
+                          target,
+                          target_type)) {
+                return -1;
+            }
+            if (target_type == kTypeVty) {
+                return set_property_trusted(
+                    proc->resources->descriptors,
+                    target,
+                    static_cast<uint32_t>(
+                        descriptor_defs::Property::VtyCursorBlink),
+                    in,
+                    size);
+            }
+            if (target_type == kTypeConsole && kconsole != nullptr) {
+                kconsole->set_cursor_blink(
+                    *reinterpret_cast<const uint8_t*>(in) != 0);
+                return 0;
+            }
+            return -1;
+        }
         if (property ==
                 static_cast<uint32_t>(descriptor_defs::Property::ConsoleCursor) ||
             property ==
@@ -110,6 +142,23 @@ int console_set_property(DescriptorEntry& entry,
             return vty_set_property(
                 vty_id,
                 static_cast<uint32_t>(descriptor_defs::Property::VtyCursor),
+                in,
+                size);
+        }
+        return 0;
+    }
+    if (property == static_cast<uint32_t>(
+                        descriptor_defs::Property::ConsoleCursorBlink)) {
+        if (in == nullptr || size != sizeof(uint8_t)) {
+            return -1;
+        }
+        const bool enabled = *reinterpret_cast<const uint8_t*>(in) != 0;
+        console->set_cursor_blink(enabled);
+        if (vty_id != 0) {
+            return vty_set_property(
+                vty_id,
+                static_cast<uint32_t>(
+                    descriptor_defs::Property::VtyCursorBlink),
                 in,
                 size);
         }
@@ -312,9 +361,7 @@ int64_t console_write(process::Task& proc,
         return 0;
     }
     size_t to_write = static_cast<size_t>(length);
-    for (size_t i = 0; i < to_write; ++i) {
-        console->putc(data[i]);
-    }
+    console->write(data, to_write);
     return static_cast<int64_t>(to_write);
 }
 
