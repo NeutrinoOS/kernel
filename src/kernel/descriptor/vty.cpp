@@ -5,6 +5,7 @@
 #include "../sync.hpp"
 #include "../vm.hpp"
 #include "../../lib/mem.hpp"
+#include "../../lib/text_encoding.hpp"
 
 namespace descriptor {
 
@@ -29,6 +30,7 @@ struct Vty {
     uint32_t fg;
     uint32_t bg;
     uint8_t text_flags;
+    text_encoding::Utf8Decoder utf8_decoder;
     descriptor_defs::VtyCell cells[kMaxCols * kMaxRows];
     uint8_t input[kInputBufferSize];
     size_t input_head;
@@ -174,6 +176,26 @@ void put_char(Vty& vty, char ch) {
     advance_cursor(vty);
 }
 
+void put_utf8_byte(Vty& vty, uint8_t byte) {
+    for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+        uint32_t codepoint = 0;
+        const auto result = text_encoding::decode_utf8_byte(
+            vty.utf8_decoder, byte, codepoint);
+        if (result == text_encoding::DecodeResult::Pending) {
+            return;
+        }
+        if (result == text_encoding::DecodeResult::Complete) {
+            put_char(vty, static_cast<char>(
+                text_encoding::unicode_to_cp437(codepoint)));
+            return;
+        }
+        put_char(vty, '?');
+        if (result != text_encoding::DecodeResult::InvalidRetry) {
+            return;
+        }
+    }
+}
+
 bool enqueue_input(Vty& vty, uint8_t value) {
     size_t next = (vty.input_head + 1) % kInputBufferSize;
     if (next == vty.input_tail) {
@@ -259,6 +281,7 @@ Vty* allocate_vty() {
     selected->fg = 0xFFFFFFFF;   // white
     selected->bg = 0x00000000;   // black
     selected->text_flags = 0;
+    selected->utf8_decoder = {};
     selected->input_head = 0;
     selected->input_tail = 0;
     selected->lock = 0;
@@ -346,7 +369,7 @@ int64_t vty_write(process::Task& proc,
         }
         lock_vty(*vty);
         for (size_t i = 0; i < chunk; ++i) {
-            put_char(*vty, static_cast<char>(buffer[i]));
+            put_utf8_byte(*vty, buffer[i]);
         }
         unlock_vty(*vty);
         total += chunk;
@@ -566,7 +589,7 @@ bool vty_write(uint32_t id, const char* data, size_t length) {
     }
     descriptor_vty::lock_vty(*vty);
     for (size_t i = 0; i < length; ++i) {
-        descriptor_vty::put_char(*vty, data[i]);
+        descriptor_vty::put_utf8_byte(*vty, static_cast<uint8_t>(data[i]));
     }
     descriptor_vty::unlock_vty(*vty);
     return true;

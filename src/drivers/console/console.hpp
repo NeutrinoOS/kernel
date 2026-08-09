@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "lib/font8x8_basic.hpp"
+#include "lib/text_encoding.hpp"
 #include "kernel/descriptor.hpp"
 
 struct Framebuffer {
@@ -80,6 +81,7 @@ private:
     bool cursor_drawn;
     uint64_t cursor_last_toggle_tick;
     size_t cursor_update_depth;
+    text_encoding::Utf8Decoder utf8_decoder;
 
     bool refresh_framebuffer_info();
     bool allocate_back_buffer();
@@ -98,6 +100,7 @@ private:
     void begin_cursor_update();
     void end_cursor_update();
     void putc_without_cursor(char c);
+    void put_utf8_byte(uint8_t byte);
     void scroll();
     void print_dec(uint64_t n);
     void print_hex(uint64_t n, bool pad16);

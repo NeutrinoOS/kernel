@@ -378,7 +378,8 @@ Console::Console(uint32_t framebuffer_handle)
       cursor_blink_enabled(false),
       cursor_drawn(false),
       cursor_last_toggle_tick(0),
-      cursor_update_depth(0) {  // white on black
+      cursor_update_depth(0),
+      utf8_decoder{} {  // white on black
     refresh_framebuffer_info();
 
     update_geometry();
@@ -434,7 +435,9 @@ void Console::draw_char(char c, size_t x, size_t y) {
         return;
     }
     uint8_t uc = static_cast<uint8_t>(c);
-    if (uc >= font_info.glyph_count) return;
+    if (uc >= font_info.glyph_count) {
+        uc = text_encoding::basic_font_fallback(uc);
+    }
 
     size_t glyph_width = cell_width_px();
     size_t glyph_height = static_cast<size_t>(font_info.height) * font_scale;
@@ -778,13 +781,13 @@ void Console::putc_without_cursor(char c) {
 
 void Console::putc(char c) {
     begin_cursor_update();
-    putc_without_cursor(c);
+    put_utf8_byte(static_cast<uint8_t>(c));
     end_cursor_update();
 }
 
 void Console::puts(const char* s) {
     begin_cursor_update();
-    while (*s) putc_without_cursor(*s++);
+    while (*s) put_utf8_byte(static_cast<uint8_t>(*s++));
     end_cursor_update();
 }
 
@@ -794,9 +797,29 @@ void Console::write(const char* data, size_t length) {
     }
     begin_cursor_update();
     for (size_t i = 0; i < length; ++i) {
-        putc_without_cursor(data[i]);
+        put_utf8_byte(static_cast<uint8_t>(data[i]));
     }
     end_cursor_update();
+}
+
+void Console::put_utf8_byte(uint8_t byte) {
+    for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+        uint32_t codepoint = 0;
+        const auto result = text_encoding::decode_utf8_byte(
+            utf8_decoder, byte, codepoint);
+        if (result == text_encoding::DecodeResult::Pending) {
+            return;
+        }
+        if (result == text_encoding::DecodeResult::Complete) {
+            putc_without_cursor(static_cast<char>(
+                text_encoding::unicode_to_cp437(codepoint)));
+            return;
+        }
+        putc_without_cursor('?');
+        if (result != text_encoding::DecodeResult::InvalidRetry) {
+            return;
+        }
+    }
 }
 
 void Console::clear() {
@@ -971,7 +994,7 @@ void Console::printf(const char* fmt, ...) {
     va_start(args, fmt);
     while (*fmt) {
         if (*fmt != '%') {
-            putc_without_cursor(*fmt++);
+            put_utf8_byte(static_cast<uint8_t>(*fmt++));
             continue;
         }
         fmt++;
@@ -996,12 +1019,12 @@ void Console::printf(const char* fmt, ...) {
             case 's':
                 if (const char* text = va_arg(args, const char*)) {
                     while (*text != '\0') {
-                        putc_without_cursor(*text++);
+                        put_utf8_byte(static_cast<uint8_t>(*text++));
                     }
                 }
                 break;
             case 'c':
-                putc_without_cursor((char)va_arg(args, int));
+                put_utf8_byte(static_cast<uint8_t>(va_arg(args, int)));
                 break;
             case '%':
                 putc_without_cursor('%');
