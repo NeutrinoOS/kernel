@@ -20,6 +20,11 @@ constexpr uint8_t kRegisterYear = 0x09;
 constexpr uint8_t kRegisterStatusA = 0x0A;
 constexpr uint8_t kRegisterStatusB = 0x0B;
 constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
+constexpr uint32_t kPitInputFrequency = 1193182u;
+constexpr uint16_t kPitCalibrationCount = 0xFFFFu;
+constexpr uint16_t kPitChannel2Port = 0x42;
+constexpr uint16_t kPitCommandPort = 0x43;
+constexpr uint16_t kPitSpeakerPort = 0x61;
 
 struct RtcSample {
     uint8_t second;
@@ -43,6 +48,105 @@ uint32_t g_tick_nanos_remainder = 0;
 uint64_t g_tick_count = 0;
 uint64_t g_uptime_nanoseconds = 0;
 bool g_initialized = false;
+uint64_t g_tsc_base = 0;
+uint64_t g_tsc_frequency_hz = 0;
+uint64_t g_last_monotonic_nanoseconds = 0;
+
+struct CpuidResult {
+    uint32_t eax;
+    uint32_t ebx;
+    uint32_t ecx;
+    uint32_t edx;
+};
+
+CpuidResult cpuid(uint32_t leaf) {
+    CpuidResult result{};
+    asm volatile("cpuid"
+                 : "=a"(result.eax), "=b"(result.ebx),
+                   "=c"(result.ecx), "=d"(result.edx)
+                 : "a"(leaf), "c"(0));
+    return result;
+}
+
+uint64_t read_tsc() {
+    uint32_t low = 0;
+    uint32_t high = 0;
+    // LFENCE orders the timestamp read after preceding loads on x86-64.
+    asm volatile("lfence\n"
+                 "rdtsc"
+                 : "=a"(low), "=d"(high)
+                 :
+                 : "memory");
+    return (static_cast<uint64_t>(high) << 32) | low;
+}
+
+uint64_t calibrate_tsc_with_pit() {
+    const uint8_t original_speaker = inb(kPitSpeakerPort);
+
+    // Keep the speaker silent and hold channel 2's gate low while loading a
+    // one-shot count. Channel 0 remains untouched and continues driving IRQ0.
+    outb(kPitSpeakerPort,
+         static_cast<uint8_t>(original_speaker & ~0x03u));
+    outb(kPitCommandPort, 0xB0u);
+    outb(kPitChannel2Port,
+         static_cast<uint8_t>(kPitCalibrationCount & 0xFFu));
+    outb(kPitChannel2Port,
+         static_cast<uint8_t>(kPitCalibrationCount >> 8));
+
+    const uint64_t start = read_tsc();
+    outb(kPitSpeakerPort,
+         static_cast<uint8_t>((original_speaker & ~0x02u) | 0x01u));
+
+    bool elapsed = false;
+    for (uint32_t spin = 0; spin < 10000000u; ++spin) {
+        if ((inb(kPitSpeakerPort) & 0x20u) != 0) {
+            elapsed = true;
+            break;
+        }
+        asm volatile("pause");
+    }
+    const uint64_t end = read_tsc();
+    outb(kPitSpeakerPort, original_speaker);
+    if (!elapsed || end <= start) return 0;
+
+    return ((end - start) * kPitInputFrequency +
+            kPitCalibrationCount / 2u) /
+           kPitCalibrationCount;
+}
+
+uint64_t detect_tsc_frequency() {
+    constexpr uint64_t kMaximumPlausibleTscHz = 10000000000ull;
+    const CpuidResult max_basic = cpuid(0);
+    if (max_basic.eax < 1u || (cpuid(1u).edx & (1u << 4)) == 0) {
+        return 0;
+    }
+
+    if (max_basic.eax >= 0x15u) {
+        const CpuidResult ratio = cpuid(0x15u);
+        if (ratio.eax != 0 && ratio.ebx != 0 && ratio.ecx != 0) {
+            const uint64_t frequency_hz =
+                (static_cast<uint64_t>(ratio.ecx) * ratio.ebx) / ratio.eax;
+            if (frequency_hz <= kMaximumPlausibleTscHz) {
+                return frequency_hz;
+            }
+        }
+    }
+
+    // CPUID.16H reports the nominal core frequency in MHz. It is less exact
+    // than the crystal-clock ratio, but avoids a calibration delay when leaf
+    // 15H is incomplete.
+    if (max_basic.eax >= 0x16u) {
+        const uint32_t base_mhz = cpuid(0x16u).eax & 0xFFFFu;
+        const uint64_t frequency_hz =
+            static_cast<uint64_t>(base_mhz) * 1000000ull;
+        if (frequency_hz != 0 && frequency_hz <= kMaximumPlausibleTscHz) {
+            return frequency_hz;
+        }
+    }
+
+    const uint64_t calibrated_hz = calibrate_tsc_with_pit();
+    return calibrated_hz <= kMaximumPlausibleTscHz ? calibrated_hz : 0;
+}
 
 bool clock_available() {
     return __atomic_load_n(&g_initialized, __ATOMIC_ACQUIRE);
@@ -247,7 +351,19 @@ bool init_from_rtc(uint32_t pit_frequency_hz) {
         static_cast<uint32_t>(kNanosecondsPerSecond % pit_frequency_hz);
     g_tick_count = 0;
     g_uptime_nanoseconds = 0;
+    g_tsc_frequency_hz = detect_tsc_frequency();
+    g_tsc_base = g_tsc_frequency_hz != 0 ? read_tsc() : 0;
+    g_last_monotonic_nanoseconds = 0;
     end_write();
+
+    if (g_tsc_frequency_hz != 0) {
+        log_message(LogLevel::Info,
+                    "Time: monotonic TSC frequency %llu Hz",
+                    static_cast<unsigned long long>(g_tsc_frequency_hz));
+    } else {
+        log_message(LogLevel::Warn,
+                    "Time: TSC unavailable, using PIT-resolution monotonic clock");
+    }
 
     uint64_t unix_seconds = 0;
     if (!read_rtc_unix_time(unix_seconds)) {
@@ -359,7 +475,40 @@ uint64_t tick_count() {
 }
 
 uint64_t nanoseconds_since_boot() {
-    return __atomic_load_n(&g_uptime_nanoseconds, __ATOMIC_ACQUIRE);
+    uint64_t candidate = 0;
+    const uint64_t frequency_hz =
+        __atomic_load_n(&g_tsc_frequency_hz, __ATOMIC_ACQUIRE);
+    if (frequency_hz != 0) {
+        const uint64_t elapsed_cycles =
+            read_tsc() - __atomic_load_n(&g_tsc_base, __ATOMIC_RELAXED);
+        const uint64_t whole_seconds = elapsed_cycles / frequency_hz;
+        const uint64_t remaining_cycles = elapsed_cycles % frequency_hz;
+        if (whole_seconds <= UINT64_MAX / kNanosecondsPerSecond) {
+            candidate = whole_seconds * kNanosecondsPerSecond +
+                        (remaining_cycles * kNanosecondsPerSecond) /
+                        frequency_hz;
+        } else {
+            candidate = UINT64_MAX;
+        }
+    } else {
+        candidate =
+            __atomic_load_n(&g_uptime_nanoseconds, __ATOMIC_ACQUIRE);
+    }
+
+    // The uACPI contract requires a strictly monotonic value. Keep that
+    // promise across sub-nanosecond TSC reads, unsynchronized CPUs, and the
+    // coarse PIT fallback used when no invariant TSC frequency is available.
+    uint64_t previous =
+        __atomic_load_n(&g_last_monotonic_nanoseconds, __ATOMIC_RELAXED);
+    for (;;) {
+        uint64_t next = candidate > previous ? candidate : previous + 1;
+        if (previous == UINT64_MAX) return UINT64_MAX;
+        if (__atomic_compare_exchange_n(&g_last_monotonic_nanoseconds,
+                                        &previous, next, false,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+            return next;
+        }
+    }
 }
 
 uint64_t ticks_for_duration_ns(uint64_t duration_ns) {
