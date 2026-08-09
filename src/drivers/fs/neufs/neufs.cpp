@@ -14,7 +14,8 @@ constexpr size_t kNeufsFileNameLength = 256;
 constexpr uint64_t kNeufsMagicSize = 8;
 constexpr uint8_t kNeufsMagic[kNeufsMagicSize] = {
     0x4E, 0x45, 0x55, 0x46, 0x53, 0x00, 0x77, 0x42};
-constexpr int32_t kNeufsVersion = 1;
+constexpr int32_t kNeufsVersionLegacy = 1;
+constexpr int32_t kNeufsVersion = 2;
 constexpr uint8_t kTypeNdir = 0;
 constexpr uint8_t kTypeFile = 1;
 
@@ -24,7 +25,10 @@ struct NeufsRvt {
     int32_t version;
     char name[16];
     uint64_t root;
+    char preferred_alias[32];
 };
+
+constexpr size_t kLegacyRvtSize = 8 + 4 + 16 + 8;
 
 struct NeufsAclEntry {
     int64_t machine_id;
@@ -706,7 +710,7 @@ static bool bitmap_find_first_clear_from(const fs::BlockDevice& device,
         return false;
     }
 
-    uint64_t rvt_blocks = align_up(sizeof(NeufsRvt), 8) / 8;
+    uint64_t rvt_blocks = align_up(volume.rvt_size, 8) / 8;
     uint64_t data_bitmap_blocks =
         align_up(volume.data_bitmap_size_bytes, 8) / 8;
     uint64_t meta_bitmap_blocks =
@@ -2418,7 +2422,7 @@ bool neufs_mount(neufs::NeufsVolume& volume, const fs::BlockDevice& device) {
     if (!compare_magic(rvt.magic)) {
         return false;
     }
-    if (rvt.version != kNeufsVersion) {
+    if (rvt.version != kNeufsVersionLegacy && rvt.version != kNeufsVersion) {
         return false;
     }
     if (rvt.root == 0) {
@@ -2441,22 +2445,24 @@ bool neufs_mount(neufs::NeufsVolume& volume, const fs::BlockDevice& device) {
         suggested_meta = total_bytes;
     }
 
+    volume.rvt_size = rvt.version == kNeufsVersion ? sizeof(NeufsRvt)
+                                                   : kLegacyRvtSize;
     volume.root_offset = rvt.root;
     volume.meta_size = align_up(suggested_meta, device.sector_size);
     if (volume.meta_size > total_bytes) {
         return false;
     }
-    if (volume.meta_size < sizeof(NeufsRvt)) {
+    if (volume.meta_size < volume.rvt_size) {
         return false;
     }
-    if (volume.root_offset < sizeof(NeufsRvt) ||
+    if (volume.root_offset < volume.rvt_size ||
         volume.root_offset + sizeof(NeufsNdir) > volume.meta_size) {
         return false;
     }
 
     volume.next_free_metadata = align_up(volume.root_offset + sizeof(NeufsNdir), 8);
-    if (volume.next_free_metadata < sizeof(NeufsRvt)) {
-        volume.next_free_metadata = sizeof(NeufsRvt);
+    if (volume.next_free_metadata < volume.rvt_size) {
+        volume.next_free_metadata = volume.rvt_size;
     }
     if (volume.next_free_metadata > volume.meta_size) {
         volume.next_free_metadata = volume.meta_size;
@@ -2471,8 +2477,21 @@ bool neufs_mount(neufs::NeufsVolume& volume, const fs::BlockDevice& device) {
         return false;
     }
 
-    if (!ensure_name(volume.name, sizeof(volume.name), rvt.name)) {
-        return false;
+    size_t volume_name_length = 0;
+    while (volume_name_length < sizeof(rvt.name) &&
+           rvt.name[volume_name_length] != '\0') {
+        ++volume_name_length;
+    }
+    memcpy(volume.name, rvt.name, volume_name_length);
+    volume.name[volume_name_length] = '\0';
+    if (rvt.version == kNeufsVersion) {
+        size_t alias_length = 0;
+        while (alias_length < sizeof(rvt.preferred_alias) &&
+               rvt.preferred_alias[alias_length] != '\0') {
+            ++alias_length;
+        }
+        memcpy(volume.preferred_alias, rvt.preferred_alias, alias_length);
+        volume.preferred_alias[alias_length] = '\0';
     }
 
     // Compute and initialize bitmaps inside the meta section if there is space.
@@ -2488,7 +2507,7 @@ bool neufs_mount(neufs::NeufsVolume& volume, const fs::BlockDevice& device) {
     uint64_t meta_blocks = volume.meta_size / 8;
     uint64_t meta_bitmap_bytes = (meta_blocks + 7) / 8;
 
-    uint64_t meta_cursor = align_up(sizeof(NeufsRvt), 8);
+    uint64_t meta_cursor = align_up(volume.rvt_size, 8);
     uint64_t proposed_data_bitmap_offset = meta_cursor;
     uint64_t proposed_meta_bitmap_offset = align_up(meta_cursor + data_bitmap_bytes, 8);
 
@@ -2557,7 +2576,14 @@ bool neufs_mount(neufs::NeufsVolume& volume, const fs::BlockDevice& device) {
 }
 
 const vfs::FilesystemOps& neufs_vfs_ops() {
+    static const auto get_volume_alias = [](void* fs_context) -> const char* {
+        if (fs_context == nullptr) return nullptr;
+        auto* volume = static_cast<neufs::NeufsVolume*>(fs_context);
+        return volume->preferred_alias[0] != '\0' ? volume->preferred_alias
+                                                   : nullptr;
+    };
     static const vfs::FilesystemOps kOps = {
+        get_volume_alias,
         &neufs_list_directory,
         &neufs_open_file,
         &neufs_create_file,

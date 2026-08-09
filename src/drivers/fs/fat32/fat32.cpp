@@ -1627,6 +1627,7 @@ void to_vfs_entry(const Fat32DirEntry& source, vfs::DirEntry& dest) {
 }  // namespace
 
 bool fat32_mount(Fat32Volume& volume, const fs::BlockDevice& device) {
+    memset(&volume, 0, sizeof(volume));
     volume.device = device;
     volume.mounted = false;
     const char* device_name =
@@ -1676,6 +1677,23 @@ bool fat32_mount(Fat32Volume& volume, const fs::BlockDevice& device) {
         log_message(LogLevel::Warn, "FAT32: invalid root cluster: %u",
                     bpb->root_cluster);
         return false;
+    }
+
+    // FAT labels are space padded. Present a trimmed label to the VFS, which
+    // remains responsible for namespace validation and conflict handling.
+    size_t label_length = sizeof(bpb->volume_label);
+    while (label_length > 0 && bpb->volume_label[label_length - 1] == ' ') {
+        --label_length;
+    }
+    if (label_length == 7 && bpb->volume_label[0] == 'N' &&
+        bpb->volume_label[1] == 'O' && bpb->volume_label[2] == ' ' &&
+        bpb->volume_label[3] == 'N' && bpb->volume_label[4] == 'A' &&
+        bpb->volume_label[5] == 'M' && bpb->volume_label[6] == 'E') {
+        label_length = 0;
+    }
+    if (label_length > 0) {
+        memcpy(volume.preferred_alias, bpb->volume_label, label_length);
+        volume.preferred_alias[label_length] = '\0';
     }
 
     volume.sectors_per_cluster = bpb->sectors_per_cluster;
@@ -2417,6 +2435,12 @@ void fat32_vfs_close_directory(void* dir_context) {
 }
 
 const vfs::FilesystemOps kFat32FilesystemOps{
+    [](void* fs_context) -> const char* {
+        if (fs_context == nullptr) return nullptr;
+        auto* volume = static_cast<Fat32Volume*>(fs_context);
+        return volume->preferred_alias[0] != '\0' ? volume->preferred_alias
+                                                   : nullptr;
+    },
     &fat32_vfs_list_directory,
     &fat32_vfs_open_file,
     &fat32_vfs_create_file,

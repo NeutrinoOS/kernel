@@ -1488,7 +1488,12 @@ Result handle_syscall(SyscallFrame& frame) {
 
             char cwd[path_util::kMaxPathLength];
             snapshot_cwd(*proc, cwd);
-            size_t cwd_len = string_util::length(cwd);
+            char user_cwd[path_util::kMaxPathLength];
+            if (!path_util::build_user_path(cwd, user_cwd)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            size_t cwd_len = string_util::length(user_cwd);
             if (cwd_len + 1 > buffer_size) {
                 if (buffer_size == 0) {
                     frame.rax = static_cast<uint64_t>(-1);
@@ -1499,7 +1504,7 @@ Result handle_syscall(SyscallFrame& frame) {
 
             if (!vm::copy_to_user(proc->cr3,
                                   reinterpret_cast<uint64_t>(buffer),
-                                  cwd,
+                                  user_cwd,
                                   cwd_len)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;

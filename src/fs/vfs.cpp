@@ -12,11 +12,13 @@ namespace {
 
 constexpr size_t kMaxMounts = 16;
 constexpr size_t kMaxRootDirHandles = 8;
+constexpr size_t kMaxVolumeAliasLength = 63;
 
 struct MountEntry {
     const char* name;
     const FilesystemOps* ops;
     void* fs_context;
+    char volume_alias[kMaxVolumeAliasLength + 1];
     bool in_use;
 };
 
@@ -69,6 +71,55 @@ int string_compare_n(const char* a, const char* b, size_t len) {
         }
     }
     return 0;
+}
+
+bool ascii_equal_ignore_case(const char* a, const char* b, size_t length) {
+    for (size_t i = 0; i < length; ++i) {
+        char ca = a[i];
+        char cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb + ('a' - 'A'));
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+bool copy_valid_volume_alias(const char* preferred,
+                             char (&out)[kMaxVolumeAliasLength + 1]) {
+    out[0] = '\0';
+    if (preferred == nullptr || preferred[0] == '\0') return false;
+
+    size_t length = 0;
+    while (preferred[length] != '\0') {
+        const unsigned char c = static_cast<unsigned char>(preferred[length]);
+        const bool valid = (c >= 'a' && c <= 'z') ||
+                           (c >= 'A' && c <= 'Z') ||
+                           (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+                           c == '.';
+        if (!valid || length >= kMaxVolumeAliasLength) return false;
+        ++length;
+    }
+    if ((length == 1 && preferred[0] == '.') ||
+        (length == 2 && preferred[0] == '.' && preferred[1] == '.') ||
+        (length == 3 && ascii_equal_ignore_case(preferred, "sys", 3))) {
+        return false;
+    }
+    memcpy(out, preferred, length);
+    out[length] = '\0';
+    return true;
+}
+
+MountEntry* find_unique_alias(const char* alias, size_t alias_length) {
+    MountEntry* match = nullptr;
+    for (auto& mount : g_mounts) {
+        if (!mount.in_use || string_length(mount.volume_alias) != alias_length ||
+            string_compare_n(mount.volume_alias, alias, alias_length) != 0) {
+            continue;
+        }
+        if (match != nullptr) return nullptr;
+        match = &mount;
+    }
+    return match;
 }
 
 const char* skip_leading_slash(const char* path) {
@@ -232,8 +283,30 @@ bool register_mount(const char* name,
         mount.name = name;
         mount.ops = ops;
         mount.fs_context = fs_context;
+        if (ops->get_volume_alias != nullptr) {
+            const char* preferred = ops->get_volume_alias(fs_context);
+            if (preferred != nullptr && preferred[0] != '\0' &&
+                !copy_valid_volume_alias(preferred, mount.volume_alias)) {
+                log_message(LogLevel::Warn,
+                            "VFS: rejected invalid or reserved alias '@%s' for '%s'",
+                            preferred, name);
+            }
+        }
         mount.in_use = true;
-        log_message(LogLevel::Info, "VFS: mounted '%s'", name);
+        if (mount.volume_alias[0] != '\0') {
+            size_t alias_length = string_length(mount.volume_alias);
+            if (find_unique_alias(mount.volume_alias, alias_length) == nullptr) {
+                log_message(LogLevel::Warn,
+                            "VFS: mounted '%s'; alias '@%s' unavailable due to conflict",
+                            name, mount.volume_alias);
+            } else {
+                log_message(LogLevel::Info,
+                            "VFS: mounted '%s' (preferred alias '@%s')",
+                            name, mount.volume_alias);
+            }
+        } else {
+            log_message(LogLevel::Info, "VFS: mounted '%s'", name);
+        }
         return true;
     }
 
@@ -282,6 +355,24 @@ bool has_explicit_mount_prefix(const char* path) {
     size_t mount_len = static_cast<size_t>(mount_end - trimmed);
     LockGuard guard;
     return find_mount(trimmed, mount_len) != nullptr;
+}
+
+const char* mount_name_for_alias(const char* alias, size_t alias_length) {
+    if (alias == nullptr || alias_length == 0) return nullptr;
+    LockGuard guard;
+    MountEntry* mount = find_unique_alias(alias, alias_length);
+    return mount != nullptr ? mount->name : nullptr;
+}
+
+const char* volume_alias_for_mount(const char* name, size_t name_length) {
+    if (name == nullptr || name_length == 0) return nullptr;
+    LockGuard guard;
+    MountEntry* mount = find_mount(name, name_length);
+    if (mount == nullptr || mount->volume_alias[0] == '\0') return nullptr;
+    size_t alias_length = string_length(mount->volume_alias);
+    return find_unique_alias(mount->volume_alias, alias_length) == mount
+               ? mount->volume_alias
+               : nullptr;
 }
 
 size_t enumerate_mounts(const char** names, size_t max_names) {

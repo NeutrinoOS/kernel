@@ -31,6 +31,7 @@ struct Fat32Volume {
     uint32_t fs_info_sector;
     uint32_t total_clusters;
     uint32_t next_free_cluster;
+    char preferred_alias[12];
 };
 
 bool fat32_mount(Fat32Volume& volume, const fs::BlockDevice& device);

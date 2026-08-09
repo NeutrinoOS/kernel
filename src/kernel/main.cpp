@@ -269,12 +269,12 @@ static bool build_module_load_path(const char* boot_cwd,
     if (entry == nullptr || entry[0] == '\0') {
         return false;
     }
-    if (entry[0] == '/' || string_util::starts_with(entry, ".../")) {
+    if (entry[0] == '/' || string_util::starts_with(entry, "@sys/")) {
         return path_util::build_absolute_path(boot_cwd, entry, out);
     }
 
     char relative[path_util::kMaxPathLength];
-    const char prefix[] = ".../modules/";
+    const char prefix[] = "@sys/modules/";
     size_t used = sizeof(prefix) - 1;
     if (used >= sizeof(relative)) {
         return false;
@@ -295,7 +295,7 @@ static bool build_module_load_path(const char* boot_cwd,
 static void load_module_list_file(const char* boot_cwd) {
     char list_path[path_util::kMaxPathLength];
     if (!path_util::build_absolute_path(boot_cwd,
-                                        ".../modules/loads.txt",
+                                        "@sys/modules/loads.txt",
                                         list_path)) {
         return;
     }
@@ -737,7 +737,7 @@ static void kernel_main_stage2() {
         }
 
         char path[path_util::kMaxPathLength];
-        if (path_util::build_absolute_path(boot_cwd, ".../KERNEL.CFG", path)) {
+        if (path_util::build_absolute_path(boot_cwd, "@sys/KERNEL.CFG", path)) {
                 uint8_t file_buffer[1024];
                 size_t file_size = 0;
                 if (vfs::read_file(path, file_buffer, sizeof(file_buffer),
@@ -823,8 +823,8 @@ static void kernel_main_stage2() {
 
     if (root_ptr != nullptr) {
         constexpr const char* kDefaultInitFiles[] = {
-            ".../init.elf",
-            ".../init.bin",
+            "@sys/init.elf",
+            "@sys/init.bin",
         };
 
         for (const char* fallback : kDefaultInitFiles) {

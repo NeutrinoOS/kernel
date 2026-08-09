@@ -34,16 +34,9 @@ void pop_segment(size_t& count) {
     }
 }
 
-void reset_to_mount_root(size_t floor_count, size_t& count) {
-    if (count > floor_count) {
-        count = floor_count;
-    }
-}
-
 bool parse_into_segments(const char* path,
                          bool path_is_absolute,
                          size_t floor_count,
-                         const Segment* mount_root_segment,
                          Segment (&segments)[kMaxSegments],
                          size_t& count) {
     if (path == nullptr) {
@@ -76,21 +69,6 @@ bool parse_into_segments(const char* path,
             } else if (!path_is_absolute) {
                 // For relative paths we do not allow traversing above the root
                 // of the combined base path, so ignore extra ".." segments.
-            }
-            continue;
-        }
-        if (!path_is_absolute &&
-            len == 3 &&
-            start[0] == '.' &&
-            start[1] == '.' &&
-            start[2] == '.') {
-            if (mount_root_segment != nullptr &&
-                mount_root_segment->data != nullptr &&
-                mount_root_segment->length != 0) {
-                segments[0] = *mount_root_segment;
-                count = 1;
-            } else {
-                reset_to_mount_root(floor_count, count);
             }
             continue;
         }
@@ -139,6 +117,49 @@ size_t string_length(const char* str) {
     return len;
 }
 
+bool system_namespace_remainder(const char* path, const char*& remainder) {
+    if (path == nullptr) {
+        return false;
+    }
+
+    const char* cursor = path;
+    while (*cursor == '/') {
+        ++cursor;
+    }
+
+    constexpr char kSystemNamespace[] = "@sys";
+    for (size_t i = 0; i < sizeof(kSystemNamespace) - 1; ++i) {
+        if (cursor[i] == '\0' || cursor[i] != kSystemNamespace[i]) {
+            return false;
+        }
+    }
+
+    cursor += sizeof(kSystemNamespace) - 1;
+    if (*cursor != '\0' && *cursor != '/') {
+        return false;
+    }
+    while (*cursor == '/') {
+        ++cursor;
+    }
+    remainder = cursor;
+    return true;
+}
+
+bool volume_namespace_parts(const char* path,
+                            const char*& alias,
+                            size_t& alias_length,
+                            const char*& remainder) {
+    if (path == nullptr || path[0] != '@') return false;
+    alias = path + 1;
+    const char* cursor = alias;
+    while (*cursor != '\0' && *cursor != '/') ++cursor;
+    alias_length = static_cast<size_t>(cursor - alias);
+    if (alias_length == 0) return false;
+    while (*cursor == '/') ++cursor;
+    remainder = cursor;
+    return true;
+}
+
 }  // namespace
 
 bool build_absolute_path(const char* base,
@@ -155,31 +176,57 @@ bool build_absolute_path(const char* base,
     if (!parse_into_segments(effective_base,
                              true,
                              0,
-                             nullptr,
                              segments,
                              segment_count)) {
         return false;
     }
-    // "..." is the sysroot anchor, not the root of whichever mounted
-    // filesystem contains the current working directory.  In particular,
-    // commands must continue resolving through .../binary after cd'ing into
-    // a removable filesystem such as /USBMS_0_0.
     const char* root_mount = vfs::root_mount_name();
     if (root_mount != nullptr && root_mount[0] != '\0') {
         mount_root_segment = Segment{root_mount, string_length(root_mount)};
-    } else if (floor_count == 1 && segment_count > 0) {
-        // Preserve the old mount-root behavior only during early boot before
-        // a system root has been selected.
-        mount_root_segment = segments[0];
     }
 
     if (input == nullptr || input[0] == '\0') {
         return write_segments(segments, segment_count, out);
     }
 
+    // @sys is an OS namespace resolved to the configured system root mount.
+    // Keep the mount segment as the traversal floor so @sys/.. cannot escape
+    // into the VFS mount namespace.
+    const char* namespace_remainder = nullptr;
+    if (system_namespace_remainder(input, namespace_remainder)) {
+        if (mount_root_segment.data == nullptr ||
+            mount_root_segment.length == 0) {
+            return false;
+        }
+        segments[0] = mount_root_segment;
+        segment_count = 1;
+        if (!parse_into_segments(namespace_remainder,
+                                 true,
+                                 1,
+                                 segments,
+                                 segment_count)) {
+            return false;
+        }
+        return write_segments(segments, segment_count, out);
+    }
+
+    const char* alias = nullptr;
+    size_t alias_length = 0;
+    if (volume_namespace_parts(input, alias, alias_length, namespace_remainder)) {
+        const char* mount_name = vfs::mount_name_for_alias(alias, alias_length);
+        if (mount_name == nullptr) return false;
+        segments[0] = Segment{mount_name, string_length(mount_name)};
+        segment_count = 1;
+        if (!parse_into_segments(namespace_remainder, true, 1,
+                                 segments, segment_count)) {
+            return false;
+        }
+        return write_segments(segments, segment_count, out);
+    }
+
     if (input[0] == '/') {
         segment_count = 0;
-        if (!parse_into_segments(input, true, 0, nullptr, segments, segment_count)) {
+        if (!parse_into_segments(input, true, 0, segments, segment_count)) {
             return false;
         }
         return write_segments(segments, segment_count, out);
@@ -188,12 +235,92 @@ bool build_absolute_path(const char* base,
     if (!parse_into_segments(input,
                              false,
                              floor_count,
-                             &mount_root_segment,
                              segments,
                              segment_count)) {
         return false;
     }
     return write_segments(segments, segment_count, out);
+}
+
+bool build_user_path(const char* canonical,
+                     char (&out)[kMaxPathLength]) {
+    if (canonical == nullptr || canonical[0] != '/') {
+        return false;
+    }
+
+    size_t canonical_length = string_length(canonical);
+    if (canonical_length == 1) {
+        out[0] = '/';
+        out[1] = '\0';
+        return true;
+    }
+
+    const char* root_mount = vfs::root_mount_name();
+    if (root_mount == nullptr || root_mount[0] == '\0') {
+        if (canonical_length >= kMaxPathLength) {
+            return false;
+        }
+        memcpy(out, canonical, canonical_length + 1);
+        return true;
+    }
+
+    const char* first = canonical + 1;
+    const char* first_end = first;
+    while (*first_end != '\0' && *first_end != '/') {
+        ++first_end;
+    }
+    size_t first_length = static_cast<size_t>(first_end - first);
+    size_t root_length = string_length(root_mount);
+    bool explicit_system_mount =
+        first_length == root_length &&
+        memcmp(first, root_mount, root_length) == 0;
+
+    if (!explicit_system_mount && vfs::has_explicit_mount_prefix(canonical)) {
+        const char* alias = vfs::volume_alias_for_mount(first, first_length);
+        if (alias != nullptr) {
+            size_t alias_length = string_length(alias);
+            if (alias_length + 1 >= kMaxPathLength) return false;
+            out[0] = '@';
+            memcpy(out + 1, alias, alias_length);
+            size_t length = alias_length + 1;
+            const char* remainder = first_end;
+            while (*remainder == '/') ++remainder;
+            if (*remainder != '\0') {
+                size_t remainder_length = string_length(remainder);
+                if (length + 1 + remainder_length >= kMaxPathLength) return false;
+                out[length++] = '/';
+                memcpy(out + length, remainder, remainder_length);
+                length += remainder_length;
+            }
+            out[length] = '\0';
+            return true;
+        }
+        if (canonical_length >= kMaxPathLength) {
+            return false;
+        }
+        memcpy(out, canonical, canonical_length + 1);
+        return true;
+    }
+
+    constexpr char kSystemNamespace[] = "@sys";
+    size_t length = sizeof(kSystemNamespace) - 1;
+    memcpy(out, kSystemNamespace, length);
+
+    const char* remainder = explicit_system_mount ? first_end : canonical;
+    while (*remainder == '/') {
+        ++remainder;
+    }
+    if (*remainder != '\0') {
+        size_t remainder_length = string_length(remainder);
+        if (length + 1 + remainder_length >= kMaxPathLength) {
+            return false;
+        }
+        out[length++] = '/';
+        memcpy(out + length, remainder, remainder_length);
+        length += remainder_length;
+    }
+    out[length] = '\0';
+    return true;
 }
 
 }  // namespace path_util

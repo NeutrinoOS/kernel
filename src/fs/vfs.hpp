@@ -66,6 +66,10 @@ struct DirectoryHandle {
 };
 
 struct FilesystemOps {
+    // Returns a filesystem-provided preferred name for the global @ namespace,
+    // or nullptr when the filesystem has no preference. The VFS validates the
+    // value, reserves @sys, and suppresses conflicting aliases.
+    const char* (*get_volume_alias)(void* fs_context);
     bool (*list_directory)(void* fs_context,
                            const char* path,
                            DirEntry* entries,
@@ -124,6 +128,8 @@ bool register_mount(const char* name,
 void set_root_mount(const char* name);
 const char* root_mount_name();
 bool has_explicit_mount_prefix(const char* path);
+const char* mount_name_for_alias(const char* alias, size_t alias_length);
+const char* volume_alias_for_mount(const char* name, size_t name_length);
 size_t enumerate_mounts(const char** names, size_t max_names);
 
 bool list(const char* path,

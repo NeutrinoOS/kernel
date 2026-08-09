@@ -16,6 +16,8 @@ struct NeufsVolume {
     uint64_t next_free_metadata;
     uint64_t next_free_data;
     char name[32];
+    char preferred_alias[33];
+    size_t rvt_size;
     // Bitmap bookkeeping (stored within the meta section)
     uint64_t data_bitmap_offset;      // offset from start of volume where data bitmap lives
     uint64_t data_bitmap_size_bytes;  // size in bytes of the data bitmap
