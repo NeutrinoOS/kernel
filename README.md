@@ -147,7 +147,40 @@ enforced thread, descriptor, handle, address-space, and CPU-time limits with
 usage accounting; and a capability-gated tracer that can stop a process,
 inspect or modify its memory, and read a stopped thread's registers. External
 control requires the `ProcessControl` capability, while cross-process
-observation continues to require `Monitor`.
+observation requires `ProcessInspect` and tracing requires the separate
+`ProcessTrace` capability.
+
+## Capabilities and filesystem permissions
+
+Capabilities authorize privileged kernel operations; they are not file or
+disk ownership permissions. NeuFS reads, writes, creation, deletion, and ACL
+updates are authorized by NeuFS ACLs. Filesystems without ACL support retain
+their filesystem-specific behavior. `FilesystemOverride` is the explicit
+administrative ACL bypass and is intentionally separate from `IdentityManage`.
+
+The current capability bits are:
+
+This layout intentionally replaces the earlier coarse mask; persisted masks
+from pre-4.0 kernels must be recreated rather than reinterpreted.
+
+| Bit | Capability | Authority |
+| ---: | --- | --- |
+| 0 | `SystemSettings` | Global console and kernel settings |
+| 1 | `SystemPower` | Shutdown and reset |
+| 2 | `FilesystemMount` | Mount a filesystem |
+| 3–5 | `StorageRawRead`, `StorageRawWrite`, `StorageManage` | Raw media I/O and global storage management |
+| 6–9 | `ProcessSpawn`, `ProcessInspect`, `ProcessControl`, `ProcessTrace` | Process lifecycle, observation, control, and debugging |
+| 10–11 | `IdentityManage`, `ModuleLoad` | Users/principals and kernel modules |
+| 12–14 | `GraphicalSession`, `InputDevices`, `Audio` | Desktop display, input-seat, and audio access |
+| 15–16 | `Network`, `NetworkManage` | Network endpoints and network-device administration |
+| 17–18 | `Serial`, `Pci` | Direct serial and PCI access |
+| 19–20 | `SystemMonitor`, `KernelLog` | System telemetry and kernel logs |
+| 21 | `FilesystemOverride` | Administrative ACL bypass |
+
+Pipes, shared memory, and access-controlled VTYs are ordinary process/session
+primitives and require no capability. Raw storage capabilities govern direct
+device descriptors only; mounted-file access remains a filesystem permission
+decision.
 
 Syscall ABI 2.0 renumbers the complete syscall table into contiguous subsystem
 groups. ABI discovery remains at calls 0 and 1; core system services,

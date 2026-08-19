@@ -201,7 +201,7 @@ bool acl_allows(const process::Task& proc,
     if (principal.get() == nullptr ||
         capabilities::principal_allows(
             *principal.get(),
-            capabilities::CapabilityKind::SecurityManage)) {
+            capabilities::CapabilityKind::FilesystemOverride)) {
         return true;
     }
     if (!vfs::acl_supported(path)) {
@@ -240,7 +240,7 @@ bool acl_check_required(capabilities::Principal* principal) {
     return principal != nullptr &&
            !capabilities::principal_allows(
                *principal,
-               capabilities::CapabilityKind::SecurityManage);
+               capabilities::CapabilityKind::FilesystemOverride);
 }
 
 struct AclDecision {
@@ -249,6 +249,34 @@ struct AclDecision {
     bool delete_permission;
     bool edit;
 };
+
+bool initialize_created_acl(const process::Task& proc, const char* path) {
+    if (!vfs::acl_supported(path)) {
+        return true;
+    }
+    PrincipalSnapshot principal(proc);
+    if (!principal.valid()) {
+        return false;
+    }
+    if (principal.get() == nullptr) {
+        return true;
+    }
+    uint64_t machine_id = 0;
+    uint64_t local_id = 0;
+    if (!capabilities::principal_user_id(principal.get(),
+                                         machine_id,
+                                         local_id)) {
+        return false;
+    }
+    vfs::AclEntry owner{};
+    owner.machine_id = machine_id;
+    owner.local_id = local_id;
+    owner.read = vfs::AclValue::Allow;
+    owner.write = vfs::AclValue::Allow;
+    owner.delete_permission = vfs::AclValue::Allow;
+    owner.edit = vfs::AclValue::Allow;
+    return vfs::set_acl(path, &owner, 1);
+}
 
 AclDecision acl_snapshot_decision(capabilities::Principal* principal,
                                   const vfs::AclSnapshot& acl) {
@@ -345,6 +373,7 @@ static int32_t open_file_impl(process::Task& proc,
     }
     bool check_acl = acl_check_required(principal.get());
     bool opened = false;
+    bool created = false;
     if ((flags & OpenExclusive) == 0) {
         opened = vfs::open_file(local_path,
                                 vfs_handle,
@@ -356,9 +385,17 @@ static int32_t open_file_impl(process::Task& proc,
             acl_allows(proc, parent, vfs::AclPermission::Write)) {
             opened = vfs::create_file(local_path, vfs_handle);
             if (opened) {
+                created = true;
                 acl = {};
             }
         }
+    }
+    if (created && !initialize_created_acl(proc, local_path)) {
+        vfs::close_file(vfs_handle);
+        (void)vfs::remove_file(local_path);
+        proc.resources->file_handles[static_cast<size_t>(slot)].handle = {};
+        release_file_reservation(proc, static_cast<size_t>(slot));
+        return -1;
     }
     if (!opened) {
         vfs::close_file(vfs_handle);
@@ -411,6 +448,13 @@ int32_t create_file(process::Task& proc, const char* path) {
 
     vfs::FileHandle vfs_handle{};
     if (!vfs::create_file(local_path, vfs_handle)) {
+        proc.resources->file_handles[static_cast<size_t>(slot)].handle = {};
+        release_file_reservation(proc, static_cast<size_t>(slot));
+        return -1;
+    }
+    if (!initialize_created_acl(proc, local_path)) {
+        vfs::close_file(vfs_handle);
+        (void)vfs::remove_file(local_path);
         proc.resources->file_handles[static_cast<size_t>(slot)].handle = {};
         release_file_reservation(proc, static_cast<size_t>(slot));
         return -1;
@@ -852,9 +896,16 @@ bool create_directory(process::Task& proc, const char* path) {
         return false;
     }
     char parent[path_util::kMaxPathLength];
-    return parent_path(local_path, parent) &&
-           acl_allows(proc, parent, vfs::AclPermission::Write) &&
-           vfs::create_directory(local_path);
+    if (!parent_path(local_path, parent) ||
+        !acl_allows(proc, parent, vfs::AclPermission::Write) ||
+        !vfs::create_directory(local_path)) {
+        return false;
+    }
+    if (!initialize_created_acl(proc, local_path)) {
+        (void)vfs::remove_directory(local_path);
+        return false;
+    }
+    return true;
 }
 
 bool remove_file(process::Task& proc, const char* path) {
@@ -986,6 +1037,13 @@ int32_t create_file_at(process::Task& proc,
         release_file_reservation(proc, static_cast<size_t>(slot));
         return -1;
     }
+    if (!initialize_created_acl(proc, local_path)) {
+        vfs::close_file(vfs_handle);
+        (void)vfs::remove_file(local_path);
+        proc.resources->file_handles[static_cast<size_t>(slot)].handle = {};
+        release_file_reservation(proc, static_cast<size_t>(slot));
+        return -1;
+    }
 
     process::FileHandle& handle = proc.resources->file_handles[static_cast<size_t>(slot)];
     handle.handle = vfs_handle;
@@ -1048,6 +1106,9 @@ int64_t get_acl(process::Task& proc,
     if (!copy_path(proc, path, local_path)) {
         return -1;
     }
+    if (!acl_allows(proc, local_path, vfs::AclPermission::Read)) {
+        return -1;
+    }
     vfs::AclEntry entries[vfs::kMaxAclEntries]{};
     size_t count = 0;
     if (!vfs::get_acl(local_path,
@@ -1075,6 +1136,32 @@ bool set_acl(process::Task& proc,
     if (!copy_path(proc, path, local_path)) {
         return false;
     }
+    PrincipalSnapshot principal(proc);
+    if (!principal.valid()) {
+        return false;
+    }
+    bool override_acl = !acl_check_required(principal.get());
+    AclDecision caller_permissions{};
+    if (!override_acl) {
+        vfs::AclEntry current_entries[vfs::kMaxAclEntries]{};
+        size_t current_count = 0;
+        if (!vfs::get_acl(local_path,
+                          current_entries,
+                          vfs::kMaxAclEntries,
+                          current_count)) {
+            return false;
+        }
+        vfs::AclSnapshot current{};
+        current.supported = vfs::acl_supported(local_path);
+        current.count = current_count;
+        for (size_t i = 0; i < current_count; ++i) {
+            current.entries[i] = current_entries[i];
+        }
+        caller_permissions = acl_snapshot_decision(principal.get(), current);
+        if (!caller_permissions.edit || entry_count == 0) {
+            return false;
+        }
+    }
     vfs::AclEntry entries[vfs::kMaxAclEntries]{};
     if (entry_count != 0 &&
         !vm::copy_from_user(proc.cr3,
@@ -1083,6 +1170,20 @@ bool set_acl(process::Task& proc,
                             static_cast<size_t>(entry_count) *
                                 sizeof(vfs::AclEntry))) {
         return false;
+    }
+    if (!override_acl) {
+        for (size_t i = 0; i < entry_count; ++i) {
+            const vfs::AclEntry& entry = entries[i];
+            if ((entry.read == vfs::AclValue::Allow &&
+                 !caller_permissions.read) ||
+                (entry.write == vfs::AclValue::Allow &&
+                 !caller_permissions.write) ||
+                (entry.delete_permission == vfs::AclValue::Allow &&
+                 !caller_permissions.delete_permission) ||
+                entry.edit == vfs::AclValue::Allow) {
+                return false;
+            }
+        }
     }
     return vfs::set_acl(local_path,
                         entries,

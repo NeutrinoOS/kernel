@@ -366,10 +366,10 @@ bool prepare_spawn_config(process::Task& parent,
         child_principal = parent.resources->principal;
         return capabilities::principal_add_ref(child_principal);
     }
-    // SecurityManage is the kernel's explicit impersonation authority; the
+    // IdentityManage is the kernel's explicit impersonation authority; the
     // same permission is required by PrincipalSet and PrincipalCreate.
     if (!require_capability(parent,
-                            capabilities::CapabilityKind::SecurityManage,
+                            capabilities::CapabilityKind::IdentityManage,
                             frame)) {
         return false;
     }
@@ -390,33 +390,64 @@ bool prepare_spawn_config(process::Task& parent,
     return true;
 }
 
-bool descriptor_type_requires_hardware_access(uint32_t type) {
-    return type == descriptor::kTypeSerial ||
-           type == descriptor::kTypeBlockDevice ||
+bool descriptor_type_capability(
+    uint32_t type,
+    capabilities::CapabilityKind& out_kind) {
+    switch (type) {
+        case descriptor::kTypeSerial:
+            out_kind = capabilities::CapabilityKind::Serial;
+            return true;
+        case descriptor::kTypeBlockDevice:
+        case descriptor::kTypeDisk:
+        case descriptor::kTypePartition:
+            out_kind = capabilities::CapabilityKind::StorageRawRead;
+            return true;
+        case descriptor::kTypeNetDevice:
+            out_kind = capabilities::CapabilityKind::NetworkManage;
+            return true;
+        case descriptor::kTypeNetEndpoint:
+            out_kind = capabilities::CapabilityKind::Network;
+            return true;
+        case descriptor::kTypePci:
+            out_kind = capabilities::CapabilityKind::Pci;
+            return true;
+        case descriptor::kTypeAudioOutput:
+            out_kind = capabilities::CapabilityKind::Audio;
+            return true;
+        case descriptor::kTypeCpuStats:
+        case descriptor::kTypeSensor:
+            out_kind = capabilities::CapabilityKind::SystemMonitor;
+            return true;
+        case descriptor::kTypeTaskStats:
+            out_kind = capabilities::CapabilityKind::ProcessInspect;
+            return true;
+        case descriptor::kTypeKernelLog:
+            out_kind = capabilities::CapabilityKind::KernelLog;
+            return true;
+        case descriptor::kTypeGraphicalSession:
+        case descriptor::kTypeFramebuffer:
+            out_kind = capabilities::CapabilityKind::GraphicalSession;
+            return true;
+        case descriptor::kTypeKeyboard:
+        case descriptor::kTypeMouse:
+            out_kind = capabilities::CapabilityKind::InputDevices;
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool descriptor_handle_is_storage(process::Task& proc, uint32_t handle) {
+    uint16_t type = 0;
+    {
+        sync::LockGuard descriptor_guard(proc.resources->descriptor_lock);
+        if (!descriptor::get_type(proc.resources->descriptors, handle, type)) {
+            return false;
+        }
+    }
+    return type == descriptor::kTypeBlockDevice ||
            type == descriptor::kTypeDisk ||
-           type == descriptor::kTypePartition ||
-           type == descriptor::kTypeNetDevice ||
-           type == descriptor::kTypePci ||
-           type == descriptor::kTypeAudioOutput;
-}
-
-bool descriptor_type_requires_monitor_access(uint32_t type) {
-    return type == descriptor::kTypeCpuStats ||
-           type == descriptor::kTypeTaskStats ||
-           type == descriptor::kTypeKernelLog ||
-           type == descriptor::kTypeSensor;
-}
-
-bool descriptor_type_requires_stream_access(uint32_t type) {
-    return type == descriptor::kTypePipe ||
-           type == descriptor::kTypeSharedMemory ||
-           type == descriptor::kTypeNetEndpoint ||
-           type == descriptor::kTypeVty;
-}
-
-bool descriptor_type_requires_graphical_session_access(uint32_t type) {
-    return type == descriptor::kTypeGraphicalSession ||
-           type == descriptor::kTypeFramebuffer;
+           type == descriptor::kTypePartition;
 }
 
 bool console_property_requires_settings_access(uint32_t property) {
@@ -637,32 +668,9 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
             uint32_t type = static_cast<uint32_t>(frame.rdi & 0xFFFFu);
-            if (descriptor_type_requires_hardware_access(type) &&
-                !require_capability(*proc,
-                                    capabilities::CapabilityKind::HardwareAccess,
-                                    frame)) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
-            if (descriptor_type_requires_monitor_access(type) &&
-                !require_capability(*proc,
-                                    capabilities::CapabilityKind::Monitor,
-                                    frame)) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
-            if (descriptor_type_requires_stream_access(type) &&
-                !require_capability(*proc,
-                                    capabilities::CapabilityKind::Stream,
-                                    frame)) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
-            if (descriptor_type_requires_graphical_session_access(type) &&
-                !require_capability(
-                    *proc,
-                    capabilities::CapabilityKind::GraphicalSession,
-                    frame)) {
+            capabilities::CapabilityKind required{};
+            if (descriptor_type_capability(type, required) &&
+                !require_capability(*proc, required, frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -686,12 +694,13 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
+            uint32_t handle =
+                static_cast<uint32_t>(frame.rdi & 0xFFFFFFFFu);
             sync::LockGuard descriptor_guard(
                 proc->resources->descriptor_lock);
             int64_t result = descriptor::read(*proc,
                                               proc->resources->descriptors,
-                                              static_cast<uint32_t>(frame.rdi &
-                                                                     0xFFFFFFFFu),
+                                              handle,
                                               frame.rsi,
                                               frame.rdx,
                                               frame.r10);
@@ -708,12 +717,21 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
+            uint32_t handle =
+                static_cast<uint32_t>(frame.rdi & 0xFFFFFFFFu);
+            if (descriptor_handle_is_storage(*proc, handle) &&
+                 !require_capability(
+                     *proc,
+                     capabilities::CapabilityKind::StorageRawWrite,
+                     frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             sync::LockGuard descriptor_guard(
                 proc->resources->descriptor_lock);
             int64_t result = descriptor::write(*proc,
                                                proc->resources->descriptors,
-                                               static_cast<uint32_t>(frame.rdi &
-                                                                      0xFFFFFFFFu),
+                                               handle,
                                                frame.rsi,
                                                frame.rdx,
                                                frame.r10);
@@ -801,12 +819,14 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
+            uint32_t handle =
+                static_cast<uint32_t>(frame.rdi & 0xFFFFFFFFu);
             sync::LockGuard descriptor_guard(
                 proc->resources->descriptor_lock);
             int result = descriptor::get_property(
                 *proc,
                 proc->resources->descriptors,
-                static_cast<uint32_t>(frame.rdi & 0xFFFFFFFFu),
+                handle,
                 static_cast<uint32_t>(frame.rsi & 0xFFFFFFFFu),
                 frame.rdx,
                 frame.r10);
@@ -835,7 +855,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 console_property_requires_settings_access(property) &&
                 !require_capability(
                     *proc,
-                    capabilities::CapabilityKind::SysSettingsWrite,
+                    capabilities::CapabilityKind::SystemSettings,
                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -878,9 +898,14 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            if (!require_capability(*proc,
-                                    capabilities::CapabilityKind::HardwareAccess,
-                                    frame)) {
+            if (!require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::FilesystemMount,
+                    frame) ||
+                !require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::StorageRawRead,
+                    frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -920,9 +945,18 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            if (!require_capability(*proc,
-                                    capabilities::CapabilityKind::HardwareAccess,
-                                    frame)) {
+            if (!require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::StorageManage,
+                    frame) ||
+                !require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::FilesystemMount,
+                    frame) ||
+                !require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::StorageRawRead,
+                    frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -945,12 +979,7 @@ Result handle_syscall(SyscallFrame& frame) {
         case SystemCall::FileOpenFlags: {
             process::Task* proc = process::current();
             uint32_t flags = static_cast<uint32_t>(frame.rsi);
-            if (proc == nullptr ||
-                ((flags & (file_io::OpenWrite | file_io::OpenCreate)) != 0 &&
-                 !require_capability(
-                     *proc,
-                     capabilities::CapabilityKind::FileSystemWrite,
-                     frame))) {
+            if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -1024,12 +1053,6 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            if (!require_capability(*proc,
-                                    capabilities::CapabilityKind::FileSystemWrite,
-                                    frame)) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
             bool ok =
                 file_io::sync_file(*proc, static_cast<uint32_t>(frame.rdi));
             frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
@@ -1039,7 +1062,7 @@ Result handle_syscall(SyscallFrame& frame) {
             process::Task* proc = process::current();
             if (proc != nullptr &&
                 !require_capability(*proc,
-                                    capabilities::CapabilityKind::FileSystemWrite,
+                                    capabilities::CapabilityKind::StorageManage,
                                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1052,7 +1075,7 @@ Result handle_syscall(SyscallFrame& frame) {
             process::Task* proc = process::current();
             if (proc != nullptr &&
                 !require_capability(*proc,
-                                    capabilities::CapabilityKind::SysSettingsWrite,
+                                    capabilities::CapabilityKind::SystemPower,
                                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1110,12 +1133,25 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::ModuleCount: {
+            process::Task* proc = process::current();
+            if (proc == nullptr ||
+                !require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::SystemMonitor,
+                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             frame.rax = static_cast<uint64_t>(kernel_module::loaded_count());
             return Result::Continue;
         }
         case SystemCall::ModuleInfo: {
             process::Task* proc = process::current();
-            if (proc == nullptr || frame.rsi == 0) {
+            if (proc == nullptr || frame.rsi == 0 ||
+                !require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::SystemMonitor,
+                    frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -1170,12 +1206,6 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            if (!require_capability(*proc,
-                                    capabilities::CapabilityKind::FileSystemWrite,
-                                    frame)) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
             int64_t result =
                 file_io::write_file(*proc,
                                     static_cast<uint32_t>(frame.rdi),
@@ -1187,12 +1217,6 @@ Result handle_syscall(SyscallFrame& frame) {
         case SystemCall::FileCreate: {
             process::Task* proc = process::current();
             if (proc == nullptr) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
-            if (!require_capability(*proc,
-                                    capabilities::CapabilityKind::FileSystemWrite,
-                                    frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -1595,12 +1619,6 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            if (!require_capability(*proc,
-                                    capabilities::CapabilityKind::FileSystemWrite,
-                                    frame)) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
             uint32_t parent = static_cast<uint32_t>(frame.rdi);
             const char* name = reinterpret_cast<const char*>(frame.rsi);
             int32_t handle = file_io::create_file_at(*proc, parent, name);
@@ -1610,12 +1628,6 @@ Result handle_syscall(SyscallFrame& frame) {
         case SystemCall::DirectoryCreate: {
             process::Task* proc = process::current();
             if (proc == nullptr) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
-            if (!require_capability(*proc,
-                                    capabilities::CapabilityKind::FileSystemWrite,
-                                    frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -1631,12 +1643,6 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            if (!require_capability(*proc,
-                                    capabilities::CapabilityKind::FileSystemWrite,
-                                    frame)) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
             const char* path = reinterpret_cast<const char*>(frame.rdi);
             frame.rax = file_io::remove_file(*proc, path)
                             ? 0
@@ -1645,11 +1651,7 @@ Result handle_syscall(SyscallFrame& frame) {
         }
         case SystemCall::FileGetAcl: {
             process::Task* proc = process::current();
-            if (proc == nullptr ||
-                !require_capability(
-                    *proc,
-                    capabilities::CapabilityKind::SecurityManage,
-                    frame)) {
+            if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -1662,15 +1664,7 @@ Result handle_syscall(SyscallFrame& frame) {
         }
         case SystemCall::FileSetAcl: {
             process::Task* proc = process::current();
-            if (proc == nullptr ||
-                !require_capability(
-                    *proc,
-                    capabilities::CapabilityKind::SecurityManage,
-                    frame) ||
-                !require_capability(
-                    *proc,
-                    capabilities::CapabilityKind::FileSystemWrite,
-                    frame)) {
+            if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -1686,12 +1680,6 @@ Result handle_syscall(SyscallFrame& frame) {
         case SystemCall::DirectoryRemove: {
             process::Task* proc = process::current();
             if (proc == nullptr) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
-            if (!require_capability(*proc,
-                                    capabilities::CapabilityKind::FileSystemWrite,
-                                    frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -2124,7 +2112,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 (target->pid != proc->pid &&
                  !require_capability(
                      *proc,
-                     capabilities::CapabilityKind::Monitor,
+                     capabilities::CapabilityKind::ProcessInspect,
                      frame))) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -2178,7 +2166,7 @@ Result handle_syscall(SyscallFrame& frame) {
             capabilities::CapabilityKind permission =
                 operation == SystemCall::ProcessSetLimits
                     ? capabilities::CapabilityKind::ProcessControl
-                    : capabilities::CapabilityKind::Monitor;
+                    : capabilities::CapabilityKind::ProcessInspect;
             if (proc == nullptr || target == nullptr || frame.rsi == 0 ||
                 (external &&
                  !require_capability(*proc, permission, frame))) {
@@ -2240,7 +2228,7 @@ Result handle_syscall(SyscallFrame& frame) {
             if (proc == nullptr ||
                 !require_capability(
                     *proc,
-                    capabilities::CapabilityKind::ProcessControl,
+                    capabilities::CapabilityKind::ProcessTrace,
                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -2297,7 +2285,7 @@ Result handle_syscall(SyscallFrame& frame) {
             process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
-                                    capabilities::CapabilityKind::SecurityManage,
+                                    capabilities::CapabilityKind::IdentityManage,
                                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -2317,7 +2305,7 @@ Result handle_syscall(SyscallFrame& frame) {
             process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
-                                    capabilities::CapabilityKind::SecurityManage,
+                                    capabilities::CapabilityKind::IdentityManage,
                                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -2340,10 +2328,7 @@ Result handle_syscall(SyscallFrame& frame) {
         }
         case SystemCall::CapabilityGrant: {
             process::Task* proc = process::current();
-            if (proc == nullptr ||
-                !require_capability(*proc,
-                                    capabilities::CapabilityKind::SecurityManage,
-                                    frame)) {
+            if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -2377,10 +2362,7 @@ Result handle_syscall(SyscallFrame& frame) {
         }
         case SystemCall::CapabilityPass: {
             process::Task* proc = process::current();
-            if (proc == nullptr ||
-                !require_capability(*proc,
-                                    capabilities::CapabilityKind::SecurityManage,
-                                    frame)) {
+            if (proc == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -2392,6 +2374,16 @@ Result handle_syscall(SyscallFrame& frame) {
                 handle_count = kMaxHandles;
             }
             if (child == nullptr || !child->has_context) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            bool own_child = child->resources != nullptr &&
+                             child->resources->parent_process_id == proc->pid;
+            if (!own_child &&
+                !require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::ProcessControl,
+                    frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -2424,7 +2416,7 @@ Result handle_syscall(SyscallFrame& frame) {
             process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
-                                    capabilities::CapabilityKind::SecurityManage,
+                                    capabilities::CapabilityKind::IdentityManage,
                                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -2446,7 +2438,7 @@ Result handle_syscall(SyscallFrame& frame) {
             process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
-                                    capabilities::CapabilityKind::SecurityManage,
+                                    capabilities::CapabilityKind::IdentityManage,
                                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -2467,7 +2459,7 @@ Result handle_syscall(SyscallFrame& frame) {
             process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
-                                    capabilities::CapabilityKind::SecurityManage,
+                                    capabilities::CapabilityKind::IdentityManage,
                                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -2485,7 +2477,7 @@ Result handle_syscall(SyscallFrame& frame) {
             process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
-                                    capabilities::CapabilityKind::SecurityManage,
+                                    capabilities::CapabilityKind::IdentityManage,
                                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -2516,7 +2508,7 @@ Result handle_syscall(SyscallFrame& frame) {
             process::Task* proc = process::current();
             if (proc == nullptr ||
                 !require_capability(*proc,
-                                    capabilities::CapabilityKind::SecurityManage,
+                                    capabilities::CapabilityKind::IdentityManage,
                                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;

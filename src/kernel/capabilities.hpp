@@ -10,19 +10,33 @@ constexpr CapabilityMask kFullPermissions = ~CapabilityMask{0};
 
 // Compile-time capability kinds understood by the kernel.
 enum class CapabilityKind : uint16_t {
-    SysSettingsWrite = 0,
-    BlockDeviceReadWrite = 1,
-    ProcessSpawn = 2,
-    HardwareAccess = 3,
-    SecurityManage = 4,
-    Stream = 5,
-    Monitor = 6,
-    FileSystemWrite = 7,
-    ModuleLoad = 8,
-    GraphicalSession = 9,
-    ProcessControl = 10,
+    SystemSettings = 0,
+    SystemPower = 1,
+    FilesystemMount = 2,
+    StorageRawRead = 3,
+    StorageRawWrite = 4,
+    StorageManage = 5,
+    ProcessSpawn = 6,
+    ProcessInspect = 7,
+    ProcessControl = 8,
+    ProcessTrace = 9,
+    IdentityManage = 10,
+    ModuleLoad = 11,
+    GraphicalSession = 12,
+    InputDevices = 13,
+    Audio = 14,
+    Network = 15,
+    NetworkManage = 16,
+    Serial = 17,
+    Pci = 18,
+    SystemMonitor = 19,
+    KernelLog = 20,
+    FilesystemOverride = 21,
     Count,
 };
+
+static_assert(static_cast<uint16_t>(CapabilityKind::Count) <= 64,
+              "capability mask exceeds its 64-bit storage");
 
 struct Principal {
     void* backing_user;  // optional user pointer (users::User*), may be null

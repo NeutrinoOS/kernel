@@ -52,7 +52,7 @@ bool user_database_loading() {
 }
 
 constexpr uint32_t kMagic = 0x4E544455;  // 'NTDU'
-constexpr uint16_t kVersion = 3;
+constexpr uint16_t kVersion = 4;
 constexpr uint16_t kLegacyVersion = 2;
 constexpr uint16_t kLegacyVersion1 = 1;
 constexpr uint64_t kLegacyAllCapabilities = (1ull << 3) - 1;

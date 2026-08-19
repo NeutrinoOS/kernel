@@ -330,9 +330,9 @@ $(LIVE_ROOTFS_IMG): live-package-archives $(NEUTRINO_PACKAGES_ROOT)/build-local-
 	cp $(KERNEL_MODULE_LOADS) $(LIVE_ROOTFS_STAGE)/modules/loads.txt
 	cp -a $(LIVE_REPO_DIR)/. $(LIVE_ROOTFS_STAGE)/packages/
 	# The live medium uses an ephemeral RAM write overlay at runtime. Seed it
-	# with an explicit valid, empty v3 credential store so init can distinguish
+	# with an explicit valid, empty v4 credential store so init can distinguish
 	# intentional bootstrap mode from a missing, truncated, or corrupt database.
-	printf '\125\104\124\116\003\000\200\000\000\000\000\000\001\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\000\000\000\000' > $(LIVE_ROOTFS_STAGE)/system/users.ntd
+	printf '\125\104\124\116\004\000\200\000\000\000\000\000\001\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\000\000\000\000' > $(LIVE_ROOTFS_STAGE)/system/users.ntd
 	rm -f $@
 	truncate -s $(LIVE_ROOTFS_SIZE) $@
 	mkfs.fat -F 32 --mbr=y $@
