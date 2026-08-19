@@ -890,8 +890,8 @@ static void kernel_main_stage2() {
                 // Keep the bootstrap process on the BSP. AP run queues are
                 // not yet reliable during early userspace startup; placing
                 // init there can leave the kernel alive (including CPU-0
-                // poll workers) while login never executes. Children inherit
-                // this affinity through the process syscall path.
+                // poll workers) while login never executes. Independently
+                // spawned applications are distributed by the scheduler.
                 proc->preferred_cpu = 0;
                 log_message(LogLevel::Info,
                             "Boot: launched init task from %s (%x bytes) on CPU 0",

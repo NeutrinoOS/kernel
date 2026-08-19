@@ -480,9 +480,12 @@ Task* create_user_thread(Task& owner,
     thread->resources = owner.resources;
 
     thread->is_thread = true;
-    // Keep cooperating userspace threads on the owning process's CPU until
-    // the SMP scheduler has a measured, workload-safe migration policy.
-    thread->preferred_cpu = owner.preferred_cpu;
+    // Keep every thread belonging to init on the BSP.  Init's login loop and
+    // service manager share process resources during early userspace startup,
+    // and splitting those threads across CPUs can leave the login thread no
+    // longer making progress.  Threads in ordinary applications remain free
+    // for the scheduler to distribute across CPUs.
+    thread->preferred_cpu = owner.pid == 1 ? owner.preferred_cpu : UINT32_MAX;
     thread->fs_base = tls_base != 0 ? tls_base : owner.fs_base;
     string_util::copy(thread->image_path,
                       sizeof(thread->image_path),

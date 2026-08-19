@@ -194,6 +194,10 @@ void enqueue_locked(process::Task* proc) {
     }
     if (proc->preferred_cpu == UINT32_MAX || proc->preferred_cpu >= total) {
         uint32_t choice = __atomic_fetch_add(&g_rr_assign, 1, __ATOMIC_RELAXED);
+        // Explicitly pinned work (notably init and early kernel workers) keeps
+        // its CPU.  Ordinary processes and application threads must use the
+        // whole machine: excluding the BSP collapses all userspace onto one
+        // core on common dual-core laptops.
         proc->preferred_cpu = static_cast<uint32_t>(choice % total);
     }
     size_t target = static_cast<size_t>(proc->preferred_cpu % total);
@@ -210,18 +214,16 @@ size_t current_cpu_index() {
 
 size_t runnable_user_task_count_locked(process::Task* current_proc) {
     size_t total = 0;
-    for (size_t q = 0; q < percpu::kMaxCpus; ++q) {
-        RunQueue& rq = g_run_queues[q];
-        size_t idx = rq.head;
-        for (size_t i = 0; i < rq.count; ++i) {
-            process::Task* proc = rq.items[idx];
-            if (proc != nullptr &&
-                !proc->is_kernel_task &&
-                process::load_state(*proc) == process::State::Ready) {
-                ++total;
-            }
-            idx = (idx + 1) % process::kMaxTasks;
+    RunQueue& rq = queue_for_cpu(current_cpu_index());
+    size_t idx = rq.head;
+    for (size_t i = 0; i < rq.count; ++i) {
+        process::Task* proc = rq.items[idx];
+        if (proc != nullptr &&
+            !proc->is_kernel_task &&
+            process::load_state(*proc) == process::State::Ready) {
+            ++total;
         }
+        idx = (idx + 1) % process::kMaxTasks;
     }
     if (current_proc != nullptr &&
         !current_proc->is_kernel_task &&

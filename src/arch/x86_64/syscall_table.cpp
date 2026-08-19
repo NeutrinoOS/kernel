@@ -254,16 +254,6 @@ uint64_t place_args_on_stack(process::Task& child, const char* args) {
     return dest;
 }
 
-uint32_t pick_child_cpu(process::Task* parent) {
-    if (parent != nullptr && parent->preferred_cpu != UINT32_MAX) {
-        return parent->preferred_cpu;
-    }
-    if (auto* cpu = percpu::current_cpu()) {
-        return cpu->index;
-    }
-    return UINT32_MAX;
-}
-
 bool mapping_within_limit(const process::Task& proc, size_t length) {
     if (proc.resources == nullptr || length == 0) {
         return false;
@@ -1329,7 +1319,10 @@ Result handle_syscall(SyscallFrame& frame) {
             child->context.rax = 0;
             child->has_context = true;
 
-            child->preferred_cpu = pick_child_cpu(proc);
+            // A child is an independent scheduling entity.  Leave it
+            // unassigned so enqueue() can distribute process trees instead
+            // of pinning every descendant of init to the same CPU.
+            child->preferred_cpu = UINT32_MAX;
             proc->waiting_on = child;
             process::store_state(*proc, process::State::Blocked);
             bool transferred = descriptor::transfer_console_owner(*proc, *child);
@@ -1451,7 +1444,10 @@ Result handle_syscall(SyscallFrame& frame) {
             child->context.rax = 0;
             child->has_context = true;
 
-            child->preferred_cpu = pick_child_cpu(proc);
+            // Asynchronous children need independent CPU placement too;
+            // inheriting the parent's assignment collapses the entire
+            // desktop session onto one run queue.
+            child->preferred_cpu = UINT32_MAX;
             process::store_state(*child, process::State::Ready);
             scheduler::enqueue(child);
 

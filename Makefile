@@ -88,7 +88,7 @@ QEMU_AUDIO_ARGS := -audiodev $(QEMU_AUDIO_DRIVER),id=audio0,$(QEMU_AUDIO_OPTIONS
 		-device ich9-intel-hda -device hda-output,audiodev=audio0
 endif
 QEMU_BASE_ARGS := -m 1G -serial stdio \
-		-smp 4 -bios $(QEMU_BIOS) \
+		-smp 2 -bios $(QEMU_BIOS) \
 		$(QEMU_STORAGE_ARGS) \
 		-enable-kvm -display sdl \
 		-machine pc -cpu qemu64,+apic,+rdrand \
