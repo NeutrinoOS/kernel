@@ -2,6 +2,7 @@
 
 #include "arch/x86_64/cpu_features.hpp"
 #include "arch/x86_64/gdt.hpp"
+#include "arch/x86_64/percpu.hpp"
 #include "arch/x86_64/tss.hpp"
 #include "process.hpp"
 
@@ -37,6 +38,10 @@ namespace userspace {
 [[noreturn]] void enter_task(process::Task& proc) {
     set_rsp0(proc.kernel_stack_top);
     cpu::restore_fpu_state(proc.fpu_state);
+    // enter_task() is a direct IRET path rather than the paired return in
+    // syscall_entry, so it must not inherit whichever SWAPGS orientation led
+    // the scheduler into its run loop.
+    percpu::prepare_user_entry();
     if (proc.has_context) {
         userspace_enter_frame(&proc.context);
     }

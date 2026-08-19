@@ -49,6 +49,7 @@ Cpu* current_cpu();
 Cpu* find_by_lapic(uint32_t lapic_id);
 size_t cpu_count();
 void set_current_cpu(Cpu* cpu);
+void prepare_user_entry();
 void setup_cpu_tss(Cpu& cpu);
 void setup_cpu_gdt(Cpu& cpu);
 void set_current_task(process::Task* proc);

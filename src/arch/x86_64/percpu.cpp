@@ -98,6 +98,23 @@ void set_current_cpu(Cpu* cpu) {
     }
 }
 
+void prepare_user_entry() {
+    // Keep the two MSR writes atomic with respect to maskable interrupts.  An
+    // interrupt between clearing GS_BASE and installing KERNEL_GS_BASE could
+    // otherwise observe no per-CPU pointer at all.
+    asm volatile("cli" ::: "memory");
+    Cpu* cpu = current_cpu();
+    if (cpu == nullptr) {
+        return;
+    }
+    // Direct userspace entry can be reached either from the ordinary kernel
+    // run loop (GS=0, KERNEL_GS=cpu) or after a terminating syscall abandons
+    // its return frame (GS=cpu, KERNEL_GS=0).  Establish the user-side state
+    // explicitly so the next SYSCALL's SWAPGS always exposes the CPU pointer.
+    write_msr(kMsrGsBase, 0);
+    write_msr(kMsrKernelGsBase, reinterpret_cast<uint64_t>(cpu));
+}
+
 void init_bsp(uint32_t lapic_id, uint32_t processor_id) {
     Cpu* cpu = register_cpu(lapic_id, processor_id);
     if (cpu == nullptr) {
