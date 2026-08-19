@@ -14,6 +14,7 @@ namespace {
 constexpr uint64_t kPageSize = BuddyAllocator::kPageSize;
 constexpr uint64_t kKernelPoolTargetSize = 64ull * 1024 * 1024;
 constexpr size_t kKernelPoolPages = kKernelPoolTargetSize / kPageSize;
+constexpr size_t kUserPageReserve = 256;
 
 BuddyAllocator g_kernel_buddy;
 BuddyAllocator g_user_buddy;
@@ -23,6 +24,7 @@ uint64_t g_kernel_pool_base = 0;
 uint64_t g_kernel_pool_size = 0;
 bool g_initialized = false;
 bool g_kernel_ready = false;
+UserPageReclaimer g_user_page_reclaimer = nullptr;
 
 volatile int g_alloc_lock = 0;
 
@@ -417,9 +419,36 @@ uint64_t alloc_user_page() {
     if (!g_initialized) {
         return 0;
     }
+
+    UserPageReclaimer reclaimer = nullptr;
+    size_t free_pages = 0;
     lock_alloc();
-    uint64_t phys = g_user_buddy.alloc_pages(1);
+    free_pages = g_user_buddy.free_pages();
+    reclaimer = g_user_page_reclaimer;
     unlock_alloc();
+
+    // File-cache pages are opportunistic. Keep a small emergency reserve and
+    // ask the registered shrinker to surrender clean pages before ordinary VM
+    // allocations have to fail. The callback runs without the allocator lock
+    // because releasing a cache page re-enters free_user_page().
+    if (reclaimer != nullptr && free_pages <= kUserPageReserve) {
+        size_t target = kUserPageReserve - free_pages + 1;
+        (void)reclaimer(target);
+    }
+
+    lock_alloc();
+    uint64_t phys = g_user_buddy.free_pages() != 0
+                        ? g_user_buddy.alloc_pages(1)
+                        : 0;
+    unlock_alloc();
+
+    if (phys == 0 && reclaimer != nullptr && reclaimer(1) != 0) {
+        lock_alloc();
+        phys = g_user_buddy.free_pages() != 0
+                   ? g_user_buddy.alloc_pages(1)
+                   : 0;
+        unlock_alloc();
+    }
     if (phys == 0) {
         log_message(LogLevel::Error,
                     "User pool alloc failed (free=%llu pages max_order=%u ranges=%llu)",
@@ -428,6 +457,20 @@ uint64_t alloc_user_page() {
                     static_cast<unsigned long long>(g_user_buddy.range_count()));
     }
     return phys;
+}
+
+bool register_user_page_reclaimer(UserPageReclaimer reclaimer) {
+    if (reclaimer == nullptr) {
+        return false;
+    }
+    lock_alloc();
+    bool accepted = g_user_page_reclaimer == nullptr ||
+                    g_user_page_reclaimer == reclaimer;
+    if (accepted) {
+        g_user_page_reclaimer = reclaimer;
+    }
+    unlock_alloc();
+    return accepted;
 }
 
 void free_user_page(uint64_t phys) {

@@ -5,6 +5,8 @@
 
 namespace memory {
 
+using UserPageReclaimer = size_t (*)(size_t target_pages);
+
 void init();
 bool kernel_allocator_ready();
 
@@ -19,6 +21,7 @@ void free_kernel(void* ptr);
 
 uint64_t alloc_user_page();
 void free_user_page(uint64_t phys);
+bool register_user_page_reclaimer(UserPageReclaimer reclaimer);
 
 uint64_t kernel_pool_base();
 uint64_t kernel_pool_size();
