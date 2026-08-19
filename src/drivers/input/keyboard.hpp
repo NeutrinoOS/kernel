@@ -9,6 +9,7 @@ namespace keyboard {
 
 void init();
 void handle_irq();
+void poll_controller();
 size_t read(uint32_t slot,
             descriptor_defs::KeyboardEvent* buffer,
             size_t max_events);

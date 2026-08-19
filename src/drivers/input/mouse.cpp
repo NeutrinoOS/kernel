@@ -27,8 +27,13 @@ constexpr uint8_t kCommandWriteConfig = 0x60;
 constexpr uint8_t kCommandWriteAux = 0xD4;
 
 constexpr uint8_t kMouseSetDefaults = 0xF6;
+constexpr uint8_t kMouseDisableStream = 0xF5;
 constexpr uint8_t kMouseEnableStream = 0xF4;
+constexpr uint8_t kMouseGetInfo = 0xE9;
+constexpr uint8_t kMouseSetScale11 = 0xE6;
+constexpr uint8_t kMouseReset = 0xFF;
 constexpr uint8_t kMouseAck = 0xFA;
+constexpr uint8_t kMouseSelfTestPassed = 0xAA;
 
 struct SlotBuffer {
     Event data[kBufferSize];
@@ -43,6 +48,7 @@ uint8_t g_packet[3];
 uint8_t g_packet_index = 0;
 bool g_have_last_event = false;
 Event g_last_event{};
+bool g_elan_detected = false;
 
 bool wait_input_clear() {
     for (size_t i = 0; i < 100000; ++i) {
@@ -53,41 +59,123 @@ bool wait_input_clear() {
     return false;
 }
 
-bool wait_output_full() {
-    for (size_t i = 0; i < 100000; ++i) {
-        if ((inb(kStatusPort) & kStatusOutputFull) != 0) {
-            return true;
+bool write_command(uint8_t cmd) {
+    if (!wait_input_clear()) {
+        return false;
+    }
+    outb(kStatusPort, cmd);
+    return true;
+}
+
+bool write_data(uint8_t data) {
+    if (!wait_input_clear()) {
+        return false;
+    }
+    outb(kDataPort, data);
+    return true;
+}
+
+bool read_data(uint8_t& data, bool auxiliary_only = false,
+               size_t attempts = 100000) {
+    for (size_t i = 0; i < attempts; ++i) {
+        uint8_t status = inb(kStatusPort);
+        if ((status & kStatusOutputFull) == 0) {
+            continue;
         }
+        uint8_t value = inb(kDataPort);
+        if (auxiliary_only && (status & kStatusAuxData) == 0) {
+            continue;
+        }
+        data = value;
+        return true;
     }
     return false;
 }
 
-void write_command(uint8_t cmd) {
-    if (!wait_input_clear()) {
-        return;
+void drain_output() {
+    for (size_t i = 0; i < 32; ++i) {
+        if ((inb(kStatusPort) & kStatusOutputFull) == 0) {
+            return;
+        }
+        (void)inb(kDataPort);
     }
-    outb(kStatusPort, cmd);
-}
-
-void write_data(uint8_t data) {
-    if (!wait_input_clear()) {
-        return;
-    }
-    outb(kDataPort, data);
-}
-
-uint8_t read_data() {
-    if (!wait_output_full()) {
-        return 0;
-    }
-    return inb(kDataPort);
 }
 
 bool write_mouse(uint8_t data) {
-    write_command(kCommandWriteAux);
-    write_data(data);
-    uint8_t ack = read_data();
-    return ack == kMouseAck;
+    if (!write_command(kCommandWriteAux) || !write_data(data)) {
+        return false;
+    }
+    uint8_t ack = 0;
+    return read_data(ack, true) && ack == kMouseAck;
+}
+
+bool get_mouse_info(uint8_t (&info)[3]) {
+    if (!write_mouse(kMouseGetInfo)) {
+        return false;
+    }
+    return read_data(info[0], true) && read_data(info[1], true) &&
+           read_data(info[2], true);
+}
+
+bool detect_elan() {
+    // ELAN PS/2 touchpads answer this vendor-defined magic knock. Keep the
+    // device in relative mode afterwards because Neutrino currently exposes
+    // relative mouse events to the desktop.
+    if (!write_mouse(kMouseDisableStream) ||
+        !write_mouse(kMouseSetScale11) ||
+        !write_mouse(kMouseSetScale11) ||
+        !write_mouse(kMouseSetScale11)) {
+        return false;
+    }
+
+    uint8_t info[3]{};
+    if (!get_mouse_info(info)) {
+        return false;
+    }
+    return info[0] == 0x3C && info[1] == 0x03 &&
+           (info[2] == 0xC8 || info[2] == 0x00);
+}
+
+bool configure_auxiliary_port(bool reset_device) {
+    drain_output();
+    if (!write_command(kCommandEnableAux) ||
+        !write_command(kCommandReadConfig)) {
+        return false;
+    }
+
+    uint8_t config = 0;
+    if (!read_data(config)) {
+        return false;
+    }
+    config |= (1u << 1);   // enable IRQ12
+    config &= ~(1u << 5);  // enable mouse clock
+    if (!write_command(kCommandWriteConfig) || !write_data(config)) {
+        return false;
+    }
+
+    if (reset_device && write_mouse(kMouseReset)) {
+        uint8_t self_test = 0;
+        uint8_t device_id = 0;
+        if (!read_data(self_test, true, 10000000) ||
+            self_test != kMouseSelfTestPassed) {
+            log_message(LogLevel::Warn,
+                        "Mouse: auxiliary device reset did not complete");
+        } else {
+            // The device ID follows BAT. It is diagnostic only; some
+            // firmware-backed controllers omit it.
+            (void)read_data(device_id, true);
+        }
+    }
+
+    g_elan_detected = detect_elan();
+    if (!write_mouse(kMouseSetDefaults)) {
+        log_message(LogLevel::Warn, "Mouse: failed to set defaults");
+    }
+    if (!write_mouse(kMouseEnableStream)) {
+        log_message(LogLevel::Warn, "Mouse: failed to enable streaming");
+        return false;
+    }
+    return true;
 }
 
 void enqueue(uint32_t slot, const Event& ev) {
@@ -146,19 +234,12 @@ void init() {
     g_have_last_event = false;
     g_last_event = {};
 
-    write_command(kCommandEnableAux);
-    write_command(kCommandReadConfig);
-    uint8_t config = read_data();
-    config |= (1u << 1);   // enable IRQ12
-    config &= ~(1u << 5);  // enable mouse clock
-    write_command(kCommandWriteConfig);
-    write_data(config);
-
-    if (!write_mouse(kMouseSetDefaults)) {
-        log_message(LogLevel::Warn, "Mouse: failed to set defaults");
-    }
-    if (!write_mouse(kMouseEnableStream)) {
-        log_message(LogLevel::Warn, "Mouse: failed to enable streaming");
+    if (!configure_auxiliary_port(false)) {
+        log_message(LogLevel::Warn,
+                    "Mouse: failed to initialize auxiliary port");
+    } else if (g_elan_detected) {
+        log_message(LogLevel::Info,
+                    "Mouse: ELAN PS/2-compatible touchpad detected");
     }
 
     if (!ioapic::handles_irq(12)) {
@@ -167,6 +248,27 @@ void init() {
     }
 
     g_initialized = true;
+}
+
+void recover_after_acpi_mode() {
+    if (!g_initialized) {
+        return;
+    }
+
+    const uint64_t interrupt_state = sync::disable_interrupts();
+    g_packet_index = 0;
+    const bool recovered = configure_auxiliary_port(true);
+    sync::restore_interrupts(interrupt_state);
+
+    if (!recovered) {
+        log_message(LogLevel::Warn,
+                    "Mouse: failed to recover auxiliary port after ACPI mode switch");
+        return;
+    }
+    log_message(LogLevel::Info,
+                g_elan_detected
+                    ? "Mouse: ELAN touchpad recovered after ACPI mode switch"
+                    : "Mouse: auxiliary device recovered after ACPI mode switch");
 }
 
 void handle_irq() {

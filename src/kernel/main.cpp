@@ -796,7 +796,15 @@ static void kernel_main_stage2() {
     descriptor::start_waiter_worker();
     // Namespace initialization may install SCI handlers and queue deferred AML
     // work, so it must follow process and scheduler initialization.
-    if (!acpi::initialize()) {
+    const bool acpi_available = acpi::initialize();
+    if (acpi::entered_acpi_mode()) {
+        mouse::recover_after_acpi_mode();
+    }
+    if (!scheduler::register_poll(keyboard::poll_controller)) {
+        log_message(LogLevel::Warn,
+                    "Keyboard: failed to register i8042 polling fallback");
+    }
+    if (!acpi_available) {
         log_message(LogLevel::Warn, "ACPI runtime unavailable");
     } else {
         acpi_thermal::init();

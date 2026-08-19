@@ -29,6 +29,8 @@ struct Interrupt { uacpi_interrupt_handler handler; uacpi_handle context; uint8_
 Interrupt* g_interrupts[16]{};
 bool g_initialized = false;
 bool g_tables_initialized = false;
+bool g_entered_acpi_mode = false;
+uint64_t g_rsdp_phys = 0;
 alignas(void*) unsigned char g_early_table_buffer[4096];
 
 template <unsigned Irq> void interrupt_thunk() {
@@ -52,12 +54,26 @@ bool timed_out(uint64_t start, uint16_t timeout_ms) {
 }  // namespace
 
 extern "C" uacpi_status uacpi_kernel_get_rsdp(uacpi_phys_addr* out_rsdp) {
-    if (out_rsdp == nullptr || rsdp_request.response == nullptr || rsdp_request.response->address == 0)
+    if (out_rsdp == nullptr) {
         return UACPI_STATUS_NOT_FOUND;
-    uint64_t address = reinterpret_cast<uint64_t>(rsdp_request.response->address);
+    }
+    if (g_rsdp_phys != 0) {
+        *out_rsdp = g_rsdp_phys;
+        return UACPI_STATUS_OK;
+    }
+    if (rsdp_request.response == nullptr ||
+        rsdp_request.response->address == 0) {
+        return UACPI_STATUS_NOT_FOUND;
+    }
+    uint64_t address =
+        reinterpret_cast<uint64_t>(rsdp_request.response->address);
     uint64_t hhdm = paging_hhdm_offset();
     if (hhdm != 0 && address >= hhdm) address -= hhdm;
-    *out_rsdp = address;
+    // Limine response structures live in bootloader-reclaimable memory. Keep
+    // the physical RSDP address before the page allocator (and now the dynamic
+    // disk cache) is allowed to reuse that memory.
+    g_rsdp_phys = address;
+    *out_rsdp = g_rsdp_phys;
     return UACPI_STATUS_OK;
 }
 
@@ -274,6 +290,9 @@ bool initialize() {
 
     uacpi_u64 flags = no_mode ? UACPI_FLAG_NO_ACPI_MODE : 0;
     uacpi_status status = uacpi_initialize(flags);
+    if (status == UACPI_STATUS_OK && !no_mode) {
+        g_entered_acpi_mode = true;
+    }
     if (status == UACPI_STATUS_OK && !no_namespace_load) {
         status = uacpi_namespace_load();
     }
@@ -287,5 +306,9 @@ bool initialize() {
     g_initialized = true;
     log_message(LogLevel::Info, "uACPI initialized");
     return true;
+}
+
+bool entered_acpi_mode() {
+    return g_entered_acpi_mode;
 }
 }  // namespace acpi

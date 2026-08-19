@@ -1,4 +1,5 @@
 #include "keyboard.hpp"
+#include "mouse.hpp"
 
 #include "arch/x86_64/io.hpp"
 #include "../interrupts/ioapic.hpp"
@@ -18,6 +19,7 @@ constexpr uint16_t kStatusPort = 0x64;
 
 constexpr uint8_t kStatusOutputFull = 1u << 0;
 constexpr uint8_t kStatusInputFull = 1u << 1;
+constexpr uint8_t kStatusAuxData = 1u << 5;
 
 constexpr uint8_t kCommandReadConfig = 0x20;
 constexpr uint8_t kCommandWriteConfig = 0x60;
@@ -265,6 +267,22 @@ void handle_irq() {
     bool pressed = (scancode & 0x80u) == 0;
     uint8_t code = static_cast<uint8_t>(scancode & 0x7Fu);
     process_scancode(code, extended, pressed);
+}
+
+void poll_controller() {
+    const uint64_t interrupt_state = sync::disable_interrupts();
+    for (size_t i = 0; i < 16; ++i) {
+        uint8_t status = inb(kStatusPort);
+        if ((status & kStatusOutputFull) == 0) {
+            break;
+        }
+        if ((status & kStatusAuxData) != 0) {
+            mouse::handle_irq();
+        } else {
+            handle_irq();
+        }
+    }
+    sync::restore_interrupts(interrupt_state);
 }
 
 size_t read(uint32_t slot,
