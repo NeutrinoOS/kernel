@@ -14,6 +14,11 @@ namespace descriptor_pipe {
 
 constexpr size_t kPipeBufferSize = 65536;
 constexpr size_t kMaxPipes = 64;
+// A pipe can have substantially more than two live endpoints: descriptors
+// inherited by service children and independently opened client endpoints all
+// refer to the same small set of long-lived IPC pipes.  Do not couple endpoint
+// capacity to the number of 64 KiB pipe buffers.
+constexpr size_t kMaxPipeEndpoints = 1024;
 constexpr size_t kMaxPipeWaiters = 128;
 
 struct PipeWaiter {
@@ -49,7 +54,7 @@ struct PipeEndpoint {
 };
 
 Pipe g_pipes[kMaxPipes]{};
-PipeEndpoint g_pipe_endpoints[kMaxPipes * 2]{};
+PipeEndpoint g_pipe_endpoints[kMaxPipeEndpoints]{};
 PipeWaiter g_pipe_waiters[kMaxPipeWaiters]{};
 sync::SpinLock g_pipe_pool_lock;
 
@@ -714,12 +719,19 @@ bool open_pipe(process::Task& proc,
                    : find_pipe_by_id_locked(static_cast<uint32_t>(existing_id));
         if (pipe == nullptr ||
             !__atomic_load_n(&pipe->in_use, __ATOMIC_ACQUIRE)) {
+            log_message(LogLevel::Warn,
+                        "Pipe: %s failed (pipe capacity or id %u unavailable)",
+                        created_pipe ? "create" : "open",
+                        static_cast<unsigned int>(existing_id));
             return false;
         }
 
         endpoint = allocate_pipe_endpoint_locked(
             pipe, &proc, want_read, want_write);
         if (endpoint == nullptr) {
+            log_message(LogLevel::Warn,
+                        "Pipe: endpoint capacity exhausted for pid=%u",
+                        static_cast<unsigned int>(proc.pid));
             if (created_pipe) {
                 pipe->id = 0;
                 __atomic_store_n(&pipe->in_use, false, __ATOMIC_RELEASE);
