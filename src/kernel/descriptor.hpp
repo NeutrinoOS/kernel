@@ -65,6 +65,8 @@ constexpr uint32_t kTypeAudioOutput =
     static_cast<uint32_t>(descriptor_defs::Type::AudioOutput);
 constexpr uint32_t kTypeSensor =
     static_cast<uint32_t>(descriptor_defs::Type::Sensor);
+constexpr uint32_t kTypeServiceRegistry =
+    static_cast<uint32_t>(descriptor_defs::Type::ServiceRegistry);
 
 constexpr int64_t kWouldBlock = -2;
 

@@ -26,6 +26,7 @@ enum class Type : uint16_t {
     Pci         = 0x080,
     AudioOutput = 0x090,
     Sensor      = 0x0A0,
+    ServiceRegistry = 0x0B0,
 };
 
 enum class Flag : uint64_t {
@@ -76,6 +77,9 @@ enum class Property : uint32_t {
     AudioStatus       = 0x00080002,
     AudioControl      = 0x00080003,
     SensorInfo        = 0x00090001,
+    ServiceRegister   = 0x000A0001,
+    ServiceUnregister = 0x000A0002,
+    ServiceBinding    = 0x000A0003,
 };
 
 enum class SensorKind : uint16_t {
@@ -263,6 +267,35 @@ struct PipeInfo {
     uint32_t id;
     uint32_t flags;
 };
+
+constexpr size_t kServiceIdLength = 64;
+constexpr size_t kServiceProviderLength = 32;
+
+struct ServiceOffer {
+    char service[kServiceIdLength];
+    char provider[kServiceProviderLength];
+    uint32_t abi_version;
+    uint32_t pipe_id;
+};
+
+struct ServiceQuery {
+    char service[kServiceIdLength];
+    uint32_t abi_version;
+    uint32_t reserved;
+};
+
+struct ServiceBinding {
+    char service[kServiceIdLength];
+    char provider[kServiceProviderLength];
+    uint32_t abi_version;
+    uint32_t pipe_id;
+    uint32_t provider_pid;
+    uint32_t reserved;
+};
+
+static_assert(sizeof(ServiceOffer) == 104, "ServiceOffer size mismatch");
+static_assert(sizeof(ServiceQuery) == 72, "ServiceQuery size mismatch");
+static_assert(sizeof(ServiceBinding) == 112, "ServiceBinding size mismatch");
 
 struct MouseEvent {
     int8_t dx;

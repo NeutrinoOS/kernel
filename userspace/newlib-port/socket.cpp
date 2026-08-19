@@ -10,9 +10,10 @@
 #include <string.h>
 #include <sys/socket.h>
 
-#include "../crt/syscall.hpp"
-#include "../net/dns.hpp"
-#include "../net/tcpd_protocol.hpp"
+#include "crt/syscall.hpp"
+#include "net/dns.hpp"
+#include "net/service.hpp"
+#include "net/tcpd_protocol.hpp"
 
 namespace {
 
@@ -124,23 +125,27 @@ extern "C" int connect(int fd, const sockaddr* address, socklen_t address_len) {
     if (state->connected) { errno = EISCONN; return -1; }
     const sockaddr_in* remote = reinterpret_cast<const sockaddr_in*>(address);
 
-    long registry_handle = shared_memory_open(tcpd_protocol::kRegistryName,
-                                               sizeof(tcpd_protocol::Registry));
-    if (registry_handle < 0) { errno = ENETDOWN; return -1; }
-    descriptor_defs::SharedMemoryInfo registry_info{};
-    if (shared_memory_get_info((uint32_t)registry_handle, &registry_info) != 0 ||
-        registry_info.base == 0 || registry_info.length < sizeof(tcpd_protocol::Registry)) {
+    uint32_t server_pipe_id = 0;
+    if (!service::lookup_pipe(service::kTcpService, service::kAbiV1,
+                              server_pipe_id)) {
+        long registry_handle = shared_memory_open(tcpd_protocol::kRegistryName,
+                                                   sizeof(tcpd_protocol::Registry));
+        if (registry_handle < 0) { errno = ENETDOWN; return -1; }
+        descriptor_defs::SharedMemoryInfo registry_info{};
+        if (shared_memory_get_info((uint32_t)registry_handle, &registry_info) != 0 ||
+            registry_info.base == 0 || registry_info.length < sizeof(tcpd_protocol::Registry)) {
+            descriptor_close((uint32_t)registry_handle);
+            errno = ENETDOWN;
+            return -1;
+        }
+        auto* registry = reinterpret_cast<tcpd_protocol::Registry*>(registry_info.base);
+        while (registry->magic != tcpd_protocol::kRegistryMagic ||
+               registry->version != tcpd_protocol::kRegistryVersion ||
+               registry->server_pipe_id == 0)
+            yield();
+        server_pipe_id = registry->server_pipe_id;
         descriptor_close((uint32_t)registry_handle);
-        errno = ENETDOWN;
-        return -1;
     }
-    auto* registry = reinterpret_cast<tcpd_protocol::Registry*>(registry_info.base);
-    while (registry->magic != tcpd_protocol::kRegistryMagic ||
-           registry->version != tcpd_protocol::kRegistryVersion ||
-           registry->server_pipe_id == 0)
-        yield();
-    uint32_t server_pipe_id = registry->server_pipe_id;
-    descriptor_close((uint32_t)registry_handle);
 
     long reply = pipe_open_new((uint64_t)descriptor_defs::Flag::Readable |
                                (uint64_t)descriptor_defs::Flag::Async);

@@ -22,6 +22,7 @@ bool register_net_endpoint_descriptor();
 bool register_pci_descriptor();
 bool register_audio_output_descriptor();
 bool register_sensor_descriptor();
+bool register_service_registry_descriptor();
 
 void register_builtin_types() {
     reset_block_device_registry();
@@ -97,6 +98,10 @@ void register_builtin_types() {
     if (!register_sensor_descriptor()) {
         log_message(LogLevel::Warn,
                     "Descriptor: failed to register sensor descriptor type");
+    }
+    if (!register_service_registry_descriptor()) {
+        log_message(LogLevel::Warn,
+                    "Descriptor: failed to register service registry type");
     }
 }
 

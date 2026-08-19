@@ -177,10 +177,28 @@ from pre-4.0 kernels must be recreated rather than reinterpreted.
 | 19–20 | `SystemMonitor`, `KernelLog` | System telemetry and kernel logs |
 | 21 | `FilesystemOverride` | Administrative ACL bypass |
 
-Pipes, shared memory, and access-controlled VTYs are ordinary process/session
-primitives and require no capability. Raw storage capabilities govern direct
-device descriptors only; mounted-file access remains a filesystem permission
-decision.
+Pipes, shared memory, access-controlled VTYs, and the service registry are
+ordinary process/session primitives and require no capability. Raw storage
+capabilities govern direct device descriptors only; mounted-file access remains
+a filesystem permission decision.
+
+## Replaceable userspace services
+
+Named userspace daemons such as `networkd`, `tcpd`, and `dhcp` are default
+providers. Applications look up a stable service identifier and ABI
+version through the kernel service registry:
+
+```text
+net.neutrino.network   ABI 1
+net.neutrino.tcp       ABI 1
+net.neutrino.dhcp      ABI 1
+```
+
+The `libnet` package installs `libnet.so.0` plus `include/neutrino/net.hpp` and
+`include/neutrino/http.hpp`. That one library is the userspace interface to the
+Network/TCP ABIs and to HTTP client and server protocol machinery. Replacing a
+provider does not require rebuilding applications; existing connections are
+not migrated.
 
 Syscall ABI 2.0 renumbers the complete syscall table into contiguous subsystem
 groups. ABI discovery remains at calls 0 and 1; core system services,

@@ -121,6 +121,7 @@ enum : uint8_t {
     STB_LOCAL = 0,
     STB_GLOBAL = 1,
     STB_WEAK = 2,
+    STB_GNU_UNIQUE = 10,
 };
 
 struct Elf64Sym {
@@ -686,7 +687,8 @@ bool resolve_symbol(const char* name,
                 continue;
             }
             uint32_t bind = elf_symbol_bind(sym);
-            if (bind != STB_GLOBAL && bind != STB_WEAK) {
+            if (bind != STB_GLOBAL && bind != STB_WEAK &&
+                bind != STB_GNU_UNIQUE) {
                 continue;
             }
             if (!dynamic_string_equals(object, sym.name, name, proc)) {

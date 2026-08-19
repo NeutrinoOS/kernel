@@ -44,7 +44,9 @@ NEWLIB_PORT_CFLAGS := $(NEWLIB_CFLAGS) -std=c11 -Wall -Wextra -Wpedantic \
                       -I$(NEWLIB_PORT_DIR)/include \
                       -isystem $(NEWLIB_INCLUDE_DIR) -I$(NEWLIB_PORT_DIR)
 NEWLIB_PORT_CXXFLAGS := $(filter-out -std=c11,$(NEWLIB_PORT_CFLAGS)) -std=c++17 \
-                        -I../shared/include
+                        -fno-gnu-unique \
+                        -I../shared/include \
+                        -I../../neutrino-packages/userspace-support
 FFMPEG_SIBLING_SOURCE_DIR := $(abspath ../../neutrino-packages/ffmpeg/src)
 FFMPEG_SOURCE_DIR ?= $(if $(wildcard $(FFMPEG_SIBLING_SOURCE_DIR)/configure),$(FFMPEG_SIBLING_SOURCE_DIR),$(DEPS_DIR)/ffmpeg)
 FFMPEG_BUILD_DIR ?= $(OBJ_DIR)/ffmpeg-minimal
