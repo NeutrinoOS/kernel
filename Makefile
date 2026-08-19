@@ -7,6 +7,7 @@ LD         := $(CROSS)ld
 AS         := nasm -f elf64
 OBJCOPY    := $(CROSS)objcopy
 KERNEL_VERSION ?= 0.0.0-dev
+KERNEL_CMDLINE ?=
 
 OUT_DIR    := out
 BUILD_DIR  := build
@@ -104,9 +105,13 @@ QEMU_DEBUG_WAIT_ARGS := -s -S
 TARGET_ISO_RAMFS := $(OUT_DIR)/neutrino_ramfs.iso
 ISO_ROOT_RAMFS := $(OUT_DIR)/iso_root_ramfs
 LIVE_ROOTFS_IMG ?= $(OUT_DIR)/live_rootfs.img
+# Minimum image size. The rootfs recipe grows beyond this automatically when
+# staged packages and their on-image repository need more room.
 LIVE_ROOTFS_SIZE ?= 128M
+LIVE_ROOTFS_HEADROOM ?= 32M
 NEUTRINO_PACKAGES_ROOT ?= ../neutrino-packages
-DEFAULT_LIVE_PACKAGES := neutrino-installer neutrino-live neutrino-drivers
+LOCAL_LIVE_PACKAGES := $(if $(wildcard $(NEUTRINO_PACKAGES_ROOT)/local-files/package/manifest.toml),local-files,)
+DEFAULT_LIVE_PACKAGES := neutrino-installer neutrino-live neutrino-drivers $(LOCAL_LIVE_PACKAGES)
 LIVE_PACKAGES ?= $(DEFAULT_LIVE_PACKAGES)
 LIVE_PACKAGE_NAMES = $(shell $(NEUTRINO_PACKAGES_ROOT)/resolve-package-deps.sh $(LIVE_PACKAGES))
 LIVE_PACKAGE_ZIPS = $(foreach package,$(LIVE_PACKAGE_NAMES),$(NEUTRINO_PACKAGES_ROOT)/$(package)/out/$(package).zip)
@@ -206,6 +211,9 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR) $(LIVE_ROOTFS_IMG) force-live-esp
 	printf '/Neutrino Live\n' >> $(ISO_ROOT)/limine.conf
 	printf '    protocol: limine\n' >> $(ISO_ROOT)/limine.conf
 	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT)/limine.conf
+	@if [[ -n "$(strip $(KERNEL_CMDLINE))" ]]; then \
+		printf '    cmdline: %s\n' "$(KERNEL_CMDLINE)" >> $(ISO_ROOT)/limine.conf; \
+	fi
 	printf '    module_path: boot():/boot/rootfs.img\n' >> $(ISO_ROOT)/limine.conf
 	printf '    module_cmdline: rootfs\n' >> $(ISO_ROOT)/limine.conf
 	printf '    module_path: boot():/boot/esp.img\n' >> $(ISO_ROOT)/limine.conf
@@ -239,6 +247,9 @@ $(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) $(LIVE_ROOTFS_IMG) force-live-e
 	printf '/Neutrino Live\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    protocol: limine\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	@if [[ -n "$(strip $(KERNEL_CMDLINE))" ]]; then \
+		printf '    cmdline: %s\n' "$(KERNEL_CMDLINE)" >> $(ISO_ROOT_RAMFS)/limine.conf; \
+	fi
 	printf '    module_path: boot():/boot/rootfs.img\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    module_cmdline: rootfs\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    module_path: boot():/boot/esp.img\n' >> $(ISO_ROOT_RAMFS)/limine.conf
@@ -334,7 +345,17 @@ $(LIVE_ROOTFS_IMG): live-package-archives $(NEUTRINO_PACKAGES_ROOT)/build-local-
 	# intentional bootstrap mode from a missing, truncated, or corrupt database.
 	printf '\125\104\124\116\004\000\200\000\000\000\000\000\001\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\000\000\000\000' > $(LIVE_ROOTFS_STAGE)/system/users.ntd
 	rm -f $@
-	truncate -s $(LIVE_ROOTFS_SIZE) $@
+	@set -euo pipefail; \
+		staged_bytes=$$(du -sb $(LIVE_ROOTFS_STAGE) | cut -f1); \
+		minimum_bytes=$$(numfmt --from=iec "$(LIVE_ROOTFS_SIZE)"); \
+		headroom_bytes=$$(numfmt --from=iec "$(LIVE_ROOTFS_HEADROOM)"); \
+		required_bytes=$$((staged_bytes + staged_bytes / 4 + headroom_bytes)); \
+		quantum=$$((16 * 1024 * 1024)); \
+		required_bytes=$$(((required_bytes + quantum - 1) / quantum * quantum)); \
+		image_bytes=$$minimum_bytes; \
+		if ((required_bytes > image_bytes)); then image_bytes=$$required_bytes; fi; \
+		echo "Live rootfs: staged $$staged_bytes bytes, allocating $$image_bytes bytes"; \
+		truncate -s $$image_bytes $@
 	mkfs.fat -F 32 --mbr=y $@
 	mcopy -s -i $@ $(LIVE_ROOTFS_STAGE)/* ::/
 
