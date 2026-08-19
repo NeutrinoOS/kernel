@@ -705,10 +705,13 @@ void tick(InterruptFrame& frame) {
     percpu::Cpu* cpu = percpu::current_cpu();
     if (cpu != nullptr && cpu->index == 0) {
         const uint64_t tick = timekeeping::tick_count();
-        debug_heartbeat::tick(tick);
         if (kconsole != nullptr) {
             kconsole->tick_cursor(tick);
         }
+        // The console may flush its back buffer while updating the cursor.
+        // Draw the diagnostic marker afterwards so that refresh cannot erase
+        // it in the same tick.
+        debug_heartbeat::tick(tick);
         process::wake_ready_sleepers(tick);
     }
     if ((frame.cs & 0x3) != 0) {

@@ -7,13 +7,12 @@
 
 namespace {
 
-constexpr size_t kHeartbeatSize = 3;
+constexpr size_t kHeartbeatSize = 24;
 constexpr uint64_t kTicksPerColor = 128;
 constexpr uint8_t kMemoryModelRgb = 1;
 
 Framebuffer g_framebuffer{};
 bool g_enabled = false;
-uint8_t g_last_phase = UINT8_MAX;
 
 uint64_t scale_component(uint8_t value, uint8_t bits) {
     if (bits == 0) {
@@ -60,7 +59,9 @@ void draw(uint32_t rgb) {
 namespace debug_heartbeat {
 
 void init(const Framebuffer& framebuffer) {
-    if (!kernel_cmdline::has_flag("DEBUG") || framebuffer.base == nullptr ||
+    const bool debug_enabled = kernel_cmdline::has_flag("DEBUG") ||
+                               kernel_cmdline::has_value("DEBUG", "ON");
+    if (!debug_enabled || framebuffer.base == nullptr ||
         framebuffer.width < kHeartbeatSize ||
         framebuffer.height < kHeartbeatSize ||
         framebuffer.memory_model != kMemoryModelRgb) {
@@ -96,12 +97,10 @@ void tick(uint64_t scheduler_tick) {
     }
 
     uint8_t phase = static_cast<uint8_t>((scheduler_tick / kTicksPerColor) % 3u);
-    if (phase == g_last_phase) {
-        return;
-    }
-    g_last_phase = phase;
-
     constexpr uint32_t colors[] = {0x00ff00u, 0xffff00u, 0xff4000u};
+    // The console owns a full-screen back buffer and may overwrite the marker
+    // on any tick.  Redraw the marker every tick, even when the color phase
+    // has not changed.
     draw(colors[phase]);
 }
 
