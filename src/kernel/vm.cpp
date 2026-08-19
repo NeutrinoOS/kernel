@@ -20,6 +20,29 @@ constexpr uint64_t kUserStackCeiling = vm::kUserAddressSpaceTop;
 uint64_t g_next_shared_user_code = kUserCodeBase;
 sync::SpinLock g_address_space_state_lock;
 
+class AddressSpaceStateGuard {
+public:
+    AddressSpaceStateGuard() : flags_(sync::disable_interrupts()) {
+        while (!g_address_space_state_lock.try_lock()) {
+            // The lock owner may be waiting for this CPU to acknowledge a
+            // TLB shootdown.  Briefly admit the IPI while contended, even if
+            // this path was entered from an interrupt frame with IF clear.
+            asm volatile("sti; pause; cli" ::: "memory");
+        }
+    }
+
+    ~AddressSpaceStateGuard() {
+        g_address_space_state_lock.unlock();
+        sync::restore_interrupts(flags_);
+    }
+
+    AddressSpaceStateGuard(const AddressSpaceStateGuard&) = delete;
+    AddressSpaceStateGuard& operator=(const AddressSpaceStateGuard&) = delete;
+
+private:
+    uint64_t flags_;
+};
+
 struct VmArea {
     uint64_t base;
     uint64_t length;
@@ -151,7 +174,7 @@ bool register_area(uint64_t cr3,
                    vm::MappingKind kind,
                    uint64_t reservation_base = 0,
                    uint64_t reservation_length = 0) {
-    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceStateGuard guard;
     AddressSpaceState* state =
         find_address_space_state_locked(cr3, true);
     const uint64_t occupied_base =
@@ -200,7 +223,7 @@ bool unregister_area(uint64_t cr3,
                      uint64_t base,
                      uint64_t length,
                      vm::MappingKind* out_kind = nullptr) {
-    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceStateGuard guard;
     AddressSpaceState* state =
         find_address_space_state_locked(cr3, false);
     return state != nullptr &&
@@ -211,7 +234,7 @@ bool set_area_resident_pages(uint64_t cr3,
                              uint64_t base,
                              uint64_t length,
                              uint64_t pages) {
-    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceStateGuard guard;
     AddressSpaceState* state =
         find_address_space_state_locked(cr3, false);
     if (state == nullptr) {
@@ -407,7 +430,7 @@ bool resolve_managed_fault(uint64_t cr3,
                            uint64_t address,
                            bool write,
                            bool execute) {
-    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceStateGuard guard;
     AddressSpaceState* state =
         find_address_space_state_locked(cr3, false);
     if (state == nullptr) {
@@ -454,7 +477,7 @@ vm::Region reserve_private_region(uint64_t cr3, size_t length) {
     if (!page_aligned_length(length, padded)) {
         return region;
     }
-    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceStateGuard guard;
     AddressSpaceState* state =
         find_address_space_state_locked(cr3, true);
     if (state == nullptr) {
@@ -502,7 +525,7 @@ vm::Region reserve_private_region(uint64_t cr3, size_t length) {
 }
 
 vm::Stack reserve_private_stack(uint64_t cr3, size_t total) {
-    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceStateGuard guard;
     AddressSpaceState* state =
         find_address_space_state_locked(cr3, true);
     if (state == nullptr) {
@@ -528,7 +551,7 @@ void cancel_private_region(uint64_t cr3, const vm::Region& region) {
     }
 
     const uint64_t reservation_end = region.base + region.length;
-    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceStateGuard guard;
     for (auto& state : g_address_space_states) {
         if (!state.in_use || state.cr3 != cr3) {
             continue;
@@ -548,7 +571,7 @@ void cancel_private_stack(uint64_t cr3, const vm::Stack& stack) {
         return;
     }
 
-    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceStateGuard guard;
     for (auto& state : g_address_space_states) {
         if (!state.in_use || state.cr3 != cr3) {
             continue;
@@ -644,7 +667,7 @@ Region reserve_user_region(size_t length) {
     if (!page_aligned_length(length, padded)) {
         return region;
     }
-    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceStateGuard guard;
     uint64_t base = align_up(g_next_shared_user_code, kPageSize);
     size_t pages = padded / kPageSize;
     uint64_t total = static_cast<uint64_t>(pages) * kPageSize;
@@ -841,7 +864,7 @@ void release_address_space(uint64_t cr3) {
     if (cr3 == 0) {
         return;
     }
-    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceStateGuard guard;
     for (auto& state : g_address_space_states) {
         if (!state.in_use || state.cr3 != cr3) {
             continue;
@@ -992,7 +1015,7 @@ bool unmap_region(uint64_t cr3, uint64_t addr, size_t length) {
     }
 
     {
-        sync::IrqLockGuard guard(g_address_space_state_lock);
+        AddressSpaceStateGuard guard;
         AddressSpaceState* state =
             find_address_space_state_locked(cr3, false);
         VmArea* area = state != nullptr ? find_area_locked(*state, addr)
@@ -1100,7 +1123,7 @@ bool handle_page_fault(uint64_t cr3,
     if (current_stack == nullptr) {
         return false;
     }
-    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceStateGuard guard;
     AddressSpaceState* state =
         find_address_space_state_locked(cr3, false);
     return state != nullptr &&
@@ -1130,13 +1153,19 @@ bool set_user_region_writable(uint64_t cr3,
         return false;
     }
 
+    bool defer_flush = !paging_address_space_has_run(cr3);
     for (uint64_t virt = base; virt < end; virt += kPageSize) {
-        if (!paging_set_writable_cr3(cr3, virt, writable)) {
+        bool updated = defer_flush
+                           ? paging_set_writable_cr3_deferred(cr3,
+                                                              virt,
+                                                              writable)
+                           : paging_set_writable_cr3(cr3, virt, writable);
+        if (!updated) {
             return false;
         }
     }
     {
-        sync::IrqLockGuard guard(g_address_space_state_lock);
+        AddressSpaceStateGuard guard;
         AddressSpaceState* state =
             find_address_space_state_locked(cr3, false);
         if (state != nullptr) {
@@ -1177,13 +1206,21 @@ bool set_user_region_executable(uint64_t cr3,
         return false;
     }
 
+    bool defer_flush = !paging_address_space_has_run(cr3);
     for (uint64_t virt = base; virt < end; virt += kPageSize) {
-        if (!paging_set_executable_cr3(cr3, virt, executable)) {
+        bool updated = defer_flush
+                           ? paging_set_executable_cr3_deferred(cr3,
+                                                                virt,
+                                                                executable)
+                           : paging_set_executable_cr3(cr3,
+                                                       virt,
+                                                       executable);
+        if (!updated) {
             return false;
         }
     }
     {
-        sync::IrqLockGuard guard(g_address_space_state_lock);
+        AddressSpaceStateGuard guard;
         AddressSpaceState* state =
             find_address_space_state_locked(cr3, false);
         if (state != nullptr) {
@@ -1517,7 +1554,7 @@ Usage usage(uint64_t cr3) {
     if (cr3 == 0) {
         return result;
     }
-    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceStateGuard guard;
     AddressSpaceState* state =
         find_address_space_state_locked(cr3, false);
     if (state == nullptr) {
@@ -1543,7 +1580,7 @@ size_t snapshot_areas(uint64_t cr3, AreaInfo* out, size_t max_areas) {
     if (cr3 == 0 || out == nullptr || max_areas == 0) {
         return 0;
     }
-    sync::IrqLockGuard guard(g_address_space_state_lock);
+    AddressSpaceStateGuard guard;
     AddressSpaceState* state =
         find_address_space_state_locked(cr3, false);
     if (state == nullptr) {

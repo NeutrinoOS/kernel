@@ -76,6 +76,7 @@ uint64_t g_kernel_cr3 = 0;
 
 uint64_t* pml4_table = nullptr;
 uint64_t* g_address_space_roots[MAX_ADDRESS_SPACES];
+bool g_address_space_activated[MAX_ADDRESS_SPACES]{};
 size_t g_address_space_count = 0;
 bool g_pcid_in_use[PCID_COUNT]{};
 sync::SpinLock g_address_space_registry_lock;
@@ -190,7 +191,14 @@ void release_pcid_locked(uint16_t pcid) {
 bool shootdown_all_cpus(TlbShootdownKind kind,
                         uint64_t cr3 = 0,
                         uint64_t address = 0) {
-    sync::IrqLockGuard guard(g_tlb_shootdown_lock);
+    const uint64_t interrupt_state = sync::disable_interrupts();
+    while (!g_tlb_shootdown_lock.try_lock()) {
+        // The owner can be waiting for this CPU's shootdown acknowledgement.
+        // Page faults may arrive through a frame whose saved IF is clear, so
+        // merely restoring the caller's flags while spinning is insufficient:
+        // explicitly open a one-instruction interrupt window for the IPI.
+        asm volatile("sti; pause; cli" ::: "memory");
+    }
     if (g_tlb_shootdown_vector == 0) {
         uint8_t vector = interrupts::allocate_vector();
         if (vector == 0 ||
@@ -198,6 +206,8 @@ bool shootdown_all_cpus(TlbShootdownKind kind,
             if (vector != 0) {
                 interrupts::free_vector(vector);
             }
+            g_tlb_shootdown_lock.unlock();
+            sync::restore_interrupts(interrupt_state);
             return false;
         }
         g_tlb_shootdown_vector = vector;
@@ -214,6 +224,8 @@ bool shootdown_all_cpus(TlbShootdownKind kind,
 
     size_t online = smp::online_cpus();
     if (online <= 1) {
+        g_tlb_shootdown_lock.unlock();
+        sync::restore_interrupts(interrupt_state);
         return true;
     }
     __atomic_store_n(&g_tlb_shootdown_acks,
@@ -224,6 +236,8 @@ bool shootdown_all_cpus(TlbShootdownKind kind,
            online - 1) {
         asm volatile("pause");
     }
+    g_tlb_shootdown_lock.unlock();
+    sync::restore_interrupts(interrupt_state);
     return true;
 }
 
@@ -376,7 +390,7 @@ uint64_t* ensure_table(uint64_t* table, size_t index, uint64_t flags) {
     return reinterpret_cast<uint64_t*>(table_phys_to_virt(phys));
 }
 
-void map_page_with_root(uint64_t* root, uint64_t virt, uint64_t phys, uint64_t flags) {
+bool map_page_with_root(uint64_t* root, uint64_t virt, uint64_t phys, uint64_t flags) {
     size_t pml4_index = (virt >> 39) & 0x1FF;
     size_t pdpt_index = (virt >> 30) & 0x1FF;
     size_t pd_index = (virt >> 21) & 0x1FF;
@@ -386,7 +400,9 @@ void map_page_with_root(uint64_t* root, uint64_t virt, uint64_t phys, uint64_t f
     uint64_t* pd = ensure_table(pdpt, pdpt_index, flags);
     uint64_t* pt = ensure_table(pd, pd_index, flags);
 
+    bool replaced_present = (pt[pt_index] & PTE_PRESENT) != 0;
     pt[pt_index] = (phys & ~PAGE_MASK) | flags | PTE_PRESENT;
+    return replaced_present;
 }
 
 void sync_kernel_pml4_entry(size_t pml4_index) {
@@ -862,6 +878,17 @@ void paging_switch_cr3(uint64_t new_cr3) {
     if (cr3_context(current_cr3) == new_cr3) {
         return;
     }
+    uint64_t root_phys = new_cr3 & PHYSICAL_ADDRESS_MASK;
+    for (size_t i = 0; i < g_address_space_count; ++i) {
+        auto* root = g_address_space_roots[i];
+        if (root == reinterpret_cast<uint64_t*>(
+                        table_phys_to_virt(root_phys))) {
+            __atomic_store_n(&g_address_space_activated[i],
+                             true,
+                             __ATOMIC_RELEASE);
+            break;
+        }
+    }
     uint64_t value = pcid_enabled() ? new_cr3 | CR3_NO_FLUSH : new_cr3;
     asm volatile("mov %0, %%cr3" : : "r"(value) : "memory");
 }
@@ -902,7 +929,24 @@ uint64_t paging_create_address_space() {
         registry_slot = g_address_space_count++;
     }
     g_address_space_roots[registry_slot] = new_root;
+    g_address_space_activated[registry_slot] = false;
     return root_page.phys | pcid;
+}
+
+bool paging_address_space_has_run(uint64_t cr3) {
+    if (cr3 == 0 || cr3_context(cr3) == cr3_context(g_kernel_cr3)) {
+        return true;
+    }
+    uint64_t root_phys = cr3 & PHYSICAL_ADDRESS_MASK;
+    for (size_t i = 0; i < g_address_space_count; ++i) {
+        auto* root = g_address_space_roots[i];
+        if (root == reinterpret_cast<uint64_t*>(
+                        table_phys_to_virt(root_phys))) {
+            return __atomic_load_n(&g_address_space_activated[i],
+                                   __ATOMIC_ACQUIRE);
+        }
+    }
+    return true;
 }
 
 void paging_destroy_address_space(uint64_t cr3) {
@@ -931,6 +975,7 @@ void paging_destroy_address_space(uint64_t cr3) {
         for (size_t i = 0; i < g_address_space_count; ++i) {
             if (g_address_space_roots[i] == root) {
                 g_address_space_roots[i] = nullptr;
+                g_address_space_activated[i] = false;
                 break;
             }
         }
@@ -966,8 +1011,13 @@ bool paging_map_page_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fl
     }
     uint64_t root_phys = cr3 & ~PAGE_MASK;
     auto* root = reinterpret_cast<uint64_t*>(table_phys_to_virt(root_phys));
-    map_page_with_root(root, virt, phys, flags);
-    return shootdown_all_cpus(TlbShootdownKind::Page, cr3, virt);
+    bool replaced_present = map_page_with_root(root, virt, phys, flags);
+    // A not-present leaf cannot have a cached translation.  Avoid a global,
+    // synchronous IPI round trip for every page while constructing a new
+    // process or shared-memory mapping.  Replacements still require an
+    // immediate shootdown.
+    return !replaced_present ||
+           shootdown_all_cpus(TlbShootdownKind::Page, cr3, virt);
 }
 
 bool paging_unmap_page_cr3(uint64_t cr3, uint64_t virt, uint64_t& phys_out) {
@@ -1134,7 +1184,10 @@ bool paging_flags_cr3(uint64_t cr3, uint64_t virt, uint64_t& flags_out) {
     return true;
 }
 
-bool paging_set_writable_cr3(uint64_t cr3, uint64_t virt, bool writable) {
+bool paging_set_writable_cr3_impl(uint64_t cr3,
+                                  uint64_t virt,
+                                  bool writable,
+                                  bool flush) {
     if (cr3 == 0) {
         return false;
     }
@@ -1175,12 +1228,23 @@ bool paging_set_writable_cr3(uint64_t cr3, uint64_t virt, bool writable) {
         entry &= ~PTE_WRITE;
     }
     pt[pt_index] = entry;
-    return shootdown_all_cpus(TlbShootdownKind::Page, cr3, virt);
+    return !flush || shootdown_all_cpus(TlbShootdownKind::Page, cr3, virt);
 }
 
-bool paging_set_executable_cr3(uint64_t cr3,
-                               uint64_t virt,
-                               bool executable) {
+bool paging_set_writable_cr3(uint64_t cr3, uint64_t virt, bool writable) {
+    return paging_set_writable_cr3_impl(cr3, virt, writable, true);
+}
+
+bool paging_set_writable_cr3_deferred(uint64_t cr3,
+                                      uint64_t virt,
+                                      bool writable) {
+    return paging_set_writable_cr3_impl(cr3, virt, writable, false);
+}
+
+bool paging_set_executable_cr3_impl(uint64_t cr3,
+                                    uint64_t virt,
+                                    bool executable,
+                                    bool flush) {
     if (cr3 == 0) {
         return false;
     }
@@ -1218,7 +1282,24 @@ bool paging_set_executable_cr3(uint64_t cr3,
         entry |= PTE_NX;
     }
     pt[pt_index] = entry;
-    return shootdown_all_cpus(TlbShootdownKind::Page, cr3, virt);
+    return !flush || shootdown_all_cpus(TlbShootdownKind::Page, cr3, virt);
+}
+
+bool paging_set_executable_cr3(uint64_t cr3,
+                               uint64_t virt,
+                               bool executable) {
+    return paging_set_executable_cr3_impl(cr3, virt, executable, true);
+}
+
+bool paging_set_executable_cr3_deferred(uint64_t cr3,
+                                        uint64_t virt,
+                                        bool executable) {
+    return paging_set_executable_cr3_impl(cr3, virt, executable, false);
+}
+
+bool paging_flush_tlb_context(uint64_t cr3) {
+    return cr3 != 0 &&
+           shootdown_all_cpus(TlbShootdownKind::Context, cr3);
 }
 
 bool paging_flush_tlb_all_cpus() {
