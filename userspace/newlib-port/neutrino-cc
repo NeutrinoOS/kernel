@@ -29,6 +29,7 @@ for argument in "$@"; do
 done
 
 common_flags="
+    -O2
     -ffreestanding
     -fno-builtin
     -fno-stack-protector

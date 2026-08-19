@@ -47,6 +47,7 @@ fi
     --disable-autodetect \
     --disable-doc \
     --disable-debug \
+    --optflags=-O2 \
     --enable-network \
     --disable-devices \
     --disable-hwaccels \
