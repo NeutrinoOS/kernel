@@ -441,7 +441,9 @@ int vty_set_property(DescriptorEntry& entry,
         return 0;
     }
     if (property ==
-        static_cast<uint32_t>(descriptor_defs::Property::VtyCursor)) {
+            static_cast<uint32_t>(descriptor_defs::Property::VtyCursor) ||
+        property ==
+            static_cast<uint32_t>(descriptor_defs::Property::ConsoleCursor)) {
         if (in == nullptr || size < sizeof(descriptor_defs::CursorPosition)) {
             return -1;
         }
@@ -453,7 +455,9 @@ int vty_set_property(DescriptorEntry& entry,
         return ok ? 0 : -1;
     }
     if (property == static_cast<uint32_t>(
-                        descriptor_defs::Property::VtyCursorBlink)) {
+                        descriptor_defs::Property::VtyCursorBlink) ||
+        property == static_cast<uint32_t>(
+                        descriptor_defs::Property::ConsoleCursorBlink)) {
         if (in == nullptr || size != sizeof(uint8_t)) {
             return -1;
         }
@@ -467,14 +471,18 @@ int vty_set_property(DescriptorEntry& entry,
         return 0;
     }
     if (property ==
-        static_cast<uint32_t>(descriptor_defs::Property::VtyClear)) {
+            static_cast<uint32_t>(descriptor_defs::Property::VtyClear) ||
+        property ==
+            static_cast<uint32_t>(descriptor_defs::Property::ConsoleClear)) {
         lock_vty(*vty);
         clear_all(*vty);
         unlock_vty(*vty);
         return 0;
     }
     if (property ==
-        static_cast<uint32_t>(descriptor_defs::Property::VtyColor)) {
+            static_cast<uint32_t>(descriptor_defs::Property::VtyColor) ||
+        property ==
+            static_cast<uint32_t>(descriptor_defs::Property::ConsoleColor)) {
         if (in == nullptr || size < sizeof(descriptor_defs::ColorPair)) {
             return -1;
         }
@@ -487,7 +495,9 @@ int vty_set_property(DescriptorEntry& entry,
         return 0;
     }
     if (property ==
-        static_cast<uint32_t>(descriptor_defs::Property::VtyTextFlags)) {
+            static_cast<uint32_t>(descriptor_defs::Property::VtyTextFlags) ||
+        property == static_cast<uint32_t>(
+                        descriptor_defs::Property::ConsoleTextFlags)) {
         if (in == nullptr || size < sizeof(uint8_t)) {
             return -1;
         }
