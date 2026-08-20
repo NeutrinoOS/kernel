@@ -14,11 +14,12 @@
 
 enum {
     kFileDescriptorOffset = 3,
-    kHeapCapacity = 256 * 1024 * 1024,
+    kHeapGrowthGranularity = 64 * 1024 * 1024,
 };
 
 static unsigned char* g_heap_base;
 static size_t g_heap_size;
+static size_t g_heap_mapped;
 static long g_fallback_console = -2;
 
 static uint32_t standard_descriptor(int fd) {
@@ -344,13 +345,14 @@ void* _sbrk(ptrdiff_t increment) {
     if (g_heap_base == NULL) {
         long address = neutrino_raw_syscall2(
             NEUTRINO_MAP_ANONYMOUS,
-            kHeapCapacity,
+            kHeapGrowthGranularity,
             NEUTRINO_MAP_WRITE);
         if (address < 0) {
             errno = ENOMEM;
             return (void*)-1;
         }
         g_heap_base = (unsigned char*)(uintptr_t)address;
+        g_heap_mapped = kHeapGrowthGranularity;
     }
 
     if (increment < 0) {
@@ -369,9 +371,40 @@ void* _sbrk(ptrdiff_t increment) {
     }
 
     size_t increase = (size_t)increment;
-    if (increase > kHeapCapacity - g_heap_size) {
+    if (increase > SIZE_MAX - g_heap_size) {
         errno = ENOMEM;
         return (void*)-1;
+    }
+
+    size_t required = g_heap_size + increase;
+    if (required > g_heap_mapped) {
+        size_t additional = required - g_heap_mapped;
+        size_t remainder = additional % kHeapGrowthGranularity;
+        size_t mapped_length = additional;
+        if (remainder != 0) {
+            size_t padding = kHeapGrowthGranularity - remainder;
+            if (mapped_length > SIZE_MAX - padding) {
+                errno = ENOMEM;
+                return (void*)-1;
+            }
+            mapped_length += padding;
+        }
+        if (mapped_length > LONG_MAX ||
+            g_heap_mapped > SIZE_MAX - mapped_length) {
+            errno = ENOMEM;
+            return (void*)-1;
+        }
+        long address = neutrino_raw_syscall3(
+            NEUTRINO_MAP_AT,
+            (long)(uintptr_t)(g_heap_base + g_heap_mapped),
+            (long)mapped_length,
+            NEUTRINO_MAP_WRITE);
+        if (address < 0 ||
+            (uintptr_t)address != (uintptr_t)(g_heap_base + g_heap_mapped)) {
+            errno = ENOMEM;
+            return (void*)-1;
+        }
+        g_heap_mapped += mapped_length;
     }
     void* previous = g_heap_base + g_heap_size;
     g_heap_size += increase;
@@ -385,12 +418,21 @@ int brk(void* address) {
 
     uintptr_t base = (uintptr_t)g_heap_base;
     uintptr_t requested = (uintptr_t)address;
-    if (requested < base || requested - base > kHeapCapacity) {
+    if (requested < base) {
         errno = ENOMEM;
         return -1;
     }
 
-    g_heap_size = (size_t)(requested - base);
+    size_t requested_size = (size_t)(requested - base);
+    if (requested_size > g_heap_size) {
+        size_t increase = requested_size - g_heap_size;
+        if (increase > PTRDIFF_MAX ||
+            _sbrk((ptrdiff_t)increase) == (void*)-1) {
+            return -1;
+        }
+    } else {
+        g_heap_size = requested_size;
+    }
     return 0;
 }
 
