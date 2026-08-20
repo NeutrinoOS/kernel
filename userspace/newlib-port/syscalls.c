@@ -14,7 +14,7 @@
 
 enum {
     kFileDescriptorOffset = 3,
-    kHeapCapacity = 64 * 1024 * 1024,
+    kHeapCapacity = 256 * 1024 * 1024,
 };
 
 static unsigned char* g_heap_base;
