@@ -32,6 +32,7 @@ static uint32_t g_thread_table_lock;
 static void* g_main_key_values[kMaxKeys];
 static void (*g_key_destructors[kMaxKeys])(void*);
 static uint64_t g_key_bitmap;
+static uint32_t g_threads_started;
 
 static long raw_thread_id(void) {
     return neutrino_raw_syscall0(NEUTRINO_THREAD_ID);
@@ -236,9 +237,14 @@ int pthread_create(pthread_t* thread,
         (void)neutrino_raw_syscall1(NEUTRINO_THREAD_DETACH, tid);
     }
     *thread = (pthread_t)tid;
+    __atomic_store_n(&g_threads_started, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&context->ready, 1, __ATOMIC_RELEASE);
     raw_futex_wake(&context->ready, 1);
     return 0;
+}
+
+int neutrino_userspace_is_multithreaded(void) {
+    return __atomic_load_n(&g_threads_started, __ATOMIC_ACQUIRE) != 0;
 }
 
 int pthread_join(pthread_t thread, void** result) {

@@ -3,24 +3,36 @@
 #include "arch/x86_64/cpu_features.hpp"
 
 extern "C" void *memcpy(void *dest, const void *src, size_t n) {
-    uint8_t *d = (uint8_t*)dest;
-    const uint8_t *s = (const uint8_t*)src;
-    for (size_t i = 0; i < n; i++)
-        d[i] = s[i];
-    return dest;
+    void* result = dest;
+    if (n != 0) {
+        // Neutrino is x86-64-only.  rep movsb is both architecturally
+        // available and lets current CPUs select their optimized fast-string
+        // path, rather than forcing every caller through a byte loop.
+        asm volatile("cld\n\trep movsb"
+                     : "+D"(dest), "+S"(src), "+c"(n)
+                     :
+                     : "memory");
+    }
+    return result;
 }
 
 extern "C" void *memmove(void *dest, const void *src, size_t n) {
-    uint8_t *d = (uint8_t*)dest;
-    const uint8_t *s = (const uint8_t*)src;
-    if (d < s) {
-        for (size_t i = 0; i < n; i++)
-            d[i] = s[i];
-    } else {
-        for (size_t i = n; i != 0; i--)
-            d[i-1] = s[i-1];
+    void* result = dest;
+    if (n == 0 || dest == src) {
+        return result;
     }
-    return dest;
+
+    if (reinterpret_cast<uintptr_t>(dest) < reinterpret_cast<uintptr_t>(src)) {
+        return memcpy(dest, src, n);
+    }
+
+    auto* d = static_cast<uint8_t*>(dest) + n - 1;
+    auto* s = static_cast<const uint8_t*>(src) + n - 1;
+    asm volatile("std\n\trep movsb\n\tcld"
+                 : "+D"(d), "+S"(s), "+c"(n)
+                 :
+                 : "memory");
+    return result;
 }
 
 extern "C" void *memset(void *s, int c, size_t n) {

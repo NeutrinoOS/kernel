@@ -36,7 +36,9 @@ NEWLIB_PORT_OBJECTS := $(NEWLIB_PORT_OBJ_DIR)/start.o \
                        $(NEWLIB_PORT_OBJ_DIR)/dirent.o \
                        $(NEWLIB_PORT_OBJ_DIR)/pthread.o \
                        $(NEWLIB_PORT_OBJ_DIR)/posix_compat.o \
-                       $(NEWLIB_PORT_OBJ_DIR)/socket.o
+                       $(NEWLIB_PORT_OBJ_DIR)/socket.o \
+                       $(NEWLIB_PORT_OBJ_DIR)/libc_optimizations.o \
+                       $(NEWLIB_PORT_OBJ_DIR)/malloc_locks.o
 NEWLIB_CFLAGS := -O2 -g -ffreestanding -fno-builtin \
                  -fno-stack-protector -nostdlib -m64 -mno-red-zone \
                  -mno-avx -mno-avx512f -fPIE -D_POSIX_THREADS=200809L
@@ -106,6 +108,12 @@ $(NEWLIB_PORT_OBJ_DIR)/posix_compat.o: $(NEWLIB_PORT_DIR)/posix_compat.c $(NEWLI
 
 $(NEWLIB_PORT_OBJ_DIR)/socket.o: $(NEWLIB_PORT_DIR)/socket.cpp $(NEWLIB_PORT_DIR)/socket_internal.h $(NEWLIB_LIBC) | $(NEWLIB_PORT_OBJ_DIR)
 	$(NEWLIB_CXX) $(NEWLIB_PORT_CXXFLAGS) -c $< -o $@
+
+$(NEWLIB_PORT_OBJ_DIR)/libc_optimizations.o: $(NEWLIB_PORT_DIR)/libc_optimizations.c $(NEWLIB_LIBC) | $(NEWLIB_PORT_OBJ_DIR)
+	$(NEWLIB_CC) $(NEWLIB_PORT_CFLAGS) -c $< -o $@
+
+$(NEWLIB_PORT_OBJ_DIR)/malloc_locks.o: $(NEWLIB_PORT_DIR)/malloc_locks.c $(NEWLIB_LIBC) | $(NEWLIB_PORT_OBJ_DIR)
+	$(NEWLIB_CC) $(NEWLIB_PORT_CFLAGS) -c $< -o $@
 
 $(NEWLIB_CRT0): $(NEWLIB_PORT_OBJ_DIR)/crt0.o $(NEWLIB_LIBC)
 	@mkdir -p $(dir $@)
