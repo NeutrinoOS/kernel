@@ -4,6 +4,8 @@
 #include "arch/x86_64/lapic.hpp"
 #include "drivers/audio/audio_output.hpp"
 #include "drivers/console/console.hpp"
+#include "drivers/display_accel.hpp"
+#include "drivers/render_accel.hpp"
 #include "drivers/driver_registry.hpp"
 #include "drivers/log/logging.hpp"
 #include "drivers/pci/pci.hpp"
@@ -686,6 +688,10 @@ bool resolve_external_symbol(const char* name, uint64_t& out_value) {
          reinterpret_cast<uint64_t>(&pci::devices)},
         {"_ZN10descriptor27register_framebuffer_deviceER11Framebufferm",
          reinterpret_cast<uint64_t>(&descriptor::register_framebuffer_device)},
+        {"neutrino_register_framebuffer_presenter",
+         reinterpret_cast<uint64_t>(&neutrino_register_framebuffer_presenter)},
+        {"neutrino_register_render_accelerator",
+         reinterpret_cast<uint64_t>(&neutrino_register_render_accelerator)},
         {"_ZN7Console7presentEv",
          reinterpret_cast<uint64_t>(&module_console_present)},
         {"kconsole", reinterpret_cast<uint64_t>(&kconsole)},

@@ -8,6 +8,8 @@
 #include "../sync.hpp"
 #include "../vm.hpp"
 #include "arch/x86_64/memory/paging.hpp"
+#include "drivers/display_accel.hpp"
+#include "neutrino_drm.hpp"
 
 namespace descriptor {
 
@@ -203,6 +205,55 @@ size_t usable_frame_bytes(const FramebufferSlot& slot) {
                                              : g_frame_bytes;
 }
 
+bool present_with_acceleration(const FramebufferSlot& slot,
+                               uint32_t x,
+                               uint32_t y,
+                               uint32_t width,
+                               uint32_t height) {
+    const Framebuffer* fb = &slot.fb;
+    if (fb->bpp != 32 || slot.physical_page_count == 0 ||
+        slot.buffer_bytes < g_frame_bytes ||
+        fb->width > UINT32_MAX || fb->height > UINT32_MAX ||
+        fb->pitch > UINT32_MAX) {
+        return false;
+    }
+    return display_accel::present(
+        {.physical_pages = slot.physical_pages,
+         .physical_page_count = slot.physical_page_count,
+         .byte_length = g_frame_bytes,
+         .width = static_cast<uint32_t>(fb->width),
+         .height = static_cast<uint32_t>(fb->height),
+         .pitch_bytes = static_cast<uint32_t>(fb->pitch),
+         .bits_per_pixel = fb->bpp},
+        x,
+        y,
+        width,
+        height);
+}
+
+bool fill_with_acceleration(const FramebufferSlot& slot,
+                            uint32_t x,
+                            uint32_t y,
+                            uint32_t width,
+                            uint32_t height,
+                            uint32_t color) {
+    const Framebuffer* fb = &slot.fb;
+    if (fb->bpp != 32 || slot.physical_page_count == 0 ||
+        slot.buffer_bytes < g_frame_bytes || fb->width > UINT32_MAX ||
+        fb->height > UINT32_MAX || fb->pitch > UINT32_MAX) {
+        return false;
+    }
+    return display_accel::fill(
+        {.physical_pages = slot.physical_pages,
+         .physical_page_count = slot.physical_page_count,
+         .byte_length = g_frame_bytes,
+         .width = static_cast<uint32_t>(fb->width),
+         .height = static_cast<uint32_t>(fb->height),
+         .pitch_bytes = static_cast<uint32_t>(fb->pitch),
+         .bits_per_pixel = fb->bpp},
+        x, y, width, height, color);
+}
+
 void copy_to_hardware(const FramebufferSlot& slot) {
     if (g_hw_base == nullptr || g_frame_bytes == 0 || slot.buffer == nullptr) {
         return;
@@ -210,6 +261,14 @@ void copy_to_hardware(const FramebufferSlot& slot) {
     size_t bytes = g_frame_bytes;
     if (slot.buffer_bytes < bytes) {
         bytes = slot.buffer_bytes;
+    }
+    if (bytes == g_frame_bytes &&
+        present_with_acceleration(slot,
+                                  0,
+                                  0,
+                                  static_cast<uint32_t>(slot.fb.width),
+                                  static_cast<uint32_t>(slot.fb.height))) {
+        return;
     }
     memcpy_simd(g_hw_base, slot.buffer, bytes);
 }
@@ -282,6 +341,9 @@ bool copy_rect_to_hardware(const FramebufferSlot& slot,
         return false;
     }
     size_t frame_bytes = usable_frame_bytes(slot);
+    if (present_with_acceleration(slot, x, y, width, height)) {
+        return true;
+    }
     if (x == 0 && width == fb->width) {
         if (static_cast<size_t>(y) > static_cast<size_t>(-1) / fb->pitch ||
             static_cast<size_t>(height) > static_cast<size_t>(-1) / fb->pitch) {
@@ -494,10 +556,6 @@ int framebuffer_set_property(DescriptorEntry& entry,
                              uint32_t property,
                              const void* in,
                              size_t size) {
-    if (property !=
-        static_cast<uint32_t>(descriptor_defs::Property::FramebufferPresent)) {
-        return -1;
-    }
     BlockingSelectionGuard selection_guard;
     auto* slot = slot_from_entry(entry);
     if (slot == nullptr || slot->buffer == nullptr) {
@@ -506,6 +564,26 @@ int framebuffer_set_property(DescriptorEntry& entry,
     uint32_t slot_index =
         static_cast<uint32_t>(slot - g_framebuffers);
     if (__atomic_load_n(&g_active_slot, __ATOMIC_ACQUIRE) != slot_index) {
+        return -1;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::FramebufferFill)) {
+        if (size < sizeof(descriptor_defs::FramebufferFill) || in == nullptr) {
+            return -1;
+        }
+        const auto* fill =
+            reinterpret_cast<const descriptor_defs::FramebufferFill*>(in);
+        return fill_with_acceleration(*slot,
+                                      fill->x,
+                                      fill->y,
+                                      fill->width,
+                                      fill->height,
+                                      fill->color)
+                   ? 0
+                   : -1;
+    }
+    if (property !=
+        static_cast<uint32_t>(descriptor_defs::Property::FramebufferPresent)) {
         return -1;
     }
     if (size == 0 || in == nullptr) {
@@ -838,6 +916,108 @@ bool open_graphical_session(process::Task& proc,
     return true;
 }
 
+int drm_get_property(DescriptorEntry& entry,
+                     uint32_t property,
+                     void* out,
+                     size_t size) {
+    if (out == nullptr) return -1;
+    if (property == static_cast<uint32_t>(neutrino_drm::Property::DeviceInfo)) {
+        if (size < sizeof(neutrino_drm::DeviceInfo)) return -1;
+        *static_cast<neutrino_drm::DeviceInfo*>(out) = {
+            .abi_major = 1,
+            .abi_minor = 0,
+            .flags = neutrino_drm::kDeviceCpuPresent |
+                     (display_accel::available() ? neutrino_drm::kDeviceGpuPresent : 0u),
+            .connector_id = neutrino_drm::kConnectorId,
+            .crtc_id = neutrino_drm::kCrtcId,
+            .primary_plane_id = neutrino_drm::kPrimaryPlaneId,
+            .framebuffer_id = neutrino_drm::kFramebufferId,
+            .dumb_handle = neutrino_drm::kDumbHandle,
+        };
+        return 0;
+    }
+    if (property == static_cast<uint32_t>(neutrino_drm::Property::ModeInfo)) {
+        if (size < sizeof(neutrino_drm::ModeInfo)) return -1;
+        descriptor_defs::FramebufferInfo info{};
+        if (framebuffer_get_property(entry,
+                                     static_cast<uint32_t>(descriptor_defs::Property::FramebufferInfo),
+                                     &info, sizeof(info)) != 0 || info.bpp != 32) return -1;
+        *static_cast<neutrino_drm::ModeInfo*>(out) = {
+            .width = info.width, .height = info.height, .pitch = info.pitch,
+            .format = 0x34325258u, .vrefresh_millihz = 60000, .flags = 0,
+        };
+        return 0;
+    }
+    return framebuffer_get_property(entry, property, out, size);
+}
+
+int drm_set_property(DescriptorEntry& entry,
+                     uint32_t property,
+                     const void* in,
+                     size_t size) {
+    FramebufferSlot* slot = slot_from_entry(entry);
+    if (slot == nullptr || slot->session_owner == nullptr) return -1;
+    if (property == static_cast<uint32_t>(neutrino_drm::Property::SetCrtc)) {
+        if (in == nullptr || size < sizeof(neutrino_drm::SetCrtc)) return -1;
+        const auto* set = static_cast<const neutrino_drm::SetCrtc*>(in);
+        descriptor_defs::FramebufferInfo info{};
+        if (set->crtc_id != neutrino_drm::kCrtcId ||
+            set->connector_id != neutrino_drm::kConnectorId ||
+            set->framebuffer_id != neutrino_drm::kFramebufferId || set->flags != 0 ||
+            framebuffer_get_property(entry,
+                                     static_cast<uint32_t>(descriptor_defs::Property::FramebufferInfo),
+                                     &info, sizeof(info)) != 0 ||
+            set->mode.width != info.width || set->mode.height != info.height ||
+            set->mode.pitch != info.pitch || set->mode.format != 0x34325258u) return -1;
+        const uint32_t index = static_cast<uint32_t>(slot - g_framebuffers);
+        if (!framebuffer_activate_for_process(*slot->session_owner, index)) return -1;
+        return framebuffer_set_property(entry,
+                                        static_cast<uint32_t>(descriptor_defs::Property::FramebufferPresent),
+                                        nullptr, 0);
+    }
+    if (property == static_cast<uint32_t>(neutrino_drm::Property::Present)) {
+        if (in == nullptr || size < sizeof(neutrino_drm::Rect)) return -1;
+        const auto* damage = static_cast<const neutrino_drm::Rect*>(in);
+        const descriptor_defs::FramebufferRect rect{
+            .x = damage->x, .y = damage->y, .width = damage->width, .height = damage->height,
+        };
+        return framebuffer_set_property(entry,
+                                        static_cast<uint32_t>(descriptor_defs::Property::FramebufferPresent),
+                                        &rect, sizeof(rect));
+    }
+    return framebuffer_set_property(entry, property, in, size);
+}
+
+void drm_close(DescriptorEntry& entry) {
+    framebuffer_close(entry);
+    graphical_session_close(entry);
+}
+
+const Ops kDrmOps{
+    .read = framebuffer_read, .write = framebuffer_write,
+    .get_property = drm_get_property, .set_property = drm_set_property,
+};
+
+bool open_drm(process::Task& proc, uint64_t resource_selector,
+              uint64_t requested_flags, uint64_t open_context, Allocation& alloc) {
+    Allocation session{};
+    if (!open_graphical_session(proc, resource_selector, requested_flags,
+                                open_context, session)) return false;
+    Allocation framebuffer{};
+    if (!open_framebuffer(proc, 0, 0, 0, framebuffer)) {
+        DescriptorEntry temporary{};
+        temporary.object = session.object;
+        graphical_session_close(temporary);
+        return false;
+    }
+    alloc = framebuffer;
+    alloc.type = kTypeDrm;
+    alloc.name = "drm-card0";
+    alloc.ops = &kDrmOps;
+    alloc.close = drm_close;
+    return true;
+}
+
 }  // namespace framebuffer_descriptor
 
 bool register_framebuffer_descriptor() {
@@ -849,6 +1029,11 @@ bool register_graphical_session_descriptor() {
         kTypeGraphicalSession,
         framebuffer_descriptor::open_graphical_session,
         &framebuffer_descriptor::kGraphicalSessionOps);
+}
+
+bool register_drm_descriptor() {
+    return register_type(kTypeDrm, framebuffer_descriptor::open_drm,
+                         &framebuffer_descriptor::kDrmOps);
 }
 
 void register_framebuffer_device(Framebuffer& framebuffer,
