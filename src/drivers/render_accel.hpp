@@ -10,15 +10,19 @@ struct Surface {
     size_t byte_length;
 };
 
-using FillFn = bool (*)(const Surface&, uint64_t byte_offset,
+using FillFn = bool (*)(const Surface&, uint64_t gpu_va, uint64_t byte_offset,
                         uint32_t pitch_bytes, uint32_t x, uint32_t y,
                         uint32_t width, uint32_t height, uint32_t color);
-struct Ops { FillFn fill; };
+using BindFn = bool (*)(const Surface&, uint64_t& out_gpu_va);
+using UnbindFn = void (*)(uint64_t gpu_va);
+struct Ops { FillFn fill; BindFn bind; UnbindFn unbind; };
 
 bool available();
-bool fill(const Surface&, uint64_t byte_offset, uint32_t pitch_bytes,
+bool fill(const Surface&, uint64_t gpu_va, uint64_t byte_offset, uint32_t pitch_bytes,
           uint32_t x, uint32_t y, uint32_t width, uint32_t height,
           uint32_t color);
+bool bind(const Surface&, uint64_t& out_gpu_va);
+void unbind(uint64_t gpu_va);
 }  // namespace render_accel
 
 extern "C" bool neutrino_register_render_accelerator(

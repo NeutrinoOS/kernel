@@ -1,201 +1,349 @@
-#include "../descriptor.hpp"
-
 #include "../../drivers/render_accel.hpp"
 #include "../../lib/mem.hpp"
+#include "../descriptor.hpp"
 #include "../memory/physical_allocator.hpp"
 #include "../process.hpp"
 #include "../sync.hpp"
+#include "../time.hpp"
 #include "../vm.hpp"
+#include "../work.hpp"
 #include "arch/x86_64/memory/paging.hpp"
 #include "neutrino_render.hpp"
 
-namespace descriptor {
-namespace render_descriptor {
-
-constexpr size_t kPageSize = 0x1000;
-constexpr size_t kMaxContexts = 4;
-constexpr size_t kMaxBytes = 16ull * 1024 * 1024;
-constexpr size_t kMaxPages = kMaxBytes / kPageSize;
+namespace descriptor::render_descriptor {
+constexpr size_t kPage = 0x1000, kContexts = 4, kBuffers = 4;
+constexpr size_t kBufferBytes = 4ull * 1024 * 1024,
+                 kBufferPages = kBufferBytes / kPage;
 constexpr uint64_t kKernelBase = 0xFFFFE30000000000ull;
-
-struct Context {
-    uint64_t pages[kMaxPages];
-    uint8_t* kernel_base;
-    uint64_t user_base;
-    size_t byte_length;
-    size_t page_count;
-    process::Task* owner;
-    uint64_t completed_fence;
+struct Buffer {
+    uint64_t pages[kBufferPages];
+    uint8_t* kernel;
+    uint64_t user;
+    uint64_t gpu_va;
+    size_t bytes, count;
     bool used;
 };
-
-Context g_contexts[kMaxContexts]{};
+struct Context {
+    Buffer buffers[kBuffers];
+    process::Task* owner;
+    uint64_t submitted, completed;
+    uint32_t fence_state;
+    int32_t fence_error;
+    uint32_t jobs;
+    bool used, closing;
+};
+struct Job {
+    Context* context;
+    uint32_t buffer;
+    neutrino_render::Fill fill;
+    bool used;
+};
+Context g_contexts[kContexts]{};
+Job g_jobs[16]{};
 sync::SpinLock g_lock;
-
-uint64_t kernel_base_for(const Context& context) {
-    return kKernelBase + static_cast<uint64_t>(&context - g_contexts) * kMaxBytes;
+uint64_t kbase(const Context& c, size_t b) {
+    return kKernelBase +
+           (static_cast<uint64_t>(&c - g_contexts) * kBuffers + b) *
+               kBufferBytes;
 }
-
-void release(Context& context) {
-    const uint64_t kernel_base = kernel_base_for(context);
-    for (size_t i = 0; i < context.page_count; ++i) {
-        uint64_t ignored = 0;
-        (void)paging_unmap_page(kernel_base + i * kPageSize, ignored);
-        if (context.pages[i] != 0) memory::free_user_page(context.pages[i]);
-        context.pages[i] = 0;
+void release_buffer(Context& c, size_t bi) {
+    Buffer& b = c.buffers[bi];
+    if (b.gpu_va) render_accel::unbind(b.gpu_va);
+    for (size_t i = 0; i < b.count; i++) {
+        uint64_t x = 0;
+        (void)paging_unmap_page(kbase(c, bi) + i * kPage, x);
+        if (b.pages[i]) memory::free_user_page(b.pages[i]);
     }
-    context = {};
+    b = {};
 }
-
-bool map_user(process::Task& proc, Context& context) {
-    vm::Region region = vm::reserve_user_region(proc.cr3, context.byte_length,
-                                                  vm::MappingKind::Device);
-    if (region.base == 0 || region.length != context.byte_length) return false;
-    for (size_t i = 0; i < context.page_count; ++i) {
-        if (!paging_map_page_cr3(proc.cr3, region.base + i * kPageSize,
-                                 context.pages[i], PAGE_FLAG_USER | PAGE_FLAG_WRITE |
-                                                   PAGE_FLAG_NO_EXECUTE)) {
-            for (size_t j = 0; j < i; ++j) {
-                uint64_t ignored = 0;
-                (void)paging_unmap_page_cr3(proc.cr3, region.base + j * kPageSize, ignored);
+void release_context(Context& c) {
+    for (size_t i = 0; i < kBuffers; i++) release_buffer(c, i);
+    c = {};
+}
+bool map_user(process::Task& p, Context& c, size_t bi) {
+    Buffer& b = c.buffers[bi];
+    vm::Region r =
+        vm::reserve_user_region(p.cr3, b.bytes, vm::MappingKind::Device);
+    if (!r.base || r.length != b.bytes) return false;
+    for (size_t i = 0; i < b.count; i++)
+        if (!paging_map_page_cr3(
+                p.cr3, r.base + i * kPage, b.pages[i],
+                PAGE_FLAG_USER | PAGE_FLAG_WRITE | PAGE_FLAG_NO_EXECUTE)) {
+            for (size_t j = 0; j < i; j++) {
+                uint64_t x = 0;
+                (void)paging_unmap_page_cr3(p.cr3, r.base + j * kPage, x);
             }
-            vm::release_external_region(proc.cr3, region);
+            vm::release_external_region(p.cr3, r);
             return false;
         }
-    }
-    if (!vm::mark_region_resident(proc.cr3, region, context.page_count)) {
-        for (size_t i = 0; i < context.page_count; ++i) {
-            uint64_t ignored = 0;
-            (void)paging_unmap_page_cr3(proc.cr3, region.base + i * kPageSize, ignored);
+    if (!vm::mark_region_resident(p.cr3, r, b.count)) {
+        for (size_t i = 0; i < b.count; i++) {
+            uint64_t x = 0;
+            (void)paging_unmap_page_cr3(p.cr3, r.base + i * kPage, x);
         }
-        vm::release_external_region(proc.cr3, region);
+        vm::release_external_region(p.cr3, r);
         return false;
     }
-    context.user_base = region.base;
+    b.user = r.base;
     return true;
 }
-
-bool allocate(process::Task& proc, Context& context, size_t requested) {
-    if (requested == 0) requested = 4ull * 1024 * 1024;
-    if (requested > kMaxBytes || requested > SIZE_MAX - (kPageSize - 1)) return false;
-    const size_t pages = (requested + kPageSize - 1) / kPageSize;
-    if (pages == 0 || memory::user_free_pages() < pages) return false;
-    context.byte_length = pages * kPageSize;
-    context.page_count = pages;
-    const uint64_t kernel_base = kernel_base_for(context);
-    for (size_t i = 0; i < pages; ++i) {
-        uint64_t page = memory::alloc_user_page();
-        if (page == 0 || !paging_map_page(kernel_base + i * kPageSize, page,
-                                           PAGE_FLAG_WRITE | PAGE_FLAG_NO_EXECUTE)) {
-            if (page != 0) memory::free_user_page(page);
-            context.page_count = i;
-            release(context);
+bool allocate(process::Task& p, Context& c, size_t bi, size_t request) {
+    if (bi >= kBuffers || c.buffers[bi].used) return false;
+    if (!request) request = kBufferBytes;
+    if (request > kBufferBytes || request > SIZE_MAX - (kPage - 1))
+        return false;
+    Buffer& b = c.buffers[bi];
+    b.count = (request + kPage - 1) / kPage;
+    b.bytes = b.count * kPage;
+    if (!b.count || memory::user_free_pages() < b.count) return false;
+    for (size_t i = 0; i < b.count; i++) {
+        uint64_t pg = memory::alloc_user_page();
+        if (!pg || !paging_map_page(kbase(c, bi) + i * kPage, pg,
+                                    PAGE_FLAG_WRITE | PAGE_FLAG_NO_EXECUTE)) {
+            if (pg) memory::free_user_page(pg);
+            b.count = i;
+            release_buffer(c, bi);
             return false;
         }
-        context.pages[i] = page;
+        b.pages[i] = pg;
     }
-    context.kernel_base = reinterpret_cast<uint8_t*>(kernel_base);
-    memset(context.kernel_base, 0, context.byte_length);
-    if (!map_user(proc, context)) {
-        release(context);
+    b.kernel = reinterpret_cast<uint8_t*>(kbase(c, bi));
+    memset(b.kernel, 0, b.bytes);
+    b.used = true;
+    const render_accel::Surface surface{b.pages, b.count, b.bytes};
+    (void)render_accel::bind(surface, b.gpu_va);
+    if (!map_user(p, c, bi)) {
+        release_buffer(c, bi);
         return false;
     }
     return true;
 }
-
-bool validate_fill(const Context& context, const neutrino_render::Fill& fill) {
-    if (fill.fence == 0 || fill.fence <= context.completed_fence || fill.flags != 0 ||
-        fill.width == 0 || fill.height == 0 || fill.pitch_bytes == 0 ||
-        (fill.pitch_bytes & 3u) != 0 || fill.x > UINT32_MAX / 4 ||
-        fill.width > (UINT32_MAX / 4) || fill.x > fill.pitch_bytes / 4 ||
-        fill.width > fill.pitch_bytes / 4 - fill.x ||
-        fill.y > UINT64_MAX / fill.pitch_bytes ||
-        fill.byte_offset > context.byte_length || (fill.byte_offset & (kPageSize - 1)) != 0) return false;
-    const uint64_t first = fill.byte_offset + static_cast<uint64_t>(fill.y) * fill.pitch_bytes +
-                           static_cast<uint64_t>(fill.x) * 4;
-    const uint64_t row_bytes = static_cast<uint64_t>(fill.width) * 4;
-    if (first > context.byte_length || row_bytes > context.byte_length - first ||
-        fill.height - 1 > UINT64_MAX / fill.pitch_bytes) return false;
-    const uint64_t last = first + static_cast<uint64_t>(fill.height - 1) * fill.pitch_bytes;
-    return last <= context.byte_length && row_bytes <= context.byte_length - last;
+bool valid(const Buffer& b, const neutrino_render::Fill& f, uint64_t prior) {
+    if (!f.fence || f.fence <= prior || f.flags || !f.width || !f.height ||
+        !f.pitch_bytes || (f.pitch_bytes & 3) || f.x > f.pitch_bytes / 4 ||
+        f.width > f.pitch_bytes / 4 - f.x || f.byte_offset > b.bytes ||
+        (f.byte_offset & (kPage - 1)))
+        return false;
+    uint64_t first = f.byte_offset + (uint64_t)f.y * f.pitch_bytes +
+                     (uint64_t)f.x * 4,
+             row = (uint64_t)f.width * 4;
+    if (first > b.bytes || row > b.bytes - first ||
+        f.height - 1 > UINT64_MAX / f.pitch_bytes)
+        return false;
+    uint64_t last = first + (uint64_t)(f.height - 1) * f.pitch_bytes;
+    return last <= b.bytes && row <= b.bytes - last;
 }
-
-void cpu_fill(Context& context, const neutrino_render::Fill& fill) {
-    for (uint32_t row = 0; row < fill.height; ++row) {
-        uint64_t offset = fill.byte_offset + static_cast<uint64_t>(fill.y + row) * fill.pitch_bytes +
-                          static_cast<uint64_t>(fill.x) * 4;
-        auto* pixel = reinterpret_cast<uint32_t*>(context.kernel_base + offset);
-        for (uint32_t column = 0; column < fill.width; ++column) pixel[column] = fill.color_xrgb8888;
+void cpu(Buffer& b, const neutrino_render::Fill& f) {
+    for (uint32_t y = 0; y < f.height; y++) {
+        auto* p = reinterpret_cast<uint32_t*>(
+            b.kernel + f.byte_offset + (uint64_t)(f.y + y) * f.pitch_bytes +
+            (uint64_t)f.x * 4);
+        for (uint32_t x = 0; x < f.width; x++) p[x] = f.color_xrgb8888;
     }
 }
-
-int get_property(DescriptorEntry& entry, uint32_t property, void* out, size_t size) {
-    auto* context = static_cast<Context*>(entry.object);
-    if (context == nullptr || !context->used || out == nullptr ||
-        property != static_cast<uint32_t>(neutrino_render::Property::Info) ||
-        size < sizeof(neutrino_render::Info)) return -1;
-    *static_cast<neutrino_render::Info*>(out) = {
-        .abi_major = 1, .abi_minor = 0,
-        .flags = neutrino_render::kInfoCpuFallback |
-                 (render_accel::available() ? neutrino_render::kInfoGpuBlt : 0u),
-        .virtual_base = context->user_base, .byte_length = context->byte_length,
-        .completed_fence = context->completed_fence,
-    };
-    return 0;
-}
-
-int set_property(DescriptorEntry& entry, uint32_t property, const void* in, size_t size) {
-    auto* context = static_cast<Context*>(entry.object);
-    if (context == nullptr || !context->used || in == nullptr ||
-        property != static_cast<uint32_t>(neutrino_render::Property::SubmitFill) ||
-        size < sizeof(neutrino_render::Fill)) return -1;
-    const auto& fill = *static_cast<const neutrino_render::Fill*>(in);
+void complete_job(void* raw) {
+    auto* j = static_cast<Job*>(raw);
     g_lock.lock();
-    if (!validate_fill(*context, fill)) { g_lock.unlock(); return -1; }
-    const render_accel::Surface surface{context->pages, context->page_count, context->byte_length};
-    if (!render_accel::fill(surface, fill.byte_offset, fill.pitch_bytes, fill.x, fill.y,
-                            fill.width, fill.height, fill.color_xrgb8888)) cpu_fill(*context, fill);
-    context->completed_fence = fill.fence;
+    if (!j->used) {
+        g_lock.unlock();
+        return;
+    }
+    Context& c = *j->context;
+    Buffer& b = c.buffers[j->buffer];
+    if (c.closing) {
+        c.fence_state = neutrino_render::kFenceCancelled;
+        c.fence_error = -1;
+    } else {
+        render_accel::Surface s{b.pages, b.count, b.bytes};
+        if (!render_accel::fill(s, b.gpu_va, j->fill.byte_offset, j->fill.pitch_bytes,
+                                j->fill.x, j->fill.y, j->fill.width,
+                                j->fill.height, j->fill.color_xrgb8888))
+            cpu(b, j->fill);
+        c.fence_state = neutrino_render::kFenceComplete;
+        c.fence_error = 0;
+        c.completed = j->fill.fence;
+    }
+    if (c.jobs) --c.jobs;
+    j->used = false;
+    if (c.closing && !c.jobs) release_context(c);
     g_lock.unlock();
-    return 0;
 }
-
-void close(DescriptorEntry& entry) {
-    auto* context = static_cast<Context*>(entry.object);
-    if (context == nullptr) return;
-    g_lock.lock();
-    if (context->used && context->owner != nullptr && entry.subsystem_data != nullptr) {
-        for (size_t i = 0; i < context->page_count; ++i) {
-            uint64_t ignored = 0;
-            (void)paging_unmap_page_cr3(context->owner->cr3, context->user_base + i * kPageSize, ignored);
+int get(DescriptorEntry& e, uint32_t prop, void* out, size_t n) {
+    auto* c = static_cast<Context*>(e.object);
+    if (!c || !c->used || !out) return -1;
+    if (prop == (uint32_t)neutrino_render::Property::Info &&
+        n >= sizeof(neutrino_render::Info)) {
+        Buffer& b = c->buffers[0];
+        *static_cast<neutrino_render::Info*>(out) = {
+            1,
+            1,
+            neutrino_render::kInfoCpuFallback |
+                (render_accel::available() ? neutrino_render::kInfoGpuBlt : 0u),
+            b.user,
+            b.bytes,
+            c->completed};
+        return 0;
+    }
+    if (prop >= (uint32_t)neutrino_render::Property::BufferInfo0 &&
+        prop <= (uint32_t)neutrino_render::Property::BufferInfo3 &&
+        n >= sizeof(neutrino_render::BufferInfo)) {
+        size_t i = prop - (uint32_t)neutrino_render::Property::BufferInfo0;
+        Buffer& b = c->buffers[i];
+        if (!b.used) return -1;
+        *static_cast<neutrino_render::BufferInfo*>(out) = {
+            static_cast<uint32_t>(i + 1), 0, b.user, b.bytes, b.gpu_va};
+        return 0;
+    }
+    if (prop == (uint32_t)neutrino_render::Property::FenceInfo &&
+        n >= sizeof(neutrino_render::FenceInfo)) {
+        *static_cast<neutrino_render::FenceInfo*>(out) = {
+            c->submitted, c->completed, c->fence_state, c->fence_error};
+        return 0;
+    }
+    return -1;
+}
+int submit(Context& c, uint32_t bi, const neutrino_render::Fill& f) {
+    if (bi >= kBuffers || !c.buffers[bi].used ||
+        !valid(c.buffers[bi], f, c.submitted))
+        return -1;
+    Job* j = nullptr;
+    for (auto& x : g_jobs)
+        if (!x.used) {
+            j = &x;
+            break;
         }
-        vm::release_external_region(context->owner->cr3, {context->user_base, context->byte_length});
-        release(*context);
+    if (!j) return -1;
+    j->used = true;
+    j->context = &c;
+    j->buffer = bi;
+    j->fill = f;
+    c.submitted = f.fence;
+    c.fence_state = neutrino_render::kFencePending;
+    c.fence_error = 0;
+    c.jobs++;
+    if (!work::schedule(complete_job, j)) {
+        j->used = false;
+        c.jobs--;
+        c.fence_state = neutrino_render::kFenceFailed;
+        c.fence_error = -1;
+        return -1;
+    }
+    return 0;
+}
+int wait_fence(Context& c, const neutrino_render::FenceWait& request) {
+    if (!request.fence || request.flags || request.reserved) return -1;
+    const uint64_t start = timekeeping::tick_count();
+    for (;;) {
+        g_lock.lock();
+        const bool done = c.completed >= request.fence;
+        const bool failed = c.fence_state == neutrino_render::kFenceFailed ||
+                            c.fence_state == neutrino_render::kFenceCancelled;
+        g_lock.unlock();
+        if (done) return 0;
+        if (failed || (request.timeout_ticks &&
+                       timekeeping::tick_count() - start >= request.timeout_ticks)) return -1;
+        asm volatile("pause");
+    }
+}
+int set(DescriptorEntry& e, uint32_t prop, const void* in, size_t n) {
+    auto* c = static_cast<Context*>(e.object);
+    if (!c || !c->used || c->closing || !in) return -1;
+  if (prop == (uint32_t)neutrino_render::Property::WaitFence &&
+      n >= sizeof(neutrino_render::FenceWait))
+    return wait_fence(*c, *static_cast<const neutrino_render::FenceWait*>(in));
+  g_lock.lock();
+    int r = -1;
+    if (prop == (uint32_t)neutrino_render::Property::SubmitFill &&
+        n >= sizeof(neutrino_render::Fill))
+        r = submit(*c, 0, *static_cast<const neutrino_render::Fill*>(in));
+    else if (prop == (uint32_t)neutrino_render::Property::CreateBuffer &&
+             n >= sizeof(neutrino_render::BufferCreate)) {
+        auto& q = *static_cast<const neutrino_render::BufferCreate*>(in);
+        if (!q.flags && q.handle > 0 && q.handle <= kBuffers)
+            r = allocate(*c->owner, *c, q.handle - 1, (size_t)q.byte_length)
+                    ? 0
+                    : -1;
+    } else if (prop == (uint32_t)neutrino_render::Property::DestroyBuffer &&
+               n >= sizeof(neutrino_render::BufferDestroy)) {
+        auto& q = *static_cast<const neutrino_render::BufferDestroy*>(in);
+        size_t i = q.handle ? q.handle - 1 : kBuffers;
+        if (!q.flags && q.handle > 1 && i < kBuffers && c->buffers[i].used &&
+            !c->jobs) {
+            Buffer& b = c->buffers[i];
+            for (size_t p = 0; p < b.count; p++) {
+                uint64_t x = 0;
+                (void)paging_unmap_page_cr3(c->owner->cr3, b.user + p * kPage,
+                                            x);
+            }
+            vm::release_external_region(c->owner->cr3, {b.user, b.bytes});
+            release_buffer(*c, i);
+            r = 0;
+        }
+    } else if (prop == (uint32_t)neutrino_render::Property::SubmitFill2 &&
+               n >= sizeof(neutrino_render::Fill2)) {
+        auto& q = *static_cast<const neutrino_render::Fill2*>(in);
+        if (!q.reserved && q.buffer_handle > 0 && q.buffer_handle <= kBuffers)
+            r = submit(*c, q.buffer_handle - 1, q.fill);
+    }
+    g_lock.unlock();
+    return r;
+}
+void close(DescriptorEntry& e) {
+    auto* c = static_cast<Context*>(e.object);
+    if (!c) return;
+    g_lock.lock();
+    if (c->used) {
+        c->closing = true;
+        for (size_t bi = 0; bi < kBuffers; bi++) {
+            Buffer& b = c->buffers[bi];
+            if (!b.used) continue;
+            for (size_t i = 0; i < b.count; i++) {
+                uint64_t x = 0;
+                (void)paging_unmap_page_cr3(c->owner->cr3, b.user + i * kPage,
+                                            x);
+            }
+            vm::release_external_region(c->owner->cr3, {b.user, b.bytes});
+            b.user = 0;
+        }
+        if (!c->jobs) release_context(*c);
     }
     g_lock.unlock();
 }
-
-const Ops kOps{.read = nullptr, .write = nullptr, .get_property = get_property, .set_property = set_property};
-
-bool open(process::Task& proc, uint64_t bytes, uint64_t flags, uint64_t context_flags, Allocation& alloc) {
-    if (is_kernel_process(proc) || flags != 0 || context_flags != 0) return false;
+const Ops kOps{nullptr, nullptr, get, set};
+bool open(process::Task& p, uint64_t bytes, uint64_t flags, uint64_t ctx,
+          Allocation& a) {
+    if (is_kernel_process(p) || flags || ctx) return false;
     g_lock.lock();
-    Context* context = nullptr;
-    for (Context& candidate : g_contexts) if (!candidate.used) { context = &candidate; break; }
-    if (context == nullptr || !allocate(proc, *context, static_cast<size_t>(bytes))) {
-        g_lock.unlock(); return false;
+    Context* c = nullptr;
+    for (auto& x : g_contexts)
+        if (!x.used) {
+            c = &x;
+            break;
+        }
+    if (!c || !allocate(p, *c, 0, (size_t)bytes)) {
+        g_lock.unlock();
+        return false;
     }
-    context->owner = &proc;
-    context->used = true;
-    alloc = {.type = kTypeRender,
-             .flags = static_cast<uint64_t>(Flag::Mappable) | static_cast<uint64_t>(Flag::Device),
-             .extended_flags = 0, .has_extended_flags = false, .object = context,
-             .subsystem_data = reinterpret_cast<void*>(context->user_base), .name = "render-blt",
-             .ops = &kOps, .ext = nullptr, .close = close};
+    c->owner = &p;
+    c->used = true;
+    c->fence_state = neutrino_render::kFenceComplete;
+    a = {kTypeRender,
+         (uint64_t)Flag::Mappable | (uint64_t)Flag::Device,
+         0,
+         false,
+         c,
+         reinterpret_cast<void*>(c->buffers[0].user),
+         "render-blt",
+         &kOps,
+         nullptr,
+         close};
     g_lock.unlock();
     return true;
 }
-}  // namespace render_descriptor
-
-bool register_render_descriptor() { return register_type(kTypeRender, render_descriptor::open, &render_descriptor::kOps); }
+}  // namespace descriptor::render_descriptor
+namespace descriptor {
+bool register_render_descriptor() {
+    return register_type(kTypeRender, render_descriptor::open,
+                         &render_descriptor::kOps);
+}
 }  // namespace descriptor
