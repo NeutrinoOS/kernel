@@ -13,8 +13,13 @@ namespace {
 
 constexpr size_t kMaxStreams = 16;
 constexpr size_t kStreamBufferBytes = 64 * 1024;
-constexpr size_t kMixChunkBytes = 4 * 1024;
-constexpr size_t kHardwareTargetBytes = 16 * 1024;
+// The poll worker runs at 100 Hz and can be delayed by CPU-heavy clients such
+// as video playback.  Keep substantially more than one scheduling slice in
+// HDA so a delayed mixer pass produces a transient backlog, not a device-wide
+// underrun, without pushing enough hidden latency to desynchronize clients'
+// audio clocks.  At 48 kHz stereo PCM this is roughly 171 ms of lead time.
+constexpr size_t kMixChunkBytes = 8 * 1024;
+constexpr size_t kHardwareTargetBytes = 32 * 1024;
 
 struct Stream {
     alignas(4) uint8_t buffer[kStreamBufferBytes];
@@ -304,7 +309,7 @@ bool open(process::Task&, uint64_t selector, uint64_t, uint64_t,
     {
         sync::IrqLockGuard guard(g_stream_lock);
         if (!g_poll_registered) {
-            g_poll_registered = scheduler::register_poll(mix_service);
+            g_poll_registered = scheduler::register_realtime_poll(mix_service);
         }
         if (!g_poll_registered) return false;
         for (auto& candidate : g_streams) {

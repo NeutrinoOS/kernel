@@ -38,6 +38,12 @@ scheduler::PollFn g_poll_fns[kMaxPollFns]{};
 sync::SpinLock g_poll_lock;
 process::Task* g_poll_worker = nullptr;
 bool g_poll_worker_starting = false;
+// A regular poll worker is deliberately deferred until a normal kernel-task
+// scheduling opportunity.  The realtime worker is reserved for bounded,
+// non-blocking service such as audio mixing and runs once per timer tick.
+scheduler::PollFn g_realtime_poll = nullptr;
+process::Task* g_realtime_poll_worker = nullptr;
+bool g_realtime_poll_worker_starting = false;
 constexpr uint64_t kTargetLatencyNs = 6'000'000ull;
 constexpr uint64_t kMinGranularityNs = 900'000ull;
 uint64_t g_slice_start_ticks[percpu::kMaxCpus]{};
@@ -125,7 +131,8 @@ private:
 
 size_t current_cpu_index();
 
-process::Task* pop_next_runnable(bool include_kernel_tasks) {
+process::Task* pop_next_runnable(bool include_kernel_tasks,
+                                 bool include_realtime_kernel_tasks = false) {
     for (;;) {
         process::Task* candidate = nullptr;
         {
@@ -144,7 +151,10 @@ process::Task* pop_next_runnable(bool include_kernel_tasks) {
                 if (state != process::State::Ready) {
                     continue;
                 }
-                if (!include_kernel_tasks && proc->is_kernel_task) {
+                if (proc->is_kernel_task &&
+                    (!include_kernel_tasks &&
+                     (!include_realtime_kernel_tasks ||
+                      proc != g_realtime_poll_worker))) {
                     queue_push(queue, proc);
                     continue;
                 }
@@ -181,6 +191,19 @@ void poll_worker(process::Task& proc) {
         }
         process::store_state(proc, process::State::Blocked);
     }
+}
+
+void realtime_poll_worker(process::Task& proc) {
+    scheduler::PollFn poll = nullptr;
+    {
+        PollGuard guard;
+        poll = g_realtime_poll;
+    }
+    if (poll != nullptr) poll();
+
+    const uint64_t now = timekeeping::tick_count();
+    proc.sleep_until_tick = now == UINT64_MAX ? UINT64_MAX : now + 1;
+    process::store_state(proc, process::State::Blocked);
 }
 
 void enqueue_locked(process::Task* proc) {
@@ -454,6 +477,44 @@ bool register_poll(PollFn fn) {
     return true;
 }
 
+bool register_realtime_poll(PollFn fn) {
+    if (fn == nullptr) return false;
+
+    bool create_worker = false;
+    process::Task* worker_to_wake = nullptr;
+    {
+        PollGuard guard;
+        if (g_realtime_poll != nullptr && g_realtime_poll != fn) return false;
+        g_realtime_poll = fn;
+        if (g_realtime_poll_worker == nullptr &&
+            !g_realtime_poll_worker_starting) {
+            g_realtime_poll_worker_starting = true;
+            create_worker = true;
+        } else if (g_realtime_poll_worker != nullptr) {
+            worker_to_wake = g_realtime_poll_worker;
+        }
+    }
+
+    if (create_worker) {
+        process::Task* worker = process::allocate_kernel_task(realtime_poll_worker);
+        {
+            PollGuard guard;
+            g_realtime_poll_worker_starting = false;
+            if (worker != nullptr) {
+                worker->preferred_cpu = 0;
+                g_realtime_poll_worker = worker;
+                worker_to_wake = worker;
+            } else {
+                g_realtime_poll = nullptr;
+            }
+        }
+    }
+    if (worker_to_wake != nullptr) {
+        if (!process::wake(*worker_to_wake)) enqueue(worker_to_wake);
+    }
+    return worker_to_wake != nullptr;
+}
+
 void service_polls() {
     percpu::Cpu* cpu = percpu::current_cpu();
     if (cpu != nullptr && cpu->index != 0) {
@@ -562,7 +623,8 @@ void remove(process::Task* proc) {
     }
 }
 
-void reschedule_impl(syscall::SyscallFrame& frame, bool run_kernel_tasks) {
+void reschedule_impl(syscall::SyscallFrame& frame, bool run_kernel_tasks,
+                     bool run_realtime_kernel_tasks = false) {
     process::reap_deferred();
     process::Task* current_proc = process::current();
     if (current_proc == nullptr) {
@@ -613,7 +675,7 @@ void reschedule_impl(syscall::SyscallFrame& frame, bool run_kernel_tasks) {
         }
 
     }
-    next = pop_next_runnable(run_kernel_tasks);
+    next = pop_next_runnable(run_kernel_tasks, run_realtime_kernel_tasks);
 
     for (;;) {
         // Run any ready kernel tasks immediately (they have no userspace frame)
@@ -630,7 +692,7 @@ void reschedule_impl(syscall::SyscallFrame& frame, bool run_kernel_tasks) {
                 }
             }
             // fetch another runnable task (prefer userspace)
-            next = pop_next_runnable(run_kernel_tasks);
+            next = pop_next_runnable(run_kernel_tasks, run_realtime_kernel_tasks);
         }
 
         if (next != nullptr) {
@@ -673,7 +735,7 @@ void reschedule_impl(syscall::SyscallFrame& frame, bool run_kernel_tasks) {
         do {
             fs::block_cache::service_idle_flush();
             asm volatile("sti; hlt; cli" ::: "memory");
-            next = pop_next_runnable(run_kernel_tasks);
+            next = pop_next_runnable(run_kernel_tasks, run_realtime_kernel_tasks);
         } while (next == nullptr);
     }
 
@@ -689,7 +751,7 @@ void reschedule_impl(syscall::SyscallFrame& frame, bool run_kernel_tasks) {
 }
 
 void reschedule(syscall::SyscallFrame& frame) {
-    reschedule_impl(frame, true);
+    reschedule_impl(frame, true, true);
 }
 
 void reschedule_from_interrupt(InterruptFrame& frame) {
@@ -699,7 +761,7 @@ void reschedule_from_interrupt(InterruptFrame& frame) {
 
     syscall::SyscallFrame state{};
     capture_from_interrupt(frame, state);
-    reschedule_impl(state, false);
+    reschedule_impl(state, false, true);
     apply_to_interrupt(state, frame);
 }
 

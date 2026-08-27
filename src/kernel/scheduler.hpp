@@ -21,6 +21,9 @@ void register_cpu(percpu::Cpu* cpu);
 void tick(InterruptFrame& frame);
 size_t cpu_total();
 bool register_poll(PollFn fn);
+// Registers the one periodic worker that must run from timer-driven
+// rescheduling, even while userspace remains CPU-bound.
+bool register_realtime_poll(PollFn fn);
 void service_polls();
 
 }  // namespace scheduler
