@@ -37,6 +37,8 @@ constexpr uint32_t kTypeFramebuffer =
     static_cast<uint32_t>(descriptor_defs::Type::Framebuffer);
 constexpr uint32_t kTypeGraphicalSession =
     static_cast<uint32_t>(descriptor_defs::Type::GraphicalSession);
+constexpr uint32_t kTypeDrm = 0x012u;
+constexpr uint32_t kTypeRender = 0x013u;
 constexpr uint32_t kTypeBlockDevice =
     static_cast<uint32_t>(descriptor_defs::Type::BlockDevice);
 constexpr uint32_t kTypeDisk =
@@ -55,6 +57,8 @@ constexpr uint32_t kTypeTaskStats =
     static_cast<uint32_t>(descriptor_defs::Type::TaskStats);
 constexpr uint32_t kTypeKernelLog =
     static_cast<uint32_t>(descriptor_defs::Type::KernelLog);
+constexpr uint32_t kTypeCpuInfo =
+    static_cast<uint32_t>(descriptor_defs::Type::CpuInfo);
 constexpr uint32_t kTypeNetDevice =
     static_cast<uint32_t>(descriptor_defs::Type::NetDevice);
 constexpr uint32_t kTypeNetEndpoint =

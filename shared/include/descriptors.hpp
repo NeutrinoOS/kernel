@@ -21,6 +21,7 @@ enum class Type : uint16_t {
     CpuStats    = 0x060,
     TaskStats   = 0x061,
     KernelLog   = 0x062,
+    CpuInfo     = 0x063,
     NetDevice   = 0x070,
     NetEndpoint = 0x071,
     Pci         = 0x080,
@@ -54,6 +55,7 @@ enum class Property : uint32_t {
     ConsoleCursorBlink= 0x0000000A,
     FramebufferInfo   = 0x00010001,
     FramebufferPresent= 0x00010002,
+    FramebufferFill   = 0x00010003,
     GraphicalSessionInfo = 0x00011001,
     GraphicalSessionControl = 0x00011002,
     BlockGeometry     = 0x00020001,
@@ -192,6 +194,14 @@ struct FramebufferRect {
     uint32_t y;
     uint32_t width;
     uint32_t height;
+};
+
+struct FramebufferFill {
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t color;
 };
 
 // Versioned kernel contract held by the trusted userspace display/session
@@ -378,6 +388,55 @@ struct CpuUsage {
     uint64_t idle_ticks;
     uint64_t irq_ticks;
 };
+
+// Feature numbers are stable, but their bitmap is intentionally not embedded
+// in CpuInfo. Read the descriptor after its fixed CpuInfo header to obtain
+// ceil(feature_count / 8) bitmap bytes. A set bit means the processor
+// advertised the feature through CPUID; it does not promise that Neutrino
+// currently enables every optional feature for userspace.
+enum CpuFeature : uint32_t {
+    kCpuFeatureFpu = 0,
+    kCpuFeatureTsc,
+    kCpuFeatureMsr,
+    kCpuFeatureApic,
+    kCpuFeaturePge,
+    kCpuFeatureMmx,
+    kCpuFeatureFxsr,
+    kCpuFeatureSse,
+    kCpuFeatureSse2,
+    kCpuFeatureSse3,
+    kCpuFeatureSsse3,
+    kCpuFeatureSse4_1,
+    kCpuFeatureSse4_2,
+    kCpuFeatureXsave,
+    kCpuFeatureAvx,
+    kCpuFeatureAes,
+    kCpuFeaturePclmulqdq,
+    kCpuFeatureRdrand,
+    kCpuFeatureFsgsbase,
+    kCpuFeatureSmep,
+    kCpuFeatureSmap,
+    kCpuFeatureInvpcid,
+    kCpuFeatureRdseed,
+    kCpuFeature1GiBPages,
+    kCpuFeatureNx,
+    kCpuFeatureSyscall,
+    kCpuFeatureCount,
+};
+
+struct CpuInfo {
+    char architecture[16];
+    char vendor_id[16];
+    char model_name[64];
+    uint32_t family;
+    uint32_t model;
+    uint32_t stepping;
+    uint32_t logical_cpus;
+    uint32_t feature_count;
+    uint32_t reserved;
+};
+
+static_assert(sizeof(CpuInfo) == 120, "CpuInfo size mismatch");
 
 enum TaskStatFlag : uint32_t {
     kTaskStatFlagKernel = 1u << 0,

@@ -11,10 +11,13 @@ bool register_mouse_descriptor();
 bool register_pipe_descriptor();
 bool register_framebuffer_descriptor();
 bool register_graphical_session_descriptor();
+bool register_drm_descriptor();
+bool register_render_descriptor();
 bool register_block_device_descriptor();
 bool register_shared_memory_descriptor();
 bool register_vty_descriptor();
 bool register_cpu_stats_descriptor();
+bool register_cpu_info_descriptor();
 bool register_task_stats_descriptor();
 bool register_kernel_log_descriptor();
 bool register_net_device_descriptor();
@@ -55,6 +58,14 @@ void register_builtin_types() {
         log_message(LogLevel::Warn,
                     "Descriptor: failed to register graphical session descriptor type");
     }
+    if (!register_drm_descriptor()) {
+        log_message(LogLevel::Warn,
+                    "Descriptor: failed to register DRM descriptor type");
+    }
+    if (!register_render_descriptor()) {
+        log_message(LogLevel::Warn,
+                    "Descriptor: failed to register render descriptor type");
+    }
     if (!register_block_device_descriptor()) {
         log_message(LogLevel::Warn,
                     "Descriptor: failed to register block device descriptor type");
@@ -70,6 +81,10 @@ void register_builtin_types() {
     if (!register_cpu_stats_descriptor()) {
         log_message(LogLevel::Warn,
                     "Descriptor: failed to register cpu stats descriptor type");
+    }
+    if (!register_cpu_info_descriptor()) {
+        log_message(LogLevel::Warn,
+                    "Descriptor: failed to register cpu info descriptor type");
     }
     if (!register_task_stats_descriptor()) {
         log_message(LogLevel::Warn,

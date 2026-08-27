@@ -92,7 +92,7 @@ QEMU_BASE_ARGS := -m 4G -serial stdio \
 		-smp 2 -bios $(QEMU_BIOS) \
 		$(QEMU_STORAGE_ARGS) \
 		-enable-kvm -display sdl \
-		-machine pc -cpu qemu64,+apic,+rdrand \
+		-machine pc -cpu max \
 		$(QEMU_USB_ARGS) \
 		$(QEMU_AUDIO_ARGS) \
 		$(QEMU_NET_ARGS)
