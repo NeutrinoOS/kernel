@@ -17,8 +17,8 @@ public:
                    int8_t* order_map,
                    size_t map_entries);
 
-    uint64_t alloc_pages(size_t pages);
-    uint64_t alloc_order(uint8_t order);
+    uint64_t alloc_pages(size_t pages, bool log_failure = true);
+    uint64_t alloc_order(uint8_t order, bool log_failure = true);
     void free(uint64_t phys);
     bool owns(uint64_t phys) const;
     size_t free_pages() const { return free_pages_; }

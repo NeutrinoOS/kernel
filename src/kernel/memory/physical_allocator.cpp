@@ -12,8 +12,9 @@ namespace memory {
 namespace {
 
 constexpr uint64_t kPageSize = BuddyAllocator::kPageSize;
-constexpr uint64_t kKernelPoolTargetSize = 64ull * 1024 * 1024;
-constexpr size_t kKernelPoolPages = kKernelPoolTargetSize / kPageSize;
+constexpr uint64_t kKernelPoolMinimumSize = 64ull * 1024 * 1024;
+constexpr uint64_t kKernelPoolMaximumSize = 512ull * 1024 * 1024;
+constexpr size_t kKernelPoolPages = kKernelPoolMaximumSize / kPageSize;
 constexpr size_t kUserPageReserve = 256;
 
 BuddyAllocator g_kernel_buddy;
@@ -181,7 +182,13 @@ void init() {
         return;
     }
 
-    uint64_t pool_size = kKernelPoolTargetSize;
+    // The old fixed 64 MiB kernel pool was exhausted by normal module and
+    // driver workloads despite plenty of otherwise usable RAM.  Reserve a
+    // proportional share of the largest range, bounded so small machines
+    // retain user memory and large machines do not waste metadata.
+    uint64_t pool_size = align_down(best_range.length / 4, kPageSize);
+    if (pool_size < kKernelPoolMinimumSize) pool_size = kKernelPoolMinimumSize;
+    if (pool_size > kKernelPoolMaximumSize) pool_size = kKernelPoolMaximumSize;
     if (pool_size > best_range.length) {
         pool_size = align_down(best_range.length, kPageSize);
     }
@@ -363,7 +370,15 @@ uint64_t alloc_kernel_block_pages(size_t pages) {
         return 0;
     }
     lock_alloc();
-    uint64_t phys = g_kernel_buddy.alloc_pages(pages);
+    uint64_t phys = g_kernel_buddy.alloc_pages(pages, false);
+    // Kernel allocations often need physically contiguous memory for DMA or
+    // module images.  Once bootstrapping is complete, borrow from the user
+    // pool rather than failing solely because the kernel's reserved share is
+    // fragmented or temporarily full.  The two pools own disjoint ranges, so
+    // free_kernel_block can safely return the pages to their source pool.
+    if (phys == 0 && g_initialized) {
+        phys = g_user_buddy.alloc_pages(pages);
+    }
     unlock_alloc();
     if (phys != 0) {
         memset(paging_phys_to_virt(phys), 0, pages * kPageSize);
@@ -380,7 +395,14 @@ void free_kernel_block(uint64_t phys) {
         return;
     }
     lock_alloc();
-    g_kernel_buddy.free(phys);
+    if (g_kernel_buddy.owns(phys)) {
+        g_kernel_buddy.free(phys);
+    } else if (g_user_buddy.owns(phys)) {
+        g_user_buddy.free(phys);
+    } else {
+        KERNEL_ASSERT_MSG(false,
+                          "free_kernel_block received a physical address outside allocator pools");
+    }
     unlock_alloc();
 }
 

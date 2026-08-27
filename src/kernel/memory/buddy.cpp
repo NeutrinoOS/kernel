@@ -85,7 +85,7 @@ bool BuddyAllocator::add_range(uint64_t base,
     return true;
 }
 
-uint64_t BuddyAllocator::alloc_pages(size_t pages) {
+uint64_t BuddyAllocator::alloc_pages(size_t pages, bool log_failure) {
     if (pages == 0) {
         return 0;
     }
@@ -96,10 +96,10 @@ uint64_t BuddyAllocator::alloc_pages(size_t pages) {
     if ((1ull << order) < pages) {
         return 0;
     }
-    return alloc_order(order);
+    return alloc_order(order, log_failure);
 }
 
-uint64_t BuddyAllocator::alloc_order(uint8_t order) {
+uint64_t BuddyAllocator::alloc_order(uint8_t order, bool log_failure) {
     if (order > max_order_) {
         return 0;
     }
@@ -108,6 +108,7 @@ uint64_t BuddyAllocator::alloc_order(uint8_t order) {
         ++current;
     }
     if (current > max_order_) {
+        if (!log_failure) return 0;
         log_message(LogLevel::Error,
                     "Buddy alloc failed: order=%u max=%u",
                     static_cast<unsigned int>(order),
