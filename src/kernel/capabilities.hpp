@@ -10,7 +10,10 @@ constexpr CapabilityMask kFullPermissions = ~CapabilityMask{0};
 
 // Compile-time capability kinds understood by the kernel.
 enum class CapabilityKind : uint16_t {
-    SystemSettings = 0,
+    // Legacy bit 0 keeps its position and is now the write authority. Write
+    // settings inherently permits reads, preserving existing administrator
+    // principals while allowing read-only machine-settings access at bit 22.
+    SystemWriteSettings = 0,
     SystemPower = 1,
     FilesystemMount = 2,
     StorageRawRead = 3,
@@ -32,6 +35,7 @@ enum class CapabilityKind : uint16_t {
     SystemMonitor = 19,
     KernelLog = 20,
     FilesystemOverride = 21,
+    SystemReadSettings = 22,
     Count,
 };
 

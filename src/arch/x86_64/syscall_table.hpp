@@ -115,6 +115,13 @@ enum class SystemCall : uint64_t {
     ModuleLoad            = 90,
     ModuleCount           = 91,
     ModuleInfo            = 92,
+    SettingsGet           = 93,
+    SettingsSet           = 94,
+    MachineSettingsGet    = 95,
+    MachineSettingsSet    = 96,
+    SettingsKeyAt         = 97,
+    MachineSettingsKeyAt  = 98,
+    MachineSettingsAccess = 99,
 };
 
 Result handle_syscall(SyscallFrame& frame);

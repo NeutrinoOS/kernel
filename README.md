@@ -165,7 +165,7 @@ from pre-4.0 kernels must be recreated rather than reinterpreted.
 
 | Bit | Capability | Authority |
 | ---: | --- | --- |
-| 0 | `SystemSettings` | Global console and kernel settings |
+| 0 | `SystemWriteSettings` | Read and change global console and kernel settings |
 | 1 | `SystemPower` | Shutdown and reset |
 | 2 | `FilesystemMount` | Mount a filesystem |
 | 3–5 | `StorageRawRead`, `StorageRawWrite`, `StorageManage` | Raw media I/O and global storage management |
@@ -176,6 +176,7 @@ from pre-4.0 kernels must be recreated rather than reinterpreted.
 | 17–18 | `Serial`, `Pci` | Direct serial and PCI access |
 | 19–20 | `SystemMonitor`, `KernelLog` | System telemetry and kernel logs |
 | 21 | `FilesystemOverride` | Administrative ACL bypass |
+| 22 | `SystemReadSettings` | Read global console and kernel settings |
 
 Pipes, shared memory, access-controlled VTYs, and the service registry are
 ordinary process/session primitives and require no capability. Raw storage
@@ -206,6 +207,18 @@ descriptors, filesystem operations, virtual memory, threads, processes,
 security, and privileged administration follow in that order. All userspace
 must be rebuilt against the ABI 2.0 headers because the remaining numeric call
 identifiers are intentionally incompatible with ABI 1.x.
+
+ABI 2.2 gives every authenticated userspace principal a private persistent
+settings hive. `settings_get` and `settings_set` always address that caller's
+hive; no API accepts another user identity. Its file ACL has exactly one entry
+for the owning user, and ACL-less filesystems fail closed. Kernel callers keep
+the machine registry as their default. Userspace accesses it only through
+`machine_settings_get` (requiring `SystemReadSettings` or
+`SystemWriteSettings`) and `machine_settings_set` (requiring
+`SystemWriteSettings`); write authority inherently grants reads. Both hives
+also provide index-based key enumeration: `settings_key_at` and
+`machine_settings_key_at` return the NUL-inclusive key length and use `-1` as
+the end-of-list/error result, so callers do not need a racy count query.
 
 ## Debug heartbeat
 
@@ -243,12 +256,14 @@ graphical session, composites application-owned ARGB surfaces through the
 desktop pipe protocol, and presents only the framebuffer rectangle damaged by
 an application, cursor movement, or window movement.
 
-Appearance and the taskbar launcher are configured in
-`/config/desktop.cfg`. Click a window to focus it, drag its title bar to move
-it, drag its bottom-right grip to resize it, and use its red title-bar button
-to request that it close. The launcher button starts its configured
-application; F12 exits the desktop. The `doomgeneric` package supports the
-protocol and retains fullscreen fallback when no desktop is running.
+Appearance is configured through the signed-in user's `desktop.*` settings.
+Start-menu launchers are individual files in `/config/desktop/launchers/`;
+each has a `label`, `path`, and optional `args`, making the menu customizable
+without changing the desktop binary. Click a window to focus it, drag its title
+bar to move it, drag its bottom-right grip to resize it, and use its red
+title-bar button to request that it close. F12 exits the desktop. The
+`doomgeneric` package supports the protocol and retains fullscreen fallback
+when no desktop is running.
 
 ## Live network diagnostics
 

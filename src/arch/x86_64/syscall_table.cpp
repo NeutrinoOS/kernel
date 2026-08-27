@@ -6,6 +6,7 @@
 #include "../../drivers/driver_registry.hpp"
 #include "../../kernel/descriptor.hpp"
 #include "../../kernel/capabilities.hpp"
+#include "../../kernel/config.hpp"
 #include "../../kernel/file_io.hpp"
 #include "../../kernel/loader.hpp"
 #include "../../kernel/module.hpp"
@@ -13,6 +14,7 @@
 #include "../../kernel/random.hpp"
 #include "../../kernel/path_util.hpp"
 #include "../../kernel/scheduler.hpp"
+#include "../../kernel/settings.hpp"
 #include "../../kernel/time.hpp"
 #include "../../kernel/vm.hpp"
 #include "../../fs/vfs.hpp"
@@ -29,7 +31,7 @@ namespace syscall {
 namespace {
 
 constexpr uint64_t kAbiMajor = 2;
-constexpr uint64_t kAbiMinor = 0;
+constexpr uint64_t kAbiMinor = 3;
 
 class PrincipalRefGuard {
 public:
@@ -405,6 +407,7 @@ bool descriptor_type_capability(
             out_kind = capabilities::CapabilityKind::Audio;
             return true;
         case descriptor::kTypeCpuStats:
+        case descriptor::kTypeCpuInfo:
         case descriptor::kTypeSensor:
             out_kind = capabilities::CapabilityKind::SystemMonitor;
             return true;
@@ -447,6 +450,25 @@ bool console_property_requires_settings_access(uint32_t property) {
                            descriptor_defs::Property::ConsoleScale) ||
            property == static_cast<uint32_t>(
                            descriptor_defs::Property::ConsoleFont);
+}
+
+bool current_user_settings_identity(process::Task& proc,
+                                    uint64_t& machine_id,
+                                    uint64_t& local_id) {
+    sync::LockGuard guard(proc.resources->lock);
+    return capabilities::principal_user_id(proc.resources->principal,
+                                           machine_id,
+                                           local_id);
+}
+
+bool allow_machine_settings_read(process::Task& proc) {
+    sync::LockGuard guard(proc.resources->lock);
+    capabilities::Principal* principal = proc.resources->principal;
+    return principal != nullptr &&
+           (capabilities::principal_allows(*principal,
+                                           capabilities::CapabilityKind::SystemWriteSettings) ||
+            capabilities::principal_allows(*principal,
+                                           capabilities::CapabilityKind::SystemReadSettings));
 }
 
 uint32_t duplicate_stream_descriptor(process::Task& from,
@@ -613,6 +635,170 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
             frame.rax = 0;
+            return Result::Continue;
+        }
+        case SystemCall::SettingsGet: {
+            process::Task* proc = process::current();
+            uint64_t machine_id = 0;
+            uint64_t local_id = 0;
+            if (proc == nullptr ||
+                !current_user_settings_identity(*proc, machine_id, local_id)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            char key[config::kMaxKeyLength];
+            if (!vm::copy_user_string(proc->cr3,
+                                      reinterpret_cast<const char*>(frame.rdi),
+                                      key,
+                                      sizeof(key))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            char value[config::kMaxValueLength];
+            size_t value_length = 0;
+            if (!settings::copy_user_string(machine_id,
+                                       local_id,
+                                       key,
+                                       value,
+                                       sizeof(value),
+                                       value_length)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            if (frame.rsi == 0) {
+                if (frame.rdx != 0) {
+                    frame.rax = static_cast<uint64_t>(-1);
+                    return Result::Continue;
+                }
+            } else if (frame.rdx < value_length ||
+                       !vm::copy_to_user(proc->cr3,
+                                         frame.rsi,
+                                         value,
+                                         value_length)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = value_length;
+            return Result::Continue;
+        }
+        case SystemCall::SettingsSet: {
+            process::Task* proc = process::current();
+            uint64_t machine_id = 0;
+            uint64_t local_id = 0;
+            if (proc == nullptr ||
+                !current_user_settings_identity(*proc, machine_id, local_id)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            char key[config::kMaxKeyLength];
+            char value[config::kMaxValueLength];
+            if (!vm::copy_user_string(proc->cr3,
+                                      reinterpret_cast<const char*>(frame.rdi),
+                                      key,
+                                      sizeof(key)) ||
+                !vm::copy_user_string(proc->cr3,
+                                      reinterpret_cast<const char*>(frame.rsi),
+                                      value,
+                                      sizeof(value))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = settings::set_user_string_and_save(machine_id,
+                                                            local_id,
+                                                            key,
+                                                            value)
+                            ? 0
+                            : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::MachineSettingsGet: {
+            process::Task* proc = process::current();
+            if (proc == nullptr || !allow_machine_settings_read(*proc)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            char key[config::kMaxKeyLength];
+            char value[config::kMaxValueLength];
+            size_t value_length = 0;
+            if (!vm::copy_user_string(proc->cr3, reinterpret_cast<const char*>(frame.rdi), key, sizeof(key)) ||
+                !settings::copy_string(key, value, sizeof(value), value_length) ||
+                (frame.rsi == 0 ? frame.rdx != 0 :
+                 (frame.rdx < value_length || !vm::copy_to_user(proc->cr3, frame.rsi, value, value_length)))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = value_length;
+            return Result::Continue;
+        }
+        case SystemCall::MachineSettingsSet: {
+            process::Task* proc = process::current();
+            if (proc == nullptr ||
+                !require_capability(*proc,
+                                    capabilities::CapabilityKind::SystemWriteSettings,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            char key[config::kMaxKeyLength];
+            char value[config::kMaxValueLength];
+            if (!vm::copy_user_string(proc->cr3, reinterpret_cast<const char*>(frame.rdi), key, sizeof(key)) ||
+                !vm::copy_user_string(proc->cr3, reinterpret_cast<const char*>(frame.rsi), value, sizeof(value))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = settings::set_string_and_save(key, value) ? 0 : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::SettingsKeyAt: {
+            process::Task* proc = process::current();
+            uint64_t machine_id = 0;
+            uint64_t local_id = 0;
+            if (proc == nullptr || !current_user_settings_identity(*proc, machine_id, local_id)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            char key[config::kMaxKeyLength];
+            size_t key_length = 0;
+            if (!settings::copy_user_key(machine_id, local_id, static_cast<size_t>(frame.rdi),
+                                         key, sizeof(key), key_length) ||
+                (frame.rsi == 0 ? frame.rdx != 0 :
+                 (frame.rdx < key_length || !vm::copy_to_user(proc->cr3, frame.rsi, key, key_length)))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = key_length;
+            return Result::Continue;
+        }
+        case SystemCall::MachineSettingsKeyAt: {
+            process::Task* proc = process::current();
+            if (proc == nullptr || !allow_machine_settings_read(*proc)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            char key[config::kMaxKeyLength];
+            size_t key_length = 0;
+            if (!settings::copy_key(static_cast<size_t>(frame.rdi), key, sizeof(key), key_length) ||
+                (frame.rsi == 0 ? frame.rdx != 0 :
+                 (frame.rdx < key_length || !vm::copy_to_user(proc->cr3, frame.rsi, key, key_length)))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = key_length;
+            return Result::Continue;
+        }
+        case SystemCall::MachineSettingsAccess: {
+            process::Task* proc = process::current();
+            if (proc == nullptr || !allow_machine_settings_read(*proc)) {
+                frame.rax = 0;
+                return Result::Continue;
+            }
+            sync::LockGuard guard(proc->resources->lock);
+            frame.rax = capabilities::principal_allows(
+                            *proc->resources->principal,
+                            capabilities::CapabilityKind::SystemWriteSettings)
+                            ? 2 : 1;
             return Result::Continue;
         }
         case SystemCall::Exit: {
@@ -845,7 +1031,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 console_property_requires_settings_access(property) &&
                 !require_capability(
                     *proc,
-                    capabilities::CapabilityKind::SystemSettings,
+                    capabilities::CapabilityKind::SystemWriteSettings,
                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;

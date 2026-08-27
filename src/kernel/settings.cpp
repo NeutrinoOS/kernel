@@ -4,12 +4,14 @@
 #include <stdint.h>
 
 #include "config.hpp"
+#include "capabilities.hpp"
 #include "drivers/console/console.hpp"
 #include "drivers/fs/block_cache.hpp"
 #include "drivers/log/logging.hpp"
 #include "fs/vfs.hpp"
 #include "lib/mem.hpp"
 #include "string_util.hpp"
+#include "users.hpp"
 
 extern "C" const unsigned char kernel_tosh_sat_f14[3584];
 
@@ -33,7 +35,17 @@ char g_root_mount[64];
 char g_settings_path[128];
 Setting g_settings[kMaxSettings];
 size_t g_setting_count = 0;
+struct UserSettings {
+    uint64_t machine_id;
+    uint64_t local_id;
+    Setting settings[kMaxSettings];
+    size_t count;
+    bool loaded;
+};
+UserSettings g_user_settings[users::kMaxUsers];
 volatile int g_lock = 0;
+
+void ensure_directory(const char* path);
 
 void lock() {
     while (__atomic_test_and_set(&g_lock, __ATOMIC_ACQUIRE)) {
@@ -85,6 +97,118 @@ bool append_u32(char* out, size_t out_size, size_t& index, uint32_t value) {
     }
     out[index] = '\0';
     return true;
+}
+
+bool append_u64_hex(char* out, size_t out_size, size_t& index, uint64_t value) {
+    char digits[16];
+    for (size_t i = 0; i < sizeof(digits); ++i) {
+        uint8_t nibble = static_cast<uint8_t>((value >> ((15 - i) * 4)) & 0xf);
+        digits[i] = static_cast<char>(nibble < 10 ? '0' + nibble : 'a' + nibble - 10);
+    }
+    return append_text(out, out_size, index, digits);
+}
+
+Setting* find_user_setting(UserSettings& registry, const char* key) {
+    if (key == nullptr) return nullptr;
+    for (size_t i = 0; i < registry.count; ++i) {
+        if (string_util::equals(registry.settings[i].key, key)) return &registry.settings[i];
+    }
+    return nullptr;
+}
+
+const Setting* find_user_setting_const(const UserSettings& registry, const char* key) {
+    return find_user_setting(const_cast<UserSettings&>(registry), key);
+}
+
+bool set_user_string_locked(UserSettings& registry, const char* key, const char* value) {
+    if (key == nullptr || value == nullptr || key[0] == '\0' ||
+        string_util::length(key) >= config::kMaxKeyLength ||
+        string_util::length(value) >= config::kMaxValueLength) return false;
+    Setting* setting = find_user_setting(registry, key);
+    if (setting == nullptr) {
+        if (registry.count >= kMaxSettings) return false;
+        setting = &registry.settings[registry.count++];
+        string_util::copy(setting->key, sizeof(setting->key), key);
+    }
+    string_util::copy(setting->value, sizeof(setting->value), value);
+    return true;
+}
+
+bool user_path(uint64_t machine_id, uint64_t local_id, char* out, size_t out_size) {
+    if (g_root_mount[0] == '\0') return false;
+    size_t index = 0;
+    out[0] = '\0';
+    return append_text(out, out_size, index, g_root_mount) &&
+           append_text(out, out_size, index, "/system/users/") &&
+           append_u64_hex(out, out_size, index, machine_id) &&
+           append_text(out, out_size, index, "/") &&
+           append_u64_hex(out, out_size, index, local_id) &&
+           append_text(out, out_size, index, ".ntd");
+}
+
+bool protect_user_file(const char* path, uint64_t machine_id, uint64_t local_id) {
+    if (!vfs::acl_supported(path)) return false;
+    vfs::AclEntry acl{};
+    acl.machine_id = machine_id;
+    acl.local_id = local_id;
+    acl.read = acl.write = acl.delete_permission = acl.edit = vfs::AclValue::Allow;
+    return vfs::set_acl(path, &acl, 1);
+}
+
+bool load_user_locked(UserSettings& registry) {
+    if (registry.loaded) return true;
+    char path[160];
+    if (!user_path(registry.machine_id, registry.local_id, path, sizeof(path))) return false;
+    registry.loaded = true;
+    size_t read_size = 0;
+    uint8_t buffer[kSettingsBufferSize];
+    if (!vfs::read_file(path, buffer, sizeof(buffer), read_size)) return true;
+    vfs::AclEntry acl[vfs::kMaxAclEntries]{};
+    size_t acl_count = 0;
+    if (!vfs::acl_supported(path) || !vfs::get_acl(path, acl, vfs::kMaxAclEntries, acl_count) ||
+        acl_count != 1 || acl[0].machine_id != registry.machine_id || acl[0].local_id != registry.local_id ||
+        acl[0].read != vfs::AclValue::Allow || acl[0].write != vfs::AclValue::Allow) return false;
+    config::Table table{};
+    if (!config::parse(reinterpret_cast<const char*>(buffer), read_size, table)) return false;
+    for (size_t i = 0; i < table.count; ++i) set_user_string_locked(registry, table.entries[i].key, table.entries[i].value);
+    return true;
+}
+
+bool save_user_locked(UserSettings& registry) {
+    char path[160];
+    if (!user_path(registry.machine_id, registry.local_id, path, sizeof(path))) return false;
+    char buffer[kSettingsBufferSize]; size_t length = 0; buffer[0] = '\0';
+    if (!append_text(buffer, sizeof(buffer), length, "# Neutrino user settings\n")) return false;
+    for (size_t i = 0; i < registry.count; ++i)
+        if (!append_text(buffer, sizeof(buffer), length, registry.settings[i].key) ||
+            !append_text(buffer, sizeof(buffer), length, ": ") ||
+            !append_text(buffer, sizeof(buffer), length, registry.settings[i].value) ||
+            !append_text(buffer, sizeof(buffer), length, "\n")) return false;
+    char system_path[160];
+    size_t system_index = 0;
+    if (!append_text(system_path, sizeof(system_path), system_index, g_root_mount) ||
+        !append_text(system_path, sizeof(system_path), system_index, "/system")) return false;
+    ensure_directory(system_path);
+    if (!append_text(system_path, sizeof(system_path), system_index, "/users")) return false;
+    ensure_directory(system_path);
+    char parent[160]; size_t slash = string_util::length(path);
+    while (slash != 0 && path[slash - 1] != '/') --slash;
+    if (slash == 0 || slash >= sizeof(parent)) return false;
+    memcpy(parent, path, slash - 1); parent[slash - 1] = '\0'; ensure_directory(parent);
+    vfs::FileHandle handle{};
+    if (!vfs::create_file(path, handle) && !vfs::open_file(path, handle)) return false;
+    size_t written = 0; bool ok = vfs::write_file(handle, 0, buffer, length, written);
+    vfs::close_file(handle);
+    return ok && written == length && protect_user_file(path, registry.machine_id, registry.local_id) && fs::block_cache::flush_all();
+}
+
+UserSettings* user_registry_locked(uint64_t machine_id, uint64_t local_id) {
+    for (size_t i = 0; i < users::kMaxUsers; ++i)
+        if (g_user_settings[i].local_id == local_id && g_user_settings[i].machine_id == machine_id) return &g_user_settings[i];
+    for (size_t i = 0; i < users::kMaxUsers; ++i) if (g_user_settings[i].local_id == 0) {
+        g_user_settings[i].machine_id = machine_id; g_user_settings[i].local_id = local_id; return &g_user_settings[i];
+    }
+    return nullptr;
 }
 
 bool parse_u32(const char* text, uint32_t& out) {
@@ -218,6 +342,42 @@ bool serialize(char* out, size_t out_size, size_t& out_len) {
     return true;
 }
 
+bool save_to_disk_locked() {
+    if (!path_ready()) {
+        return false;
+    }
+
+    char buffer[kSettingsBufferSize];
+    size_t length = 0;
+    if (!serialize(buffer, sizeof(buffer), length)) {
+        log_message(LogLevel::Warn, "Settings: serialized data too large");
+        return false;
+    }
+
+    ensure_parent_directory();
+    (void)vfs::remove_file(g_settings_path);
+
+    vfs::FileHandle handle{};
+    if (!vfs::create_file(g_settings_path, handle)) {
+        log_message(LogLevel::Warn,
+                    "Settings: failed to create %s",
+                    g_settings_path);
+        return false;
+    }
+
+    size_t written = 0;
+    bool ok = vfs::write_file(handle, 0, buffer, length, written);
+    vfs::close_file(handle);
+    if (!ok || written != length) {
+        log_message(LogLevel::Warn,
+                    "Settings: failed to write %s",
+                    g_settings_path);
+        return false;
+    }
+    (void)fs::block_cache::flush_all();
+    return true;
+}
+
 bool font_is_basic(const descriptor_defs::ConsoleFont& font,
                    const uint8_t* data) {
     return data != nullptr && font.width == 8 && font.height == 8 &&
@@ -305,45 +465,39 @@ bool load_from_disk() {
 
 bool save_to_disk() {
     LockGuard guard;
-    if (!path_ready()) {
-        return false;
-    }
-
-    char buffer[kSettingsBufferSize];
-    size_t length = 0;
-    if (!serialize(buffer, sizeof(buffer), length)) {
-        log_message(LogLevel::Warn, "Settings: serialized data too large");
-        return false;
-    }
-
-    ensure_parent_directory();
-    (void)vfs::remove_file(g_settings_path);
-
-    vfs::FileHandle handle{};
-    if (!vfs::create_file(g_settings_path, handle)) {
-        log_message(LogLevel::Warn,
-                    "Settings: failed to create %s",
-                    g_settings_path);
-        return false;
-    }
-
-    size_t written = 0;
-    bool ok = vfs::write_file(handle, 0, buffer, length, written);
-    vfs::close_file(handle);
-    if (!ok || written != length) {
-        log_message(LogLevel::Warn,
-                    "Settings: failed to write %s",
-                    g_settings_path);
-        return false;
-    }
-    (void)fs::block_cache::flush_all();
-    return true;
+    return save_to_disk_locked();
 }
 
 const char* get_string(const char* key) {
     LockGuard guard;
     const Setting* setting = find_setting_const(key);
     return setting != nullptr ? setting->value : nullptr;
+}
+
+bool copy_string(const char* key,
+                 char* out,
+                 size_t out_size,
+                 size_t& out_length) {
+    LockGuard guard;
+    const Setting* setting = find_setting_const(key);
+    if (setting == nullptr) {
+        return false;
+    }
+    out_length = string_util::length(setting->value) + 1;
+    if (out == nullptr || out_size < out_length) {
+        return false;
+    }
+    string_util::copy(out, out_size, setting->value);
+    return true;
+}
+
+bool copy_key(size_t index, char* out, size_t out_size, size_t& out_length) {
+    LockGuard guard;
+    if (index >= g_setting_count) return false;
+    out_length = string_util::length(g_settings[index].key) + 1;
+    if (out == nullptr || out_size < out_length) return false;
+    string_util::copy(out, out_size, g_settings[index].key);
+    return true;
 }
 
 bool get_u32(const char* key, uint32_t& out) {
@@ -355,6 +509,78 @@ bool get_u32(const char* key, uint32_t& out) {
 bool set_string(const char* key, const char* value) {
     LockGuard guard;
     return set_string_locked(key, value);
+}
+
+bool set_string_and_save(const char* key, const char* value) {
+    LockGuard guard;
+    Setting* previous = find_setting(key);
+    const bool existed = previous != nullptr;
+    Setting old{};
+    if (existed) {
+        old = *previous;
+    }
+    if (!set_string_locked(key, value)) {
+        return false;
+    }
+    if (save_to_disk_locked()) {
+        return true;
+    }
+    if (existed) {
+        *previous = old;
+    } else {
+        --g_setting_count;
+    }
+    return false;
+}
+
+bool copy_user_string(uint64_t machine_id,
+                      uint64_t local_id,
+                      const char* key,
+                      char* out,
+                      size_t out_size,
+                      size_t& out_length) {
+    LockGuard guard;
+    UserSettings* registry = user_registry_locked(machine_id, local_id);
+    if (registry == nullptr || !load_user_locked(*registry)) return false;
+    const Setting* setting = find_user_setting_const(*registry, key);
+    if (setting == nullptr) return false;
+    out_length = string_util::length(setting->value) + 1;
+    if (out == nullptr || out_size < out_length) return false;
+    string_util::copy(out, out_size, setting->value);
+    return true;
+}
+
+bool copy_user_key(uint64_t machine_id,
+                   uint64_t local_id,
+                   size_t index,
+                   char* out,
+                   size_t out_size,
+                   size_t& out_length) {
+    LockGuard guard;
+    UserSettings* registry = user_registry_locked(machine_id, local_id);
+    if (registry == nullptr || !load_user_locked(*registry) || index >= registry->count) return false;
+    out_length = string_util::length(registry->settings[index].key) + 1;
+    if (out == nullptr || out_size < out_length) return false;
+    string_util::copy(out, out_size, registry->settings[index].key);
+    return true;
+}
+
+bool set_user_string_and_save(uint64_t machine_id,
+                              uint64_t local_id,
+                              const char* key,
+                              const char* value) {
+    LockGuard guard;
+    UserSettings* registry = user_registry_locked(machine_id, local_id);
+    if (registry == nullptr || !load_user_locked(*registry)) return false;
+    Setting* previous = find_user_setting(*registry, key);
+    const bool existed = previous != nullptr;
+    Setting old{};
+    if (existed) old = *previous;
+    if (!set_user_string_locked(*registry, key, value)) return false;
+    if (save_user_locked(*registry)) return true;
+    if (existed) *previous = old;
+    else --registry->count;
+    return false;
 }
 
 bool set_u32(const char* key, uint32_t value) {
