@@ -1992,6 +1992,41 @@ Result handle_syscall(SyscallFrame& frame) {
             frame.rax = (addr == 0) ? static_cast<uint64_t>(-1) : addr;
             return Result::Continue;
         }
+        case SystemCall::DynamicLoad: {
+            process::Task* proc = process::current();
+            char path[path_util::kMaxPathLength];
+            if (proc == nullptr || frame.rdi == 0 ||
+                !vm::copy_user_string(proc->cr3,
+                                      reinterpret_cast<const char*>(frame.rdi),
+                                      path,
+                                      sizeof(path))) {
+                frame.rax = 0;
+                return Result::Continue;
+            }
+            frame.rax = loader::dynamic_load(*proc, path);
+            return Result::Continue;
+        }
+        case SystemCall::DynamicSymbol: {
+            process::Task* proc = process::current();
+            char symbol[256];
+            if (proc == nullptr || frame.rsi == 0 ||
+                !vm::copy_user_string(proc->cr3,
+                                      reinterpret_cast<const char*>(frame.rsi),
+                                      symbol,
+                                      sizeof(symbol))) {
+                frame.rax = 0;
+                return Result::Continue;
+            }
+            frame.rax = loader::dynamic_symbol(*proc, frame.rdi, symbol);
+            return Result::Continue;
+        }
+        case SystemCall::DynamicClose: {
+            process::Task* proc = process::current();
+            frame.rax = proc != nullptr && loader::dynamic_close(*proc, frame.rdi)
+                            ? 0
+                            : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
         case SystemCall::MapAt: {
             process::Task* proc = process::current();
             if (proc == nullptr) {

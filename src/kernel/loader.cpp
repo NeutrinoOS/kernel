@@ -5,6 +5,7 @@
 #include "arch/x86_64/memory/paging.hpp"
 #include "fs/vfs.hpp"
 #include "kernel/memory/physical_allocator.hpp"
+#include "kernel/sync.hpp"
 #include "vm.hpp"
 
 namespace {
@@ -162,6 +163,35 @@ struct LoadedObject {
     DynamicInfo dynamic;
     bool main_object;
 };
+
+struct DynamicObjectSet {
+    sync::SpinLock lock;
+    uint64_t cr3;
+    size_t object_count;
+    LoadedObject objects[kMaxSharedObjects];
+};
+
+DynamicObjectSet g_dynamic_objects[process::kMaxTasks];
+sync::SpinLock g_dynamic_objects_lock;
+
+DynamicObjectSet* dynamic_object_set(uint64_t cr3, bool create) {
+    sync::LockGuard guard(g_dynamic_objects_lock);
+    for (size_t i = 0; i < process::kMaxTasks; ++i) {
+        if (g_dynamic_objects[i].cr3 == cr3) {
+            return &g_dynamic_objects[i];
+        }
+    }
+    if (!create) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < process::kMaxTasks; ++i) {
+        if (g_dynamic_objects[i].cr3 == 0) {
+            g_dynamic_objects[i].cr3 = cr3;
+            return &g_dynamic_objects[i];
+        }
+    }
+    return nullptr;
+}
 
 bool read_exact(vfs::FileHandle& file,
                 uint64_t offset,
@@ -557,7 +587,7 @@ bool image_has_needed_dependencies(const loader::ProgramImage& image) {
     if (!parse_dynamic_info(image, *header, dynamic_phdr, info)) {
         return false;
     }
-    return info.needed_count != 0;
+    return dynamic_phdr != nullptr;
 }
 
 bool object_vaddr_to_user(const LoadedObject& object,
@@ -861,6 +891,7 @@ bool map_elf_object_file(const char* path,
 
     Elf64Phdr* phdrs = nullptr;
     uint8_t* buffer = nullptr;
+    vm::Region region{};
     bool loaded = false;
     do {
         Elf64Ehdr header{};
@@ -935,7 +966,7 @@ bool map_elf_object_file(const char* path,
             aligned_max - aligned_min > SIZE_MAX) {
             break;
         }
-        vm::Region region = vm::allocate_user_region(
+        region = vm::allocate_user_region(
             proc.cr3,
             static_cast<size_t>(aligned_max - aligned_min));
         if (region.base == 0) {
@@ -1018,6 +1049,9 @@ bool map_elf_object_file(const char* path,
     memory::free_kernel(buffer);
     memory::free_kernel(phdrs);
     vfs::close_file(file);
+    if (!loaded) {
+        vm::release_user_region(proc.cr3, region);
+    }
     return loaded;
 }
 
@@ -1350,6 +1384,57 @@ void free_dependency_images(LoadedObject* objects, size_t object_count) {
     }
 }
 
+bool remember_dynamic_objects(process::Task& proc,
+                            const LoadedObject* objects,
+                            size_t object_count) {
+    DynamicObjectSet* set = dynamic_object_set(proc.cr3, true);
+    if (set == nullptr || object_count > kMaxSharedObjects) {
+        return false;
+    }
+    sync::LockGuard guard(set->lock);
+    set->object_count = object_count;
+    for (size_t i = 0; i < object_count; ++i) {
+        set->objects[i] = objects[i];
+    }
+    return true;
+}
+
+void release_object_regions(LoadedObject* objects,
+                            size_t first,
+                            size_t object_count,
+                            process::Task& proc) {
+    for (size_t i = first; i < object_count; ++i) {
+        vm::release_user_region(proc.cr3, objects[i].region);
+        objects[i].region = {};
+    }
+}
+
+bool object_name_from_path(const char* path, char* name, size_t name_size) {
+    if (path == nullptr || path[0] != '/') {
+        return false;
+    }
+    const char* base = path;
+    for (const char* it = path; *it != '\0'; ++it) {
+        if (*it == '/') {
+            base = it + 1;
+        }
+    }
+    return base[0] != '\0' && copy_cstring(name, name_size, base);
+}
+
+bool has_library_prefix(const char* path) {
+    constexpr char prefix[] = "/library/";
+    if (path == nullptr) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(prefix) - 1; ++i) {
+        if (path[i] != prefix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool load_dynamic_elf_binary(const loader::ProgramImage& image,
                              process::Task& proc) {
     LoadedObject objects[kMaxSharedObjects]{};
@@ -1410,6 +1495,12 @@ bool load_dynamic_elf_binary(const loader::ProgramImage& image,
 
     proc.code_region = objects[0].region;
     proc.user_ip = entry_va;
+    if (!remember_dynamic_objects(proc, objects, object_count)) {
+        log_message(LogLevel::Error,
+                    "Loader: failed to retain dynamic linker state");
+        free_dependency_images(objects, object_count);
+        return false;
+    }
     free_dependency_images(objects, object_count);
     return true;
 }
@@ -1939,12 +2030,14 @@ bool load_static_elf_file(vfs::FileHandle& file,
 bool file_has_needed_dependencies(vfs::FileHandle& file,
                                   const Elf64Ehdr& header,
                                   const Elf64Phdr* phdrs) {
+    bool has_dynamic_segment = false;
     for (uint16_t i = 0; i < header.phnum; ++i) {
         const Elf64Phdr& ph = phdrs[i];
         if (ph.type != PT_DYNAMIC || ph.filesz == 0 ||
             ph.offset > file.size || ph.filesz > file.size - ph.offset) {
             continue;
         }
+        has_dynamic_segment = true;
         size_t count = static_cast<size_t>(ph.filesz / sizeof(Elf64Dyn));
         for (size_t j = 0; j < count; ++j) {
             Elf64Dyn dyn{};
@@ -1958,12 +2051,169 @@ bool file_has_needed_dependencies(vfs::FileHandle& file,
             if (dyn.tag == DT_NEEDED) return true;
         }
     }
-    return false;
+    return has_dynamic_segment;
 }
 
 }  // namespace
 
 namespace loader {
+
+uint64_t dynamic_load(process::Task& proc, const char* path) {
+    if (path == nullptr || path[0] == '\0') {
+        return 0;
+    }
+
+    char object_path[kMaxSharedObjectPath];
+    char object_name[kMaxSharedObjectName];
+    if (path[0] == '/') {
+        constexpr const char* library_prefix = "/library/";
+        size_t prefix_length = cstring_length(library_prefix);
+        if (cstring_length(path) >= sizeof(object_path) ||
+            cstring_length(path) <= prefix_length ||
+            !has_library_prefix(path)) {
+            return 0;
+        }
+        if (!copy_cstring(object_path, sizeof(object_path), path)) {
+            return 0;
+        }
+    } else if (!build_library_path(path, object_path, sizeof(object_path))) {
+        return 0;
+    }
+    if (!object_name_from_path(object_path, object_name, sizeof(object_name)) ||
+        !build_library_path(object_name, object_path, sizeof(object_path))) {
+        return 0;
+    }
+
+    DynamicObjectSet* set = dynamic_object_set(proc.cr3, true);
+    if (set == nullptr) {
+        return 0;
+    }
+    sync::LockGuard guard(set->lock);
+    for (size_t i = 0; i < set->object_count; ++i) {
+        if (cstring_equal(set->objects[i].name, object_name)) {
+            return set->objects[i].load_bias;
+        }
+    }
+    if (set->object_count >= kMaxSharedObjects) {
+        return 0;
+    }
+
+    LoadedObject objects[kMaxSharedObjects]{};
+    size_t object_count = set->object_count;
+    for (size_t i = 0; i < object_count; ++i) {
+        objects[i] = set->objects[i];
+    }
+    size_t first_new = object_count;
+    if (!map_elf_object_file(object_path,
+                             proc,
+                             object_name,
+                             objects[object_count])) {
+        return 0;
+    }
+    ++object_count;
+
+    for (size_t i = first_new; i < object_count; ++i) {
+        for (size_t j = 0; j < objects[i].dynamic.needed_count; ++j) {
+            char needed[kMaxSharedObjectName];
+            if (!needed_name_at(objects[i],
+                                objects[i].dynamic.needed_offsets[j],
+                                proc,
+                                needed,
+                                sizeof(needed)) ||
+                !load_needed_object(needed, objects, object_count, proc)) {
+                release_object_regions(objects, first_new, object_count, proc);
+                return 0;
+            }
+        }
+    }
+
+    for (size_t i = first_new; i < object_count; ++i) {
+        if (!apply_relocation_table(objects[i],
+                                    objects[i].dynamic.rela_addr,
+                                    objects[i].dynamic.rela_size,
+                                    objects[i].dynamic.rela_ent,
+                                    objects,
+                                    object_count,
+                                    proc) ||
+            !apply_relocation_table(objects[i],
+                                    objects[i].dynamic.jmprel_addr,
+                                    objects[i].dynamic.pltrel_size,
+                                    sizeof(Elf64Rela),
+                                    objects,
+                                    object_count,
+                                    proc) ||
+            !protect_elf_object_pages(objects[i], proc)) {
+            release_object_regions(objects, first_new, object_count, proc);
+            return 0;
+        }
+    }
+
+    uint64_t handle = objects[first_new].load_bias;
+    set->object_count = object_count;
+    for (size_t i = 0; i < object_count; ++i) {
+        set->objects[i] = objects[i];
+    }
+    return handle;
+}
+
+uint64_t dynamic_symbol(process::Task& proc,
+                        uint64_t handle,
+                        const char* symbol) {
+    if (symbol == nullptr || symbol[0] == '\0') {
+        return 0;
+    }
+    DynamicObjectSet* set = dynamic_object_set(proc.cr3, false);
+    if (set == nullptr) {
+        return 0;
+    }
+    sync::LockGuard guard(set->lock);
+    if (handle != 0) {
+        bool found = false;
+        for (size_t i = 0; i < set->object_count; ++i) {
+            if (set->objects[i].load_bias == handle) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return 0;
+        }
+    }
+    uint64_t address = 0;
+    return resolve_symbol(symbol,
+                          set->objects,
+                          set->object_count,
+                          proc,
+                          address)
+               ? address
+               : 0;
+}
+
+bool dynamic_close(process::Task& proc, uint64_t handle) {
+    DynamicObjectSet* set = dynamic_object_set(proc.cr3, false);
+    if (set == nullptr || handle == 0) {
+        return false;
+    }
+    sync::LockGuard guard(set->lock);
+    for (size_t i = 0; i < set->object_count; ++i) {
+        if (set->objects[i].load_bias == handle) {
+            // Objects remain mapped until process exit: unloading code while
+            // another thread may execute it is not memory-safe.
+            return true;
+        }
+    }
+    return false;
+}
+
+void release_dynamic_objects(process::Task& proc) {
+    DynamicObjectSet* set = dynamic_object_set(proc.cr3, false);
+    if (set == nullptr) {
+        return;
+    }
+    sync::LockGuard guard(set->lock);
+    set->object_count = 0;
+    set->cr3 = 0;
+}
 
 bool load_into_process(const ProgramImage& image, process::Task& proc) {
     bool loaded = false;

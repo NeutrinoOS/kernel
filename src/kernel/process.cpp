@@ -7,6 +7,7 @@
 #include "drivers/log/logging.hpp"
 #include "error.hpp"
 #include "lib/mem.hpp"
+#include "loader.hpp"
 #include "scheduler.hpp"
 #include "string_util.hpp"
 #include "sync.hpp"
@@ -1595,6 +1596,7 @@ void reclaim(Task& proc) {
     }
 
     release_shared_resources(proc);
+    loader::release_dynamic_objects(proc);
     vm::release_user_region(proc.cr3,
                             vm::Region{proc.stack_region.base,
                                        proc.stack_region.length});

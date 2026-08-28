@@ -122,6 +122,11 @@ enum class SystemCall : uint64_t {
     SettingsKeyAt         = 97,
     MachineSettingsKeyAt  = 98,
     MachineSettingsAccess = 99,
+
+    // Runtime dynamic linking.
+    DynamicLoad           = 100,
+    DynamicSymbol         = 101,
+    DynamicClose          = 102,
 };
 
 Result handle_syscall(SyscallFrame& frame);

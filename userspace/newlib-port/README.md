@@ -47,6 +47,8 @@ The first milestone supports:
 - `nanosleep`, `sleep`, and `usleep`
 - monotonic/realtime clocks, anonymous/private-file mappings, and page protection
 - pthread threads, mutexes, condition variables, once controls, and keys
+- runtime shared-object loading through `dlopen`, `dlsym`, `dlclose`, and
+  `dlerror` (`/library/<name>` or a bare library name)
 
 Current ABI limitations:
 
@@ -58,6 +60,9 @@ Current ABI limitations:
   control remain unsupported.
 - Compiler-generated ELF TLS is not loaded yet. Newlib reentrancy and pthread
   state use the kernel thread ID and explicit thread control records instead.
+- `dlclose` validates a handle but retains the object mapping until process
+  exit, preventing one thread from unmapping code another thread may still
+  execute.
 
 ## Migration direction
 
