@@ -22,6 +22,12 @@ for argument in "$@"; do
         -c|-E|-S|-M|-MM|--version|--help)
             compile_only=1
             ;;
+        # OpenJDK probes C++ precompiled-header support with `-x c++-header`.
+        # That produces a compiler artifact, not a runnable Neutrino program,
+        # so it must not receive crt0 or the final-link flags below.
+        *-header)
+            compile_only=1
+            ;;
         -shared)
             shared_link=1
             ;;
