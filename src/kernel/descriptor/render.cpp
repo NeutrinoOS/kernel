@@ -4,7 +4,6 @@
 #include "../memory/physical_allocator.hpp"
 #include "../process.hpp"
 #include "../sync.hpp"
-#include "../time.hpp"
 #include "../vm.hpp"
 #include "../work.hpp"
 #include "arch/x86_64/memory/paging.hpp"
@@ -36,6 +35,7 @@ struct Job {
     Context* context;
     uint32_t buffer;
     neutrino_render::Fill fill;
+    bool demo;
     bool used;
 };
 Context g_contexts[kContexts]{};
@@ -155,13 +155,25 @@ void complete_job(void* raw) {
         c.fence_error = -1;
     } else {
         render_accel::Surface s{b.pages, b.count, b.bytes};
-        if (!render_accel::fill(s, b.gpu_va, j->fill.byte_offset, j->fill.pitch_bytes,
-                                j->fill.x, j->fill.y, j->fill.width,
-                                j->fill.height, j->fill.color_xrgb8888))
+        bool completed = true;
+        if (j->demo) {
+            completed = render_accel::draw_demo(
+                s, j->fill.pitch_bytes, j->fill.width, j->fill.height);
+        } else if (!render_accel::fill(
+                       s, b.gpu_va, j->fill.byte_offset,
+                       j->fill.pitch_bytes, j->fill.x, j->fill.y,
+                       j->fill.width, j->fill.height,
+                       j->fill.color_xrgb8888)) {
             cpu(b, j->fill);
-        c.fence_state = neutrino_render::kFenceComplete;
-        c.fence_error = 0;
-        c.completed = j->fill.fence;
+        }
+        if (completed) {
+            c.fence_state = neutrino_render::kFenceComplete;
+            c.fence_error = 0;
+            c.completed = j->fill.fence;
+        } else {
+            c.fence_state = neutrino_render::kFenceFailed;
+            c.fence_error = -1;
+        }
     }
     if (c.jobs) --c.jobs;
     j->used = false;
@@ -175,13 +187,31 @@ int get(DescriptorEntry& e, uint32_t prop, void* out, size_t n) {
         n >= sizeof(neutrino_render::Info)) {
         Buffer& b = c->buffers[0];
         *static_cast<neutrino_render::Info*>(out) = {
-            1,
-            1,
+            neutrino_render::kAbiMajor,
+            neutrino_render::kAbiMinor,
             neutrino_render::kInfoCpuFallback |
                 (render_accel::available() ? neutrino_render::kInfoGpuBlt : 0u),
             b.user,
             b.bytes,
             c->completed};
+        return 0;
+    }
+    if (prop == (uint32_t)neutrino_render::Property::DeviceInfo &&
+        n >= sizeof(neutrino_render::DeviceInfo)) {
+        render_accel::DeviceInfo device{};
+        const bool present = render_accel::query_device_info(device);
+        *static_cast<neutrino_render::DeviceInfo*>(out) = {
+            neutrino_render::kAbiMajor,
+            neutrino_render::kAbiMinor,
+            present ? device.vendor_id : static_cast<uint16_t>(0),
+            present ? device.device_id : static_cast<uint16_t>(0),
+            present ? device.graphics_version : static_cast<uint16_t>(0),
+            present ? device.graphics_version_minor : static_cast<uint16_t>(0),
+            present ? device.engines : 0u,
+            present ? device.capabilities : 0u,
+            static_cast<uint32_t>(kBuffers),
+            static_cast<uint64_t>(kBufferBytes),
+        };
         return 0;
     }
     if (prop >= (uint32_t)neutrino_render::Property::BufferInfo0 &&
@@ -217,6 +247,7 @@ int submit(Context& c, uint32_t bi, const neutrino_render::Fill& f) {
     j->context = &c;
     j->buffer = bi;
     j->fill = f;
+    j->demo = false;
     c.submitted = f.fence;
     c.fence_state = neutrino_render::kFencePending;
     c.fence_error = 0;
@@ -230,20 +261,72 @@ int submit(Context& c, uint32_t bi, const neutrino_render::Fill& f) {
     }
     return 0;
 }
+int submit_demo(Context& c, const neutrino_render::DemoDraw& q) {
+    if (!q.fence || q.fence <= c.submitted || q.flags || q.reserved ||
+        q.buffer_handle == 0 || q.buffer_handle > kBuffers ||
+        q.pitch_bytes != 64u * sizeof(uint32_t) ||
+        q.width != 64 || q.height != 64)
+        return -1;
+    const uint32_t bi = q.buffer_handle - 1;
+    Buffer& b = c.buffers[bi];
+    if (!b.used || b.bytes < static_cast<uint64_t>(q.pitch_bytes) * q.height)
+        return -1;
+    Job* j = nullptr;
+    for (auto& x : g_jobs)
+        if (!x.used) {
+            j = &x;
+            break;
+        }
+    if (!j) return -1;
+    j->used = true;
+    j->demo = true;
+    j->context = &c;
+    j->buffer = bi;
+    j->fill = {q.fence, 0, q.pitch_bytes, 0, 0, q.width, q.height, 0, 0};
+    c.submitted = q.fence;
+    c.fence_state = neutrino_render::kFencePending;
+    c.fence_error = 0;
+    ++c.jobs;
+    if (!work::schedule(complete_job, j)) {
+        j->used = false;
+        --c.jobs;
+        c.fence_state = neutrino_render::kFenceFailed;
+        c.fence_error = -1;
+        return -1;
+    }
+    return 0;
+}
 int wait_fence(Context& c, const neutrino_render::FenceWait& request) {
     if (!request.fence || request.flags || request.reserved) return -1;
-    const uint64_t start = timekeeping::tick_count();
-    for (;;) {
-        g_lock.lock();
-        const bool done = c.completed >= request.fence;
-        const bool failed = c.fence_state == neutrino_render::kFenceFailed ||
-                            c.fence_state == neutrino_render::kFenceCancelled;
-        g_lock.unlock();
-        if (done) return 0;
-        if (failed || (request.timeout_ticks &&
-                       timekeeping::tick_count() - start >= request.timeout_ticks)) return -1;
-        asm volatile("pause");
-    }
+    // Descriptor property handlers run inside the caller's syscall and must
+    // never spin waiting for deferred work. In particular, render completion
+    // is serviced by a CPU-0 worker which the caller could otherwise starve.
+    // libdrm performs the blocking policy in userspace by polling FenceInfo
+    // and sleeping, while this legacy property remains a nonblocking check.
+    g_lock.lock();
+    const bool submitted = request.fence <= c.submitted;
+    const bool done = c.completed >= request.fence;
+    g_lock.unlock();
+    return submitted && done ? 0 : -1;
+}
+int sync_buffer(Context& c, const neutrino_render::BufferSync& request) {
+    constexpr uint32_t kValidFlags =
+        neutrino_render::kBufferSyncCpuToDevice |
+        neutrino_render::kBufferSyncDeviceToCpu;
+    if (request.buffer_handle == 0 || request.buffer_handle > kBuffers ||
+        request.flags == 0 || (request.flags & ~kValidFlags) != 0 ||
+        request.byte_length == 0 || c.jobs != 0)
+        return -1;
+    Buffer& buffer = c.buffers[request.buffer_handle - 1];
+    if (!buffer.used || request.byte_offset > buffer.bytes ||
+        request.byte_length > buffer.bytes - request.byte_offset)
+        return -1;
+    const render_accel::Surface surface{
+        buffer.pages, buffer.count, buffer.bytes};
+    return render_accel::sync(surface, request.byte_offset,
+                              request.byte_length, request.flags)
+               ? 0
+               : -1;
 }
 int set(DescriptorEntry& e, uint32_t prop, const void* in, size_t n) {
     auto* c = static_cast<Context*>(e.object);
@@ -284,6 +367,14 @@ int set(DescriptorEntry& e, uint32_t prop, const void* in, size_t n) {
         auto& q = *static_cast<const neutrino_render::Fill2*>(in);
         if (!q.reserved && q.buffer_handle > 0 && q.buffer_handle <= kBuffers)
             r = submit(*c, q.buffer_handle - 1, q.fill);
+    } else if (prop == (uint32_t)neutrino_render::Property::SubmitDemo &&
+               n >= sizeof(neutrino_render::DemoDraw)) {
+        r = submit_demo(*c,
+                        *static_cast<const neutrino_render::DemoDraw*>(in));
+    } else if (prop == (uint32_t)neutrino_render::Property::SyncBuffer &&
+               n >= sizeof(neutrino_render::BufferSync)) {
+        r = sync_buffer(*c,
+                        *static_cast<const neutrino_render::BufferSync*>(in));
     }
     g_lock.unlock();
     return r;

@@ -249,6 +249,74 @@ from binding and adopting the firmware-configured scanout. Neutrino continues
 using the framebuffer supplied by Limine. The alternate spelling
 `INTEL_UHD.DISABLE` is also accepted.
 
+`INTEL_UHD.RCS_PROBE` is an opt-in render-engine diagnostic for supported
+Gemini Lake devices (`0x3184` and `0x3185`). It enables Gen9 execlist
+submission, builds a kernel-owned 22-page logical render context with a
+private PPGTT, maps a batch at GPU VA `0x00100000`, and submits it twice through
+Gen8 `MI_BATCH_BUFFER_START` using the non-secure PPGTT selector. Each batch
+writes an i915-style RCS `PIPE_CONTROL` breadcrumb and terminates with
+`MI_BATCH_BUFFER_END`; the second submission reuses the GPU-saved context with
+an advanced logical-ring tail. The batch page and an alias of the kernel
+completion page occupy consecutive private PPGTT pages, so the non-secure
+batch never writes through the global GGTT selector.
+Before its breadcrumb, the batch performs the required two-phase cache flush
+and selects the Gen9 3D pipeline with masked `PIPELINE_SELECT` fields. It then
+programs Mesa-compatible AA-line, drawing-rectangle, and WM-chromakey defaults
+to validate fixed-function `3DSTATE` command parsing. A dedicated private
+PPGTT page at `0x00102000` backs the general, surface, dynamic, indirect,
+instruction, and bindless heaps installed by Gen9 `STATE_BASE_ADDRESS`.
+BCS ring programming and submission use Gemini Lake's separate Gen9 blitter
+force-wake request and ACK registers. If a BCS request still times out, the
+driver disables that accelerator for the remainder of the boot so compositor
+damage immediately uses the kernel's CPU presentation fallback instead of
+repeatedly stalling and resetting the ring.
+The state heap also contains a PS binding table, a linear 64x64
+`B8G8R8A8_UNORM` render-target surface backed by four private PPGTT pages, and
+a Mesa-generated Gen9 constant-color fragment kernel. The batch programs the
+matching SIMD8/SIMD16 `3DSTATE_PS`, `PS_EXTRA`, and blend state, configures the
+Gen9 URB and fixed-function vertex-fetch stages, and issues a three-vertex
+`RECTLIST` primitive using Mesa's no-VS BLORP path. Its vertices live in one
+additional kernel-owned private PPGTT page. After both requests retire and the
+render cache is flushed, the driver verifies that the expected orange pixels
+were written to the render target. Success is logged as
+`Gen9 render-target write probe completed submissions=2 pixels=<count>`. It
+does not expose command submission to userspace or change the normal
+BLT/display path, so it remains a bounded hardware bring-up test before
+Mesa-facing context support is added.
+
+On failure the driver also prints a grouped `RCSDBG1` token containing the
+same RCS register snapshot and a transcription-checking CRC. Only that token
+needs to be copied for debugging; it can be decoded with
+`intel-uhd-gemini-lake/decode_rcs_debug.py` in the packages repository.
+
+libdrm exposes render ABI 1.5 device discovery through
+`neutrino_render_get_device_info()`. The query reports the PCI identity,
+graphics generation, engine mask, BO limits, and runtime-validated execlist,
+PPGTT32, 3D-pipeline, state-base, fragment-shader, and render-target-write
+capabilities. The fragment and render-target bits are published only after the
+diagnostic draw's pixels pass CPU verification. A separate bounded-demo bit
+advertises the kernel-owned 64x64 userspace demo request. Explicit cache-domain
+transitions for mapped BO ranges are available through
+`neutrino_render_sync_bo()`, giving a future Mesa winsys a defined CPU-to-GPU
+and GPU-to-CPU coherency boundary. Synchronization is rejected while work is
+in flight for the context. Fence waits poll the timeline from userspace and
+sleep between checks, ensuring a caller on CPU 0 cannot starve deferred GPU
+completion. The general
+`NEUTRINO_RENDER_CAP_USER_SUBMISSION` bit remains clear until a validated
+programmable command-stream interface suitable for Mesa is available;
+hardware discovery and bounded semantic requests never authorize raw command
+submission.
+
+The optional `intel-uhd-3d-demo` package exercises the complete initial
+userspace path. With `INTEL_UHD.RCS_PROBE` enabled, its binary opens a render
+BO through libdrm, submits the bounded RCS draw, waits for its fence, verifies
+the orange pixels, activates its own DRM/KMS lease, presents through a dumb
+framebuffer for five seconds, and returns to the console. It is intentionally
+console-only and does not displace the desktop's graphical-session lease. RCS references only
+permanent kernel-owned pages in this first ABI; after retirement the kernel
+stages the 64x64 image into the program's BO. Run it as
+`intel-uhd-3d-demo` from the framebuffer console with no desktop active.
+
 ## Desktop
 
 The `desktop` program is a small compositor and window manager. It owns the

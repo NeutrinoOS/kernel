@@ -692,6 +692,12 @@ bool resolve_external_symbol(const char* name, uint64_t& out_value) {
          reinterpret_cast<uint64_t>(&neutrino_register_framebuffer_presenter)},
         {"neutrino_register_render_accelerator",
          reinterpret_cast<uint64_t>(&neutrino_register_render_accelerator)},
+        {"neutrino_register_render_demo_accelerator",
+         reinterpret_cast<uint64_t>(
+             &neutrino_register_render_demo_accelerator)},
+        {"neutrino_register_render_sync_accelerator",
+         reinterpret_cast<uint64_t>(
+             &neutrino_register_render_sync_accelerator)},
         {"_ZN7Console7presentEv",
          reinterpret_cast<uint64_t>(&module_console_present)},
         {"kconsole", reinterpret_cast<uint64_t>(&kconsole)},
