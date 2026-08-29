@@ -88,6 +88,23 @@ struct dirent* readdir(DIR* directory) {
     return &directory->current;
 }
 
+int readdir_r(DIR* directory, struct dirent* entry, struct dirent** result) {
+    if (entry == NULL || result == NULL) {
+        return EINVAL;
+    }
+
+    errno = 0;
+    struct dirent* current = readdir(directory);
+    if (current == NULL) {
+        *result = NULL;
+        return errno;
+    }
+
+    *entry = *current;
+    *result = entry;
+    return 0;
+}
+
 int closedir(DIR* directory) {
     if (directory == NULL) {
         errno = EBADF;

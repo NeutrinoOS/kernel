@@ -23,14 +23,19 @@ constexpr size_t kSocketCount = 32;
 struct SocketState {
     bool used;
     bool connected;
+    bool bound;
+    bool listening;
     bool nonblocking;
     bool shut_read;
     bool shut_write;
+    bool owns_server_pipe;
+    bool owns_reply_pipe;
     uint32_t server_pipe;
     uint32_t reply_pipe;
     uint32_t endpoint;
     uint32_t connection_id;
     sockaddr_in peer;
+    sockaddr_in local;
 };
 
 SocketState g_sockets[kSocketCount]{};
@@ -69,9 +74,25 @@ void close_state(SocketState& state) {
         (void)write_tcpd_message(state.server_pipe, request);
     }
     if (state.endpoint != 0) descriptor_close(state.endpoint);
-    if (state.reply_pipe != 0) descriptor_close(state.reply_pipe);
-    if (state.server_pipe != 0) descriptor_close(state.server_pipe);
+    if (state.owns_reply_pipe && state.reply_pipe != 0) descriptor_close(state.reply_pipe);
+    if (state.owns_server_pipe && state.server_pipe != 0) descriptor_close(state.server_pipe);
     state = SocketState{};
+}
+
+SocketState* allocate_socket(int& fd) {
+    lock_sockets();
+    for (size_t i = 0; i < kSocketCount; ++i) {
+        if (!g_sockets[i].used) {
+            g_sockets[i] = SocketState{};
+            g_sockets[i].used = true;
+            fd = kSocketFdBase + static_cast<int>(i);
+            unlock_sockets();
+            return &g_sockets[i];
+        }
+    }
+    unlock_sockets();
+    fd = -1;
+    return nullptr;
 }
 
 int parse_port(const char* text, uint16_t& port) {
@@ -99,19 +120,11 @@ extern "C" int socket(int domain, int type, int protocol) {
         errno = (domain != AF_INET) ? EAFNOSUPPORT : EPROTONOSUPPORT;
         return -1;
     }
-    lock_sockets();
-    for (size_t i = 0; i < kSocketCount; ++i) {
-        if (!g_sockets[i].used) {
-            g_sockets[i] = SocketState{};
-            g_sockets[i].used = true;
-            g_sockets[i].nonblocking = (type & SOCK_NONBLOCK) != 0;
-            unlock_sockets();
-            return kSocketFdBase + (int)i;
-        }
-    }
-    unlock_sockets();
-    errno = EMFILE;
-    return -1;
+    int fd = -1;
+    SocketState* state = allocate_socket(fd);
+    if (state == nullptr) { errno = EMFILE; return -1; }
+    state->nonblocking = (type & SOCK_NONBLOCK) != 0;
+    return fd;
 }
 
 extern "C" int connect(int fd, const sockaddr* address, socklen_t address_len) {
@@ -196,7 +209,11 @@ extern "C" int connect(int fd, const sockaddr* address, socklen_t address_len) {
     state->reply_pipe = (uint32_t)reply;
     state->endpoint = (uint32_t)endpoint;
     state->connection_id = response.connect_response.connection_id;
+    state->owns_server_pipe = true;
+    state->owns_reply_pipe = true;
     state->peer = *remote;
+    state->local.sin_family = AF_INET;
+    state->local.sin_port = htons(response.connect_response.local_port);
     state->connected = true;
     return 0;
 }
@@ -246,6 +263,20 @@ extern "C" ssize_t recv(int fd, void* buffer, size_t length, int flags) {
     }
 }
 
+/* TCP is the only transport currently implemented by Neutrino's userspace
+ * socket service.  Expose the POSIX entry points so callers get a defined
+ * EOPNOTSUPP failure instead of an unresolved symbol for datagram I/O. */
+extern "C" ssize_t sendto(int, const void*, size_t, int,
+                          const sockaddr*, socklen_t) {
+    errno = EOPNOTSUPP;
+    return -1;
+}
+
+extern "C" ssize_t recvfrom(int, void*, size_t, int, sockaddr*, socklen_t*) {
+    errno = EOPNOTSUPP;
+    return -1;
+}
+
 extern "C" ssize_t neutrino_socket_read(int fd, void* buffer, size_t length) {
     return recv(fd, buffer, length, 0);
 }
@@ -288,8 +319,9 @@ extern "C" int neutrino_socket_fcntl(int fd, int command, int value) {
 extern "C" int neutrino_socket_poll_handle(int fd, uint32_t* handle, int* connected) {
     SocketState* state = state_for(fd);
     if (state == nullptr) return 0;
-    if (handle != nullptr) *handle = state->endpoint;
-    if (connected != nullptr) *connected = state->connected ? 1 : 0;
+    if (handle != nullptr) *handle = state->listening ? state->reply_pipe : state->endpoint;
+    // 1 = connected socket, 2 = listener, 0 = socket not ready for polling.
+    if (connected != nullptr) *connected = state->connected ? 1 : state->listening ? 2 : 0;
     return 1;
 }
 
@@ -315,9 +347,143 @@ extern "C" int setsockopt(int fd, int level, int option, const void*, socklen_t)
     errno = ENOPROTOOPT; return -1;
 }
 
-extern "C" int bind(int, const sockaddr*, socklen_t) { errno = EOPNOTSUPP; return -1; }
-extern "C" int listen(int, int) { errno = EOPNOTSUPP; return -1; }
-extern "C" int accept(int, sockaddr*, socklen_t*) { errno = EOPNOTSUPP; return -1; }
+extern "C" int bind(int fd, const sockaddr* address, socklen_t address_len) {
+    SocketState* state = state_for(fd);
+    if (state == nullptr) { errno = EBADF; return -1; }
+    if (state->connected || state->listening || state->bound) { errno = EINVAL; return -1; }
+    if (address == nullptr || address_len < sizeof(sockaddr_in) ||
+        address->sa_family != AF_INET) { errno = EAFNOSUPPORT; return -1; }
+    const sockaddr_in* local = reinterpret_cast<const sockaddr_in*>(address);
+    // tcpd currently binds a TCP port on the host's configured IPv4 interface.
+    if (local->sin_port == 0) { errno = EINVAL; return -1; }
+    state->local = *local;
+    state->bound = true;
+    return 0;
+}
+
+extern "C" int listen(int fd, int backlog) {
+    SocketState* state = state_for(fd);
+    if (state == nullptr) { errno = EBADF; return -1; }
+    if (backlog < 0) { errno = EINVAL; return -1; }
+    if (state->connected) { errno = EOPNOTSUPP; return -1; }
+    if (!state->bound) { errno = EDESTADDRREQ; return -1; }
+    if (state->listening) return 0;
+
+    long reply = pipe_open_new((uint64_t)descriptor_defs::Flag::Readable |
+                               (uint64_t)descriptor_defs::Flag::Async);
+    long server = service::open_provider_pipe(service::kTcpService, service::kAbiV1,
+        (uint64_t)descriptor_defs::Flag::Writable |
+        (uint64_t)descriptor_defs::Flag::Async);
+    if (reply < 0 || server < 0) {
+        if (reply >= 0) descriptor_close((uint32_t)reply);
+        if (server >= 0) descriptor_close((uint32_t)server);
+        errno = ENETDOWN;
+        return -1;
+    }
+    descriptor_defs::PipeInfo reply_info{};
+    if (pipe_get_info((uint32_t)reply, &reply_info) != 0 || reply_info.id == 0) {
+        descriptor_close((uint32_t)reply); descriptor_close((uint32_t)server);
+        errno = EIO; return -1;
+    }
+    tcpd_protocol::Message request{};
+    tcpd_protocol::init_message(request, tcpd_protocol::kListenRequest);
+    request.listen_request.reply_pipe_id = reply_info.id;
+    request.listen_request.port = ntohs(state->local.sin_port);
+    if (!write_tcpd_message((uint32_t)server, request)) {
+        descriptor_close((uint32_t)reply); descriptor_close((uint32_t)server);
+        errno = EIO; return -1;
+    }
+    tcpd_protocol::Message response{};
+    for (;;) {
+        if (!tcpd_protocol::read_message((uint32_t)reply, response)) { yield(); continue; }
+        if (response.type == tcpd_protocol::kListenResponse) break;
+    }
+    if (response.listen_response.status != tcpd_protocol::kStatusOk) {
+        descriptor_close((uint32_t)reply); descriptor_close((uint32_t)server);
+        errno = response.listen_response.status == tcpd_protocol::kStatusInUse ? EADDRINUSE : EIO;
+        return -1;
+    }
+    state->server_pipe = (uint32_t)server;
+    state->reply_pipe = (uint32_t)reply;
+    state->owns_server_pipe = true;
+    state->owns_reply_pipe = true;
+    state->local.sin_port = htons(response.listen_response.port);
+    state->listening = true;
+    return 0;
+}
+
+extern "C" int accept(int fd, sockaddr* address, socklen_t* address_len) {
+    SocketState* listener = state_for(fd);
+    if (listener == nullptr) { errno = EBADF; return -1; }
+    if (!listener->listening) { errno = EINVAL; return -1; }
+    if ((address == nullptr) != (address_len == nullptr)) { errno = EINVAL; return -1; }
+    tcpd_protocol::Message event{};
+    for (;;) {
+        if (tcpd_protocol::read_message(listener->reply_pipe, event)) {
+            if (event.type == tcpd_protocol::kAcceptEvent && event.accept_event.endpoint_id != 0)
+                break;
+            continue;
+        }
+        if (listener->nonblocking) { errno = EAGAIN; return -1; }
+        yield();
+    }
+    uint64_t endpoint_flags = (uint64_t)descriptor_defs::Flag::Readable |
+                              (uint64_t)descriptor_defs::Flag::Writable |
+                              (uint64_t)descriptor_defs::Flag::Async;
+    long endpoint = net_endpoint_open_existing(endpoint_flags, event.accept_event.endpoint_id);
+    if (endpoint < 0) {
+        tcpd_protocol::Message close{};
+        tcpd_protocol::init_message(close, tcpd_protocol::kCloseRequest);
+        close.close_request.connection_id = event.accept_event.connection_id;
+        (void)write_tcpd_message(listener->server_pipe, close);
+        errno = EMFILE;
+        return -1;
+    }
+    long server = service::open_provider_pipe(service::kTcpService, service::kAbiV1,
+        (uint64_t)descriptor_defs::Flag::Writable |
+        (uint64_t)descriptor_defs::Flag::Async);
+    if (server < 0) {
+        descriptor_close((uint32_t)endpoint);
+        tcpd_protocol::Message close{};
+        tcpd_protocol::init_message(close, tcpd_protocol::kCloseRequest);
+        close.close_request.connection_id = event.accept_event.connection_id;
+        (void)write_tcpd_message(listener->server_pipe, close);
+        errno = ENETDOWN;
+        return -1;
+    }
+    int accepted_fd = -1;
+    SocketState* accepted = allocate_socket(accepted_fd);
+    if (accepted == nullptr) {
+        descriptor_close((uint32_t)endpoint);
+        tcpd_protocol::Message close{};
+        tcpd_protocol::init_message(close, tcpd_protocol::kCloseRequest);
+        close.close_request.connection_id = event.accept_event.connection_id;
+        (void)write_tcpd_message((uint32_t)server, close);
+        descriptor_close((uint32_t)server);
+        errno = EMFILE;
+        return -1;
+    }
+    accepted->connected = true;
+    accepted->nonblocking = listener->nonblocking;
+    accepted->server_pipe = (uint32_t)server;
+    accepted->endpoint = (uint32_t)endpoint;
+    accepted->connection_id = event.accept_event.connection_id;
+    accepted->owns_server_pipe = true;
+    accepted->local = listener->local;
+    accepted->peer.sin_family = AF_INET;
+    accepted->peer.sin_port = htons(event.accept_event.remote_port);
+    memcpy(&accepted->peer.sin_addr.s_addr, event.accept_event.remote_ip, 4);
+    if (address != nullptr) {
+        if (*address_len < sizeof(sockaddr_in)) {
+            close_state(*accepted);
+            errno = EINVAL;
+            return -1;
+        }
+        memcpy(address, &accepted->peer, sizeof(accepted->peer));
+        *address_len = sizeof(accepted->peer);
+    }
+    return accepted_fd;
+}
 
 extern "C" int getpeername(int fd, sockaddr* address, socklen_t* length) {
     SocketState* state = state_for(fd);
@@ -329,9 +495,13 @@ extern "C" int getpeername(int fd, sockaddr* address, socklen_t* length) {
 }
 
 extern "C" int getsockname(int fd, sockaddr* address, socklen_t* length) {
-    if (state_for(fd) == nullptr || address == nullptr || length == nullptr ||
-        *length < sizeof(sockaddr_in)) { errno = EINVAL; return -1; }
-    sockaddr_in local{}; local.sin_family = AF_INET;
+    SocketState* state = state_for(fd);
+    if (state == nullptr) { errno = EBADF; return -1; }
+    if (address == nullptr || length == nullptr || *length < sizeof(sockaddr_in)) {
+        errno = EINVAL; return -1;
+    }
+    sockaddr_in local = state->local;
+    local.sin_family = AF_INET;
     memcpy(address, &local, sizeof(local)); *length = sizeof(local); return 0;
 }
 

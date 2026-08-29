@@ -13,6 +13,14 @@ struct addrinfo {
     struct addrinfo* ai_next;
 };
 
+struct hostent {
+    char* h_name;
+    char** h_aliases;
+    int h_addrtype;
+    int h_length;
+    char** h_addr_list;
+};
+
 #define AI_PASSIVE 0x01
 #define AI_CANONNAME 0x02
 #define AI_NUMERICHOST 0x04
@@ -42,6 +50,7 @@ const char* gai_strerror(int error);
 int getnameinfo(const struct sockaddr* address, socklen_t address_len,
                 char* host, socklen_t host_len, char* service,
                 socklen_t service_len, int flags);
+struct hostent* gethostbyname(const char* name);
 #ifdef __cplusplus
 }
 #endif

@@ -54,6 +54,10 @@ int listen(int socket, int backlog);
 int accept(int socket, struct sockaddr* address, socklen_t* address_len);
 ssize_t send(int socket, const void* buffer, size_t length, int flags);
 ssize_t recv(int socket, void* buffer, size_t length, int flags);
+ssize_t sendto(int socket, const void* buffer, size_t length, int flags,
+               const struct sockaddr* destination, socklen_t destination_len);
+ssize_t recvfrom(int socket, void* buffer, size_t length, int flags,
+                 struct sockaddr* source, socklen_t* source_len);
 int shutdown(int socket, int how);
 int getsockopt(int socket, int level, int option, void* value, socklen_t* value_len);
 int setsockopt(int socket, int level, int option, const void* value, socklen_t value_len);

@@ -233,16 +233,16 @@ int poll(struct pollfd* descriptors, nfds_t count, int timeout) {
         descriptors[i].revents = 0;
         if (descriptors[i].fd < 0) continue;
         uint32_t socket_handle = 0;
-        int socket_connected = 0;
+        int socket_state = 0;
         if (neutrino_socket_poll_handle(descriptors[i].fd,
                                         &socket_handle,
-                                        &socket_connected)) {
-            if (!socket_connected) {
+                                        &socket_state)) {
+            if (socket_state == 0) {
                 descriptors[i].revents = POLLERR;
                 ++ready;
                 continue;
             }
-            if ((descriptors[i].events & POLLOUT) != 0) {
+            if (socket_state == 1 && (descriptors[i].events & POLLOUT) != 0) {
                 descriptors[i].revents |= POLLOUT;
                 ++ready;
                 continue;

@@ -27,7 +27,7 @@ NEWLIB_LIBNEUTRINO := $(NEWLIB_LIBRARY_DIR)/libneutrino.a
 NEWLIB_CRT0 := $(NEWLIB_LIBRARY_DIR)/crt0.o
 NEWLIB_PLATFORM_HEADER_NAMES := arpa/inet.h dlfcn.h dirent.h netdb.h netinet/in.h netinet/tcp.h \
                                poll.h pthread.h sched.h stdatomic.h sys/ioctl.h \
-                               sys/mman.h sys/random.h sys/socket.h sys/utsname.h \
+                               sys/mman.h sys/poll.h sys/random.h sys/socket.h sys/utsname.h \
                                neutrino/exception_context.h signal.h sys/ucontext.h time.h ucontext.h unistd.h
 NEWLIB_PLATFORM_HEADERS := $(addprefix $(NEWLIB_PLATFORM_INCLUDE_DIR)/,$(NEWLIB_PLATFORM_HEADER_NAMES))
 NEWLIB_PORT_OBJ_DIR := $(OBJ_DIR)/newlib-port

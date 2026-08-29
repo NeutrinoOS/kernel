@@ -28,9 +28,12 @@ typedef struct NeuExceptionContext {
     uint64_t ss;
 } NeuExceptionContext;
 
-#if defined(__cplusplus)
+#if defined(__cplusplus) && __cplusplus >= 201103L
 static_assert(sizeof(NeuExceptionContext) == 184,
               "x86-64 exception context ABI mismatch");
+#elif defined(__cplusplus)
+typedef char neutrino_exception_context_size_must_be_184[
+    sizeof(NeuExceptionContext) == 184 ? 1 : -1];
 #else
 _Static_assert(sizeof(NeuExceptionContext) == 184,
                "x86-64 exception context ABI mismatch");

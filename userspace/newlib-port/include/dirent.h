@@ -24,6 +24,7 @@ typedef struct __neutrino_dir DIR;
 
 DIR* opendir(const char* path);
 struct dirent* readdir(DIR* directory);
+int readdir_r(DIR* directory, struct dirent* entry, struct dirent** result);
 int closedir(DIR* directory);
 void rewinddir(DIR* directory);
 long telldir(DIR* directory);
