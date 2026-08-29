@@ -48,7 +48,9 @@ The first milestone supports:
 - monotonic/realtime clocks, anonymous/private-file mappings, and page protection
 - pthread threads, mutexes, condition variables, once controls, and keys
 - runtime shared-object loading through `dlopen`, `dlsym`, `dlclose`, and
-  `dlerror` (`/library/<name>` or a bare library name)
+  `dlerror` (`/library/<name>` or a bare library name); up to 64 loaded
+  objects and 63 direct dependencies per object, with image size bounded by
+  the process virtual-memory limit rather than a loader file-size limit
 
 Current ABI limitations:
 

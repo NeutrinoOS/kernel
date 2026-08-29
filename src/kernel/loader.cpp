@@ -12,16 +12,17 @@ namespace {
 
 constexpr uint8_t kElfMagic[4] = {0x7F, 'E', 'L', 'F'};
 constexpr uint64_t kPageSize = 0x1000;
-// Keep the complete dependency graph bounded so malformed or unusually large
-// images cannot exhaust kernel resources while they are being loaded.
-constexpr size_t kMaxSharedObjects = 16;
+// A normal desktop application may have dozens of direct and transitive DSOs.
+// This is a security ceiling, not a small-image policy: object bytes are
+// constrained by the process VM limit and libraries are streamed from disk.
+constexpr size_t kMaxSharedObjects = 64;
 constexpr size_t kDefaultMainStackSize = 256 * 1024;
 // A single object may name every other object in the graph.  Do not impose a
 // smaller, independent DT_NEEDED limit: it rejects otherwise valid graphs.
 constexpr size_t kMaxNeeded = kMaxSharedObjects - 1;
-constexpr size_t kMaxSharedObjectName = 64;
+constexpr size_t kMaxSharedObjectName = 128;
 constexpr size_t kMaxSharedObjectPath = 128;
-constexpr size_t kMaxDynamicSymbolName = 256;
+constexpr size_t kMaxDynamicSymbolName = 1024;
 constexpr uint16_t kMaxProgramHeaders = 128;
 
 enum class ElfIdent : size_t {
@@ -168,7 +169,7 @@ struct DynamicObjectSet {
     sync::SpinLock lock;
     uint64_t cr3;
     size_t object_count;
-    LoadedObject objects[kMaxSharedObjects];
+    LoadedObject* objects;
 };
 
 DynamicObjectSet g_dynamic_objects[process::kMaxTasks];
@@ -209,6 +210,16 @@ constexpr uint64_t align_up(uint64_t value, uint64_t alignment) {
 
 constexpr uint64_t align_down(uint64_t value, uint64_t alignment) {
     return value & ~(alignment - 1);
+}
+
+bool mapping_within_process_limit(const process::Task& proc, size_t length) {
+    if (proc.resources == nullptr || length == 0) {
+        return false;
+    }
+    vm::Usage usage = vm::usage(proc.cr3);
+    uint64_t limit = proc.resources->limits.max_virtual_bytes;
+    return usage.virtual_bytes <= limit &&
+           static_cast<uint64_t>(length) <= limit - usage.virtual_bytes;
 }
 
 size_t cstring_length(const char* text) {
@@ -820,7 +831,17 @@ bool map_elf_object(const loader::ProgramImage& image,
 
     uint64_t aligned_min = align_down(min_vaddr, kPageSize);
     uint64_t aligned_max = align_up(max_vaddr, kPageSize);
+    if (aligned_max < max_vaddr || aligned_max <= aligned_min) {
+        return false;
+    }
     uint64_t aligned_span = aligned_max - aligned_min;
+    if (aligned_span > SIZE_MAX ||
+        !mapping_within_process_limit(proc,
+                                      static_cast<size_t>(aligned_span))) {
+        log_message(LogLevel::Error,
+                    "Loader: ELF object exceeds process virtual-memory limit");
+        return false;
+    }
     vm::Region region =
         vm::allocate_user_region(proc.cr3, static_cast<size_t>(aligned_span));
     if (region.base == 0) {
@@ -966,9 +987,13 @@ bool map_elf_object_file(const char* path,
             aligned_max - aligned_min > SIZE_MAX) {
             break;
         }
-        region = vm::allocate_user_region(
-            proc.cr3,
-            static_cast<size_t>(aligned_max - aligned_min));
+        size_t region_size = static_cast<size_t>(aligned_max - aligned_min);
+        if (!mapping_within_process_limit(proc, region_size)) {
+            log_message(LogLevel::Error,
+                        "Loader: shared object exceeds process virtual-memory limit");
+            break;
+        }
+        region = vm::allocate_user_region(proc.cr3, region_size);
         if (region.base == 0) {
             log_message(LogLevel::Error,
                         "Loader: failed to allocate shared object region %s",
@@ -1392,10 +1417,21 @@ bool remember_dynamic_objects(process::Task& proc,
         return false;
     }
     sync::LockGuard guard(set->lock);
+    if (set->objects != nullptr) {
+        memory::free_kernel(set->objects);
+        set->objects = nullptr;
+        set->object_count = 0;
+    }
+    auto* retained = static_cast<LoadedObject*>(memory::alloc_kernel(
+        object_count * sizeof(LoadedObject), alignof(LoadedObject)));
+    if (retained == nullptr) {
+        return false;
+    }
     set->object_count = object_count;
     for (size_t i = 0; i < object_count; ++i) {
-        set->objects[i] = objects[i];
+        retained[i] = objects[i];
     }
+    set->objects = retained;
     return true;
 }
 
@@ -1437,10 +1473,16 @@ bool has_library_prefix(const char* path) {
 
 bool load_dynamic_elf_binary(const loader::ProgramImage& image,
                              process::Task& proc) {
-    LoadedObject objects[kMaxSharedObjects]{};
+    auto* objects = static_cast<LoadedObject*>(memory::alloc_kernel(
+        kMaxSharedObjects * sizeof(LoadedObject), alignof(LoadedObject)));
+    if (objects == nullptr) {
+        return false;
+    }
+    memset(objects, 0, kMaxSharedObjects * sizeof(LoadedObject));
     size_t object_count = 0;
 
     if (!map_elf_object(image, proc, "(main)", true, objects[object_count])) {
+        memory::free_kernel(objects);
         return false;
     }
     ++object_count;
@@ -1455,21 +1497,25 @@ bool load_dynamic_elf_binary(const loader::ProgramImage& image,
             log_message(LogLevel::Error,
                         "Loader: failed to read dependency name");
             free_dependency_images(objects, object_count);
+            memory::free_kernel(objects);
             return false;
         }
         if (!load_needed_object(needed, objects, object_count, proc)) {
             free_dependency_images(objects, object_count);
+            memory::free_kernel(objects);
             return false;
         }
     }
 
     if (!apply_dynamic_relocations(objects, object_count, proc)) {
         free_dependency_images(objects, object_count);
+        memory::free_kernel(objects);
         return false;
     }
     for (size_t i = 0; i < object_count; ++i) {
         if (!protect_elf_object_pages(objects[i], proc)) {
             free_dependency_images(objects, object_count);
+            memory::free_kernel(objects);
             return false;
         }
     }
@@ -1489,6 +1535,7 @@ bool load_dynamic_elf_binary(const loader::ProgramImage& image,
                                           kPageSize,
                                           false)) {
             free_dependency_images(objects, object_count);
+            memory::free_kernel(objects);
             return false;
         }
     }
@@ -1499,9 +1546,11 @@ bool load_dynamic_elf_binary(const loader::ProgramImage& image,
         log_message(LogLevel::Error,
                     "Loader: failed to retain dynamic linker state");
         free_dependency_images(objects, object_count);
+        memory::free_kernel(objects);
         return false;
     }
     free_dependency_images(objects, object_count);
+    memory::free_kernel(objects);
     return true;
 }
 
@@ -2098,7 +2147,12 @@ uint64_t dynamic_load(process::Task& proc, const char* path) {
         return 0;
     }
 
-    LoadedObject objects[kMaxSharedObjects]{};
+    auto* objects = static_cast<LoadedObject*>(memory::alloc_kernel(
+        kMaxSharedObjects * sizeof(LoadedObject), alignof(LoadedObject)));
+    if (objects == nullptr) {
+        return 0;
+    }
+    memset(objects, 0, kMaxSharedObjects * sizeof(LoadedObject));
     size_t object_count = set->object_count;
     for (size_t i = 0; i < object_count; ++i) {
         objects[i] = set->objects[i];
@@ -2108,6 +2162,7 @@ uint64_t dynamic_load(process::Task& proc, const char* path) {
                              proc,
                              object_name,
                              objects[object_count])) {
+        memory::free_kernel(objects);
         return 0;
     }
     ++object_count;
@@ -2122,6 +2177,7 @@ uint64_t dynamic_load(process::Task& proc, const char* path) {
                                 sizeof(needed)) ||
                 !load_needed_object(needed, objects, object_count, proc)) {
                 release_object_regions(objects, first_new, object_count, proc);
+                memory::free_kernel(objects);
                 return 0;
             }
         }
@@ -2144,15 +2200,26 @@ uint64_t dynamic_load(process::Task& proc, const char* path) {
                                     proc) ||
             !protect_elf_object_pages(objects[i], proc)) {
             release_object_regions(objects, first_new, object_count, proc);
+            memory::free_kernel(objects);
             return 0;
         }
     }
 
     uint64_t handle = objects[first_new].load_bias;
-    set->object_count = object_count;
-    for (size_t i = 0; i < object_count; ++i) {
-        set->objects[i] = objects[i];
+    auto* retained = static_cast<LoadedObject*>(memory::alloc_kernel(
+        object_count * sizeof(LoadedObject), alignof(LoadedObject)));
+    if (retained == nullptr) {
+        release_object_regions(objects, first_new, object_count, proc);
+        memory::free_kernel(objects);
+        return 0;
     }
+    for (size_t i = 0; i < object_count; ++i) {
+        retained[i] = objects[i];
+    }
+    memory::free_kernel(set->objects);
+    set->objects = retained;
+    set->object_count = object_count;
+    memory::free_kernel(objects);
     return handle;
 }
 
@@ -2211,6 +2278,8 @@ void release_dynamic_objects(process::Task& proc) {
         return;
     }
     sync::LockGuard guard(set->lock);
+    memory::free_kernel(set->objects);
+    set->objects = nullptr;
     set->object_count = 0;
     set->cr3 = 0;
 }

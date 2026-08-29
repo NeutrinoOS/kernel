@@ -17,7 +17,7 @@
 namespace {
 
 constexpr size_t kMaxJobs = 4;
-constexpr size_t kMaxAreas = 128;
+constexpr size_t kMaxAreas = 256;
 constexpr size_t kPageSize = 4096;
 constexpr uint64_t kMaxDumpBytes = 64ull * 1024 * 1024;
 constexpr uint16_t kElfTypeCore = 4;

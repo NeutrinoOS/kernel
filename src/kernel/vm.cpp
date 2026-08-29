@@ -13,7 +13,9 @@ namespace {
 constexpr uint64_t kPageSize = 0x1000;
 constexpr uint64_t kPageMask = kPageSize - 1;
 constexpr size_t kMaxAddressSpaces = 256;
-constexpr size_t kMaxVmAreas = 128;
+// Dynamic-link-heavy applications need one image mapping per loaded DSO in
+// addition to heaps, stacks, file mappings, and shared-memory regions.
+constexpr size_t kMaxVmAreas = 256;
 
 constexpr uint64_t kUserCodeBase = vm::kUserAddressSpaceBase;
 constexpr uint64_t kUserStackCeiling = vm::kUserAddressSpaceTop;
