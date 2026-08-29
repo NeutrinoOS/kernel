@@ -75,8 +75,8 @@ extern "C" void isr_validate_return(InterruptFrame* regs) {
         process::Task* proc = process::current();
         if (proc != nullptr) {
             InterruptFrame fault = *regs;
-            fault.int_no = 13;
-            fault.err_code = 0;
+            fault.exception = 13;
+            fault.error_code = 0;
             (void)core_dump::schedule(*proc, fault, 0);
             process::terminate_group(*proc, exit_code_from_exception(13));
             scheduler::reschedule_from_interrupt(*regs);
@@ -90,8 +90,8 @@ extern "C" void isr_handler(InterruptFrame* regs) {
         return;
     }
 
-    if (regs->int_no >= 32) {
-        uint64_t irq = regs->int_no - 32;
+    if (regs->exception >= 32) {
+        uint64_t irq = regs->exception - 32;
         if (irq == 0) {
             bool user_mode = (regs->cs & 0x3) != 0;
             bool has_task = process::current() != nullptr;
@@ -104,7 +104,7 @@ extern "C" void isr_handler(InterruptFrame* regs) {
             pic::send_eoi(0);
             lapic::eoi();
             return;
-        } else if (regs->int_no == 0x40) {
+        } else if (regs->exception == 0x40) {
             bool user_mode = (regs->cs & 0x3) != 0;
             bool has_task = process::current() != nullptr;
             percpu::record_tick(user_mode, has_task);
@@ -114,7 +114,7 @@ extern "C" void isr_handler(InterruptFrame* regs) {
             scheduler::tick(*regs);
             lapic::eoi();
             return;
-        } else if (regs->int_no == lapic::kSchedulerWakeVector) {
+        } else if (regs->exception == lapic::kSchedulerWakeVector) {
             if ((regs->cs & 0x3) != 0) {
                 scheduler::reschedule_from_interrupt(*regs);
             }
@@ -122,7 +122,7 @@ extern "C" void isr_handler(InterruptFrame* regs) {
             return;
         }
         percpu::record_irq();
-        if (interrupts::dispatch(static_cast<uint8_t>(regs->int_no))) {
+        if (interrupts::dispatch(static_cast<uint8_t>(regs->exception))) {
             lapic::eoi();
             return;
         }
@@ -145,14 +145,15 @@ extern "C" void isr_handler(InterruptFrame* regs) {
         return;
     }
 
-    if (regs->int_no == 14 && (regs->cs & 0x3) != 0) {
+    if (regs->exception == 14 && (regs->cs & 0x3) != 0) {
         uint64_t fault_address = 0;
         asm volatile("mov %%cr2, %0" : "=r"(fault_address));
         process::Task* proc = process::current();
-        const bool write = (regs->err_code & (1u << 1)) != 0;
-        const bool execute = (regs->err_code & (1u << 4)) != 0;
+        regs->fault_address = fault_address;
+        const bool write = (regs->error_code & (1u << 1)) != 0;
+        const bool execute = (regs->error_code & (1u << 4)) != 0;
         const bool recoverable =
-            (regs->err_code & 0x1u) == 0 || write;
+            (regs->error_code & 0x1u) == 0 || write;
         size_t max_stack_length = process::kMaxThreadStackSize;
         if (proc != nullptr && proc->resources != nullptr) {
             const vm::Usage memory_usage = vm::usage(proc->cr3);
@@ -183,20 +184,20 @@ extern "C" void isr_handler(InterruptFrame* regs) {
     }
 
     log_message(LogLevel::Error, "Exception %x %s",
-                static_cast<unsigned int>(regs->int_no),
-                regs->int_no < 32 ? exception_names[regs->int_no] : "Unknown");
+                static_cast<unsigned int>(regs->exception),
+                regs->exception < 32 ? exception_names[regs->exception] : "Unknown");
     if (auto* cpu = percpu::current_cpu()) {
         log_message(LogLevel::Error,
                     "CPU: lapic=%u processor=%u",
                     cpu->lapic_id,
                     cpu->processor_id);
     }
-    uint16_t selector = static_cast<uint16_t>(regs->err_code & 0xFFF8);
-    bool external = (regs->err_code & 0x1) != 0;
-    bool idt = (regs->err_code & 0x2) != 0;
-    bool ldt = (regs->err_code & 0x4) != 0;
+    uint16_t selector = static_cast<uint16_t>(regs->error_code & 0xFFF8);
+    bool external = (regs->error_code & 0x1) != 0;
+    bool idt = (regs->error_code & 0x2) != 0;
+    bool ldt = (regs->error_code & 0x4) != 0;
     log_message(LogLevel::Error, "Error code: %x (sel=%04x ext=%d idt=%d ldt=%d)",
-                static_cast<unsigned int>(regs->err_code),
+                static_cast<unsigned int>(regs->error_code),
                 static_cast<unsigned int>(selector),
                 external ? 1 : 0,
                 idt ? 1 : 0,
@@ -236,9 +237,10 @@ extern "C" void isr_handler(InterruptFrame* regs) {
                     "Faulting process unknown (cr3=%016llx)",
                     static_cast<unsigned long long>(cr3_reg));
     }
-    if (regs->int_no == 14) {
+    if (regs->exception == 14) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        regs->fault_address = cr2;
         log_message(LogLevel::Error, "CR2=%016llx",
                     static_cast<unsigned long long>(cr2));
     }
@@ -345,7 +347,7 @@ extern "C" void isr_handler(InterruptFrame* regs) {
     // that the kernel killed the task (exit code has the high bit set) and
     // continue running.
     if ((regs->cs & 0x3) != 0) {
-        uint16_t exit_code = exit_code_from_exception(regs->int_no);
+        uint16_t exit_code = exit_code_from_exception(regs->exception);
         log_message(LogLevel::Error,
                     "Terminating userspace task tid=%u image=%s due to exception %s (#%u) rip=%016llx exit=%u",
                     process::current() ? static_cast<unsigned int>(process::current()->tid) : 0,
@@ -353,13 +355,13 @@ extern "C" void isr_handler(InterruptFrame* regs) {
                      process::current()->image_path[0] != '\0')
                         ? process::current()->image_path
                         : "(unknown)",
-                    regs->int_no < 32 ? exception_names[regs->int_no] : "Unknown",
-                    static_cast<unsigned int>(regs->int_no),
+                    regs->exception < 32 ? exception_names[regs->exception] : "Unknown",
+                    static_cast<unsigned int>(regs->exception),
                     static_cast<unsigned long long>(regs->rip),
                     static_cast<unsigned int>(exit_code));
         if (process::Task* proc = process::current()) {
             uint64_t fault_address = 0;
-            if (regs->int_no == 14) {
+            if (regs->exception == 14) {
                 asm volatile("mov %%cr2, %0" : "=r"(fault_address));
             }
             (void)core_dump::schedule(*proc, *regs, fault_address);
@@ -370,6 +372,6 @@ extern "C" void isr_handler(InterruptFrame* regs) {
     }
 
     const char* secondary =
-        regs->int_no < 32 ? exception_names[regs->int_no] : "UNKNOWN_EXCEPTION";
+        regs->exception < 32 ? exception_names[regs->exception] : "UNKNOWN_EXCEPTION";
     error_screen::display("UNHANDLED_CPU_EXCEPTION_", secondary, regs);
 }

@@ -39,8 +39,8 @@ void print_registers(const InterruptFrame* regs) {
 
     kconsole->printf("Register dump:\n");
     kconsole->printf("INT=%016x     ERR=%016x     CR2=%016x\n",
-                     static_cast<unsigned int>(regs->int_no),
-                     static_cast<unsigned long long>(regs->err_code),
+                     static_cast<unsigned int>(regs->exception),
+                     static_cast<unsigned long long>(regs->error_code),
                      static_cast<unsigned long long>(cr.cr2));
     kconsole->printf("RAX=%016x     RBX=%016x     RCX=%016x\n",
                      static_cast<unsigned long long>(regs->rax),

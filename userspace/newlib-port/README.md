@@ -65,6 +65,9 @@ Current ABI limitations:
 - `dlclose` validates a handle but retains the object mapping until process
   exit, preventing one thread from unmapping code another thread may still
   execute.
+- The x86-64 `ucontext_t` and `SA_SIGINFO` declarations are available for
+  exception-handler compatibility, but user signal delivery and the
+  `getcontext`/`setcontext` context-switching APIs are not implemented yet.
 
 ## Migration direction
 

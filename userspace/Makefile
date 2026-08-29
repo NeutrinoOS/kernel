@@ -28,7 +28,7 @@ NEWLIB_CRT0 := $(NEWLIB_LIBRARY_DIR)/crt0.o
 NEWLIB_PLATFORM_HEADER_NAMES := arpa/inet.h dlfcn.h dirent.h netdb.h netinet/in.h netinet/tcp.h \
                                poll.h pthread.h sched.h stdatomic.h sys/ioctl.h \
                                sys/mman.h sys/random.h sys/socket.h sys/utsname.h \
-                               time.h unistd.h
+                               neutrino/exception_context.h signal.h sys/ucontext.h time.h ucontext.h unistd.h
 NEWLIB_PLATFORM_HEADERS := $(addprefix $(NEWLIB_PLATFORM_INCLUDE_DIR)/,$(NEWLIB_PLATFORM_HEADER_NAMES))
 NEWLIB_PORT_OBJ_DIR := $(OBJ_DIR)/newlib-port
 NEWLIB_PORT_OBJECTS := $(NEWLIB_PORT_OBJ_DIR)/start.o \
@@ -128,6 +128,10 @@ $(NEWLIB_LIBNEUTRINO): $(NEWLIB_PORT_OBJECTS) $(NEWLIB_LIBC)
 	$(NEWLIB_AR) rcs $@ $(NEWLIB_PORT_OBJECTS)
 
 $(NEWLIB_PLATFORM_INCLUDE_DIR)/%.h: $(NEWLIB_PORT_DIR)/include/%.h $(NEWLIB_LIBC)
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+$(NEWLIB_PLATFORM_INCLUDE_DIR)/neutrino/exception_context.h: ../shared/include/neutrino/exception_context.h $(NEWLIB_LIBC)
 	@mkdir -p $(dir $@)
 	cp $< $@
 

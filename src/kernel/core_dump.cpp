@@ -398,7 +398,7 @@ bool write_dump(Job& job, const char* path) {
 
     memset(g_notes, 0, sizeof(g_notes));
     ElfPrStatus status{};
-    const int signal = signal_for_vector(job.frame.int_no);
+    const int signal = signal_for_vector(job.frame.exception);
     status.signal_number = signal;
     status.current_signal = static_cast<int16_t>(signal);
     status.pid = static_cast<int32_t>(job.tid);
@@ -430,8 +430,8 @@ bool write_dump(Job& job, const char* path) {
                              &info,
                              sizeof(info));
     const NeutrinoException exception{
-        .vector = job.frame.int_no,
-        .error_code = job.frame.err_code,
+        .vector = job.frame.exception,
+        .error_code = job.frame.error_code,
         .fault_address = job.fault_address,
         .instruction_pointer = job.frame.rip,
     };
@@ -555,7 +555,7 @@ void service_job(void* context) {
         log_message(LogLevel::Info,
                     "Core dump: wrote %s for exception #%u at %016llx (fault=%016llx)",
                     path,
-                    static_cast<unsigned int>(job.frame.int_no),
+                    static_cast<unsigned int>(job.frame.exception),
                     static_cast<unsigned long long>(job.frame.rip),
                     static_cast<unsigned long long>(job.fault_address));
     } else {
