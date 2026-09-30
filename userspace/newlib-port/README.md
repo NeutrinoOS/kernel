@@ -46,7 +46,11 @@ The first milestone supports:
 - basic filesystem mutation, synchronization, and current-directory calls
 - `nanosleep`, `sleep`, and `usleep`
 - monotonic/realtime clocks, anonymous/private-file mappings, and page protection
+- `getrlimit`/`setrlimit` for address-space, process-count, and descriptor
+  limits, backed by Neutrino process limits
 - pthread threads, mutexes, condition variables, once controls, and keys
+- unnamed POSIX semaphores (`sem_init`, wait/try/timed-wait, post, and
+  get-value); process-shared and named semaphores currently report `ENOSYS`
 - runtime shared-object loading through `dlopen`, `dlsym`, `dlclose`, and
   `dlerror` (`/library/<name>` or a bare library name); up to 64 loaded
   objects and 63 direct dependencies per object, with image size bounded by

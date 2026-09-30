@@ -37,6 +37,22 @@ enum {
     REG_CR2,
 };
 
+/* Local names for code which does not assume a Linux libc. */
+#define NEU_REG_PC REG_RIP
+#define NEU_REG_SP REG_RSP
+#define NEU_REG_FP REG_RBP
+
+#define NEU_UCONTEXT_PC(context) ((context)->uc_mcontext.native.rip)
+#define NEU_UCONTEXT_SP(context) ((context)->uc_mcontext.native.rsp)
+#define NEU_UCONTEXT_FP(context) ((context)->uc_mcontext.native.rbp)
+#define NEU_UCONTEXT_FLAGS(context) ((context)->uc_mcontext.native.rflags)
+#define NEU_UCONTEXT_FAULT_ADDRESS(context) \
+    ((context)->uc_mcontext.native.fault_address)
+#define NEU_UCONTEXT_ERROR_CODE(context) \
+    ((context)->uc_mcontext.native.error_code)
+#define NEU_UCONTEXT_EXCEPTION(context) \
+    ((context)->uc_mcontext.native.exception)
+
 typedef struct {
     gregset_t gregs;
     /* Canonical Neutrino representation; gregs mirrors its GPR state. */

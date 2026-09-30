@@ -171,6 +171,104 @@ int getrusage(int who, struct rusage* usage) {
     return 0;
 }
 
+int getrlimit(int resource, struct rlimit* limits) {
+    if (limits == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+
+    struct neutrino_process_limits process_limits;
+    if (neutrino_raw_syscall2(
+            NEUTRINO_PROCESS_GET_LIMITS,
+            0,
+            (long)(uintptr_t)&process_limits) < 0) {
+        errno = EIO;
+        return -1;
+    }
+
+    uint64_t value;
+    switch (resource) {
+        case RLIMIT_AS:
+            value = process_limits.max_virtual_bytes;
+            break;
+        case RLIMIT_NPROC:
+            value = process_limits.max_threads;
+            break;
+        case RLIMIT_NOFILE:
+            value = process_limits.max_descriptors;
+            break;
+        case RLIMIT_STACK:
+        case RLIMIT_CORE:
+        case RLIMIT_CPU:
+        case RLIMIT_FSIZE:
+        case RLIMIT_DATA:
+        case RLIMIT_RSS:
+        case RLIMIT_MEMLOCK:
+            value = RLIM_INFINITY;
+            break;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+    limits->rlim_cur = value;
+    limits->rlim_max = value;
+    return 0;
+}
+
+int setrlimit(int resource, const struct rlimit* limits) {
+    if (limits == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    /* Neutrino currently has one enforced value per resource, rather than
+     * distinct soft and hard limits. */
+    if (limits->rlim_cur != limits->rlim_max) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    struct neutrino_process_limits process_limits;
+    if (neutrino_raw_syscall2(
+            NEUTRINO_PROCESS_GET_LIMITS,
+            0,
+            (long)(uintptr_t)&process_limits) < 0) {
+        errno = EIO;
+        return -1;
+    }
+
+    switch (resource) {
+        case RLIMIT_AS:
+            process_limits.max_virtual_bytes = limits->rlim_cur;
+            break;
+        case RLIMIT_NPROC:
+            if (limits->rlim_cur > UINT32_MAX) {
+                errno = EINVAL;
+                return -1;
+            }
+            process_limits.max_threads = (uint32_t)limits->rlim_cur;
+            break;
+        case RLIMIT_NOFILE:
+            if (limits->rlim_cur > UINT32_MAX) {
+                errno = EINVAL;
+                return -1;
+            }
+            process_limits.max_descriptors = (uint32_t)limits->rlim_cur;
+            break;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+
+    if (neutrino_raw_syscall2(
+            NEUTRINO_PROCESS_SET_LIMITS,
+            0,
+            (long)(uintptr_t)&process_limits) < 0) {
+        errno = EPERM;
+        return -1;
+    }
+    return 0;
+}
+
 int fcntl(int fd, int command, ...) {
     if (fd < 0) {
         errno = EBADF;

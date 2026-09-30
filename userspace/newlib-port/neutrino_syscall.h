@@ -48,6 +48,8 @@ enum neutrino_system_call {
     NEUTRINO_PROCESS_ID = 60,
     NEUTRINO_PROCESS_SET_CWD = 64,
     NEUTRINO_PROCESS_GET_CWD = 65,
+    NEUTRINO_PROCESS_SET_LIMITS = 76,
+    NEUTRINO_PROCESS_GET_LIMITS = 77,
     NEUTRINO_DYNAMIC_LOAD = 100,
     NEUTRINO_DYNAMIC_SYMBOL = 101,
     NEUTRINO_DYNAMIC_CLOSE = 102,
@@ -82,6 +84,15 @@ struct neutrino_file_metadata {
     uint32_t reserved;
 };
 
+struct neutrino_process_limits {
+    uint32_t max_threads;
+    uint32_t max_descriptors;
+    uint32_t max_file_handles;
+    uint32_t max_directory_handles;
+    uint64_t max_virtual_bytes;
+    uint64_t max_cpu_ticks;
+};
+
 struct neutrino_wall_time {
     uint64_t unix_seconds;
     uint32_t nanoseconds;
@@ -112,6 +123,8 @@ _Static_assert(sizeof(struct neutrino_directory_entry) == 80,
                "Neutrino directory-entry ABI mismatch");
 _Static_assert(sizeof(struct neutrino_file_metadata) == 24,
                "Neutrino file-metadata ABI mismatch");
+_Static_assert(sizeof(struct neutrino_process_limits) == 32,
+               "Neutrino process-limits ABI mismatch");
 
 static inline long neutrino_raw_syscall4(long number,
                                          long argument1,
