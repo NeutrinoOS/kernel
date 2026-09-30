@@ -17,6 +17,11 @@ struct sockaddr_storage {
     unsigned char __data[126];
 };
 
+struct linger {
+    int l_onoff;
+    int l_linger;
+};
+
 #define AF_UNSPEC 0
 #define AF_INET 2
 #define PF_UNSPEC AF_UNSPEC
@@ -33,10 +38,13 @@ struct sockaddr_storage {
 #define SO_SNDBUF 7
 #define SO_RCVBUF 8
 #define SO_KEEPALIVE 9
+#define SO_LINGER 13
+#define SO_OOBINLINE 0x0100
 #define SO_TYPE 3
 #define SO_NOSIGPIPE 0x1022
 
 #define MSG_PEEK 0x02
+#define MSG_OOB 0x01
 #define MSG_DONTWAIT 0x40
 #define MSG_NOSIGNAL 0x4000
 

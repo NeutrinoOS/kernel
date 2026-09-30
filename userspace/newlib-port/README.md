@@ -46,6 +46,8 @@ The first milestone supports:
 - basic filesystem mutation, synchronization, and current-directory calls
 - `nanosleep`, `sleep`, and `usleep`
 - monotonic/realtime clocks, anonymous/private-file mappings, and page protection
+- capability-gated writable/executable mappings after an explicit
+  `neutrino_enable_write_execute()` process opt-in
 - `getrlimit`/`setrlimit` for address-space, process-count, and descriptor
   limits, backed by Neutrino process limits
 - pthread threads, mutexes, condition variables, once controls, and keys
@@ -62,6 +64,9 @@ Current ABI limitations:
   `argv[0]` is currently an empty string.
 - Kernel failures are not structured error numbers, so several failures map to
   conservative `errno` values.
+- `PROT_WRITE | PROT_EXEC` is rejected unless the process first calls
+  `neutrino_enable_write_execute()` and its principal holds the
+  `MemoryWriteExecute` capability.
 - `O_TRUNC`, file-length changes, timed descriptor polling, and full terminal
   control remain unsupported.
 - Compiler-generated ELF TLS is not loaded yet. Newlib reentrancy and pthread

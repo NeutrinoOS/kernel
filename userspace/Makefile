@@ -5,7 +5,14 @@
 
 SHELL := /bin/bash
 
+NEUTRINO_RELEASE ?= 0
+ifeq ($(NEUTRINO_RELEASE),1)
+OBJ_DIR := build-release
+NEWLIB_DEBUG_FLAGS :=
+else
 OBJ_DIR := build
+NEWLIB_DEBUG_FLAGS := -g
+endif
 DEPS_DIR := deps
 NEWLIB_SOURCE_DIR ?= $(DEPS_DIR)/newlib-cygwin
 NEWLIB_PORT_DIR := newlib-port
@@ -40,8 +47,9 @@ NEWLIB_PORT_OBJECTS := $(NEWLIB_PORT_OBJ_DIR)/start.o \
                        $(NEWLIB_PORT_OBJ_DIR)/dlfcn.o \
                        $(NEWLIB_PORT_OBJ_DIR)/socket.o \
                        $(NEWLIB_PORT_OBJ_DIR)/libc_optimizations.o \
+                       $(NEWLIB_PORT_OBJ_DIR)/cxx_abi.o \
                        $(NEWLIB_PORT_OBJ_DIR)/malloc_locks.o
-NEWLIB_CFLAGS := -O2 -g -ffreestanding -fno-builtin \
+NEWLIB_CFLAGS := -O2 $(NEWLIB_DEBUG_FLAGS) -ffreestanding -fno-builtin \
                  -fno-stack-protector -nostdlib -m64 -mno-red-zone \
                  -mno-avx -mno-avx512f -fPIE -D_POSIX_THREADS=200809L
 NEWLIB_PORT_CFLAGS := $(NEWLIB_CFLAGS) -std=c11 -Wall -Wextra -Wpedantic \
@@ -79,7 +87,7 @@ $(NEWLIB_CONFIG_STAMP): $(NEWLIB_SOURCE_DIR)/newlib/configure
 			--enable-newlib-io-long-long \
 			--enable-newlib-register-fini \
 			CC=$(NEWLIB_CC) AR=$(NEWLIB_AR) RANLIB=$(NEWLIB_RANLIB) \
-			CFLAGS='-O2 -g -ffreestanding -fno-stack-protector -mno-red-zone -mno-avx -mno-avx512f -fPIE'
+			CFLAGS='-O2 $(NEWLIB_DEBUG_FLAGS) -ffreestanding -fno-stack-protector -mno-red-zone -mno-avx -mno-avx512f -fPIE'
 	@touch $@
 
 $(NEWLIB_BUILD_DIR)/Makefile: $(NEWLIB_CONFIG_STAMP)
@@ -118,6 +126,9 @@ $(NEWLIB_PORT_OBJ_DIR)/socket.o: $(NEWLIB_PORT_DIR)/socket.cpp $(NEWLIB_PORT_DIR
 	$(NEWLIB_CXX) $(NEWLIB_PORT_CXXFLAGS) -c $< -o $@
 
 $(NEWLIB_PORT_OBJ_DIR)/libc_optimizations.o: $(NEWLIB_PORT_DIR)/libc_optimizations.c $(NEWLIB_LIBC) | $(NEWLIB_PORT_OBJ_DIR)
+	$(NEWLIB_CC) $(NEWLIB_PORT_CFLAGS) -c $< -o $@
+
+$(NEWLIB_PORT_OBJ_DIR)/cxx_abi.o: $(NEWLIB_PORT_DIR)/cxx_abi.c $(NEWLIB_LIBC) | $(NEWLIB_PORT_OBJ_DIR)
 	$(NEWLIB_CC) $(NEWLIB_PORT_CFLAGS) -c $< -o $@
 
 $(NEWLIB_PORT_OBJ_DIR)/malloc_locks.o: $(NEWLIB_PORT_DIR)/malloc_locks.c $(NEWLIB_LIBC) | $(NEWLIB_PORT_OBJ_DIR)

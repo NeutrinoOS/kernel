@@ -20,8 +20,11 @@ constexpr size_t kDefaultMainStackSize = 256 * 1024;
 // A single object may name every other object in the graph.  Do not impose a
 // smaller, independent DT_NEEDED limit: it rejects otherwise valid graphs.
 constexpr size_t kMaxNeeded = kMaxSharedObjects - 1;
-constexpr size_t kMaxSharedObjectName = 128;
-constexpr size_t kMaxSharedObjectPath = 128;
+// A DSO name is relative to /library and may include nested directories.
+// Keep the stored name large enough to retain that relative path verbatim.
+constexpr size_t kMaxSharedObjectName = 256;
+constexpr size_t kMaxSharedObjectPath =
+    kMaxSharedObjectName + sizeof("/library/");
 constexpr size_t kMaxDynamicSymbolName = 1024;
 constexpr uint16_t kMaxProgramHeaders = 128;
 
@@ -45,6 +48,11 @@ enum : uint16_t {
 enum : uint32_t {
     PT_LOAD = 1,
     PT_DYNAMIC = 2,
+};
+
+enum : uint32_t {
+    SHT_SYMTAB = 2,
+    SHT_STRTAB = 3,
 };
 
 enum : uint32_t {
@@ -80,6 +88,19 @@ struct Elf64Phdr {
     uint64_t align;
 };
 
+struct Elf64Shdr {
+    uint32_t name;
+    uint32_t type;
+    uint64_t flags;
+    uint64_t addr;
+    uint64_t offset;
+    uint64_t size;
+    uint32_t link;
+    uint32_t info;
+    uint64_t addralign;
+    uint64_t entsize;
+};
+
 struct Elf64Dyn {
     int64_t tag;
     uint64_t val;
@@ -104,6 +125,7 @@ enum : int64_t {
     DT_RELAENT = 9,
     DT_STRSZ = 10,
     DT_SYMENT = 11,
+    DT_SONAME = 14,
     DT_PLTREL = 20,
     DT_JMPREL = 23,
 };
@@ -138,6 +160,8 @@ struct Elf64Sym {
 struct DynamicInfo {
     uint64_t needed_offsets[kMaxNeeded];
     size_t needed_count;
+    uint64_t soname_offset;
+    bool has_soname;
     uint64_t rela_addr;
     uint64_t rela_size;
     uint64_t rela_ent;
@@ -162,6 +186,10 @@ struct LoadedObject {
     uint64_t max_vaddr;
     uint64_t entry;
     DynamicInfo dynamic;
+    Elf64Sym* static_symbols;
+    size_t static_symbol_count;
+    char* static_strings;
+    size_t static_string_size;
     bool main_object;
 };
 
@@ -272,15 +300,30 @@ bool build_library_path(const char* name, char* out, size_t out_size) {
     }
     size_t prefix_len = cstring_length(prefix);
     size_t name_len = cstring_length(name);
-    if ((name_len == 1 && name[0] == '.') ||
-        (name_len == 2 && name[0] == '.' && name[1] == '.')) {
-        return false;
-    }
+    size_t component_start = 0;
     for (size_t i = 0; i < name_len; ++i) {
         unsigned char ch = static_cast<unsigned char>(name[i]);
-        if (ch < 0x20 || ch == 0x7F || ch == '/' || ch == '\\') {
+        if (ch < 0x20 || ch == 0x7F || ch == '\\') {
             return false;
         }
+        if (ch != '/') {
+            continue;
+        }
+        size_t component_len = i - component_start;
+        if (component_len == 0 ||
+            (component_len == 1 && name[component_start] == '.') ||
+            (component_len == 2 && name[component_start] == '.' &&
+             name[component_start + 1] == '.')) {
+            return false;
+        }
+        component_start = i + 1;
+    }
+    size_t component_len = name_len - component_start;
+    if (component_len == 0 ||
+        (component_len == 1 && name[component_start] == '.') ||
+        (component_len == 2 && name[component_start] == '.' &&
+         name[component_start + 1] == '.')) {
+        return false;
     }
     if (prefix_len + name_len + 1 > out_size) {
         return false;
@@ -423,7 +466,8 @@ bool validate_dynamic_info(DynamicInfo& info) {
         info.dynsym_count = static_cast<size_t>(count);
     }
 
-    if (info.needed_count != 0 && info.strtab_addr == 0) {
+    if ((info.needed_count != 0 || info.has_soname) &&
+        info.strtab_addr == 0) {
         log_message(LogLevel::Error,
                     "Loader: dependencies require a dynamic string table");
         return false;
@@ -464,6 +508,10 @@ bool parse_dynamic_info(const loader::ProgramImage& image,
                 }
                 info.needed_offsets[info.needed_count++] = dyn.val;
                 break;
+            case DT_SONAME:
+                info.soname_offset = dyn.val;
+                info.has_soname = true;
+                break;
             case DT_RELA:
                 info.rela_addr = dyn.val;
                 break;
@@ -498,6 +546,78 @@ bool parse_dynamic_info(const loader::ProgramImage& image,
 
     (void)header;
     return validate_dynamic_info(info);
+}
+
+void release_static_symbols(LoadedObject& object) {
+    memory::free_kernel(object.static_symbols);
+    memory::free_kernel(object.static_strings);
+    object.static_symbols = nullptr;
+    object.static_symbol_count = 0;
+    object.static_strings = nullptr;
+    object.static_string_size = 0;
+}
+
+bool capture_main_static_symbols(const loader::ProgramImage& image,
+                                 const Elf64Ehdr& header,
+                                 LoadedObject& object) {
+    if (header.shoff == 0 || header.shnum == 0) {
+        return true;
+    }
+    if (header.shentsize != sizeof(Elf64Shdr) ||
+        header.shoff > image.size ||
+        static_cast<uint64_t>(header.shnum) >
+            (image.size - header.shoff) / sizeof(Elf64Shdr)) {
+        log_message(LogLevel::Error,
+                    "Loader: invalid main executable section headers");
+        return false;
+    }
+
+    const auto* sections = reinterpret_cast<const Elf64Shdr*>(
+        image.data + header.shoff);
+    const Elf64Shdr* symbols = nullptr;
+    for (uint16_t i = 0; i < header.shnum; ++i) {
+        if (sections[i].type == SHT_SYMTAB) {
+            symbols = &sections[i];
+            break;
+        }
+    }
+    if (symbols == nullptr) {
+        return true;
+    }
+    if (symbols->entsize != sizeof(Elf64Sym) || symbols->size == 0 ||
+        symbols->size / sizeof(Elf64Sym) > SIZE_MAX ||
+        symbols->offset > image.size || symbols->size > image.size - symbols->offset ||
+        symbols->link >= header.shnum) {
+        log_message(LogLevel::Error,
+                    "Loader: invalid main executable symbol table");
+        return false;
+    }
+    const Elf64Shdr& strings = sections[symbols->link];
+    if (strings.type != SHT_STRTAB || strings.size == 0 ||
+        strings.size > SIZE_MAX || strings.offset > image.size ||
+        strings.size > image.size - strings.offset) {
+        log_message(LogLevel::Error,
+                    "Loader: invalid main executable symbol strings");
+        return false;
+    }
+
+    size_t symbol_size = static_cast<size_t>(symbols->size);
+    size_t string_size = static_cast<size_t>(strings.size);
+    auto* symbol_copy = static_cast<Elf64Sym*>(
+        memory::alloc_kernel(symbol_size, alignof(Elf64Sym)));
+    auto* string_copy = static_cast<char*>(memory::alloc_kernel(string_size, 1));
+    if (symbol_copy == nullptr || string_copy == nullptr) {
+        memory::free_kernel(symbol_copy);
+        memory::free_kernel(string_copy);
+        return false;
+    }
+    memcpy(symbol_copy, image.data + symbols->offset, symbol_size);
+    memcpy(string_copy, image.data + strings.offset, string_size);
+    object.static_symbols = symbol_copy;
+    object.static_symbol_count = symbol_size / sizeof(Elf64Sym);
+    object.static_strings = string_copy;
+    object.static_string_size = string_size;
+    return true;
 }
 
 bool parse_mapped_dynamic_info(const Elf64Phdr* dynamic_phdr,
@@ -542,6 +662,10 @@ bool parse_mapped_dynamic_info(const Elf64Phdr* dynamic_phdr,
                 }
                 object.dynamic.needed_offsets[
                     object.dynamic.needed_count++] = dyn.val;
+                break;
+            case DT_SONAME:
+                object.dynamic.soname_offset = dyn.val;
+                object.dynamic.has_soname = true;
                 break;
             case DT_RELA:
                 object.dynamic.rela_addr = dyn.val;
@@ -709,6 +833,83 @@ bool dynamic_string_equals(const LoadedObject& object,
            cstring_equal(candidate, expected);
 }
 
+bool static_symbol_string_equals(const LoadedObject& object,
+                                 uint32_t string_offset,
+                                 const char* expected) {
+    if (expected == nullptr || object.static_strings == nullptr ||
+        string_offset >= object.static_string_size) {
+        return false;
+    }
+    size_t expected_length = cstring_length(expected);
+    size_t available = object.static_string_size - string_offset;
+    if (expected_length >= available) {
+        return false;
+    }
+    for (size_t i = 0; i < expected_length; ++i) {
+        if (object.static_strings[string_offset + i] != expected[i]) {
+            return false;
+        }
+    }
+    return object.static_strings[string_offset + expected_length] == '\0';
+}
+
+bool resolve_main_static_symbol(const char* name,
+                                const LoadedObject& object,
+                                uint64_t& out_value) {
+    if (name == nullptr || name[0] == '\0' ||
+        object.static_symbols == nullptr) {
+        return false;
+    }
+    for (size_t i = 0; i < object.static_symbol_count; ++i) {
+        const Elf64Sym& symbol = object.static_symbols[i];
+        uint32_t bind = elf_symbol_bind(symbol);
+        if (symbol.shndx == SHN_UNDEF || symbol.name == 0 ||
+            (bind != STB_GLOBAL && bind != STB_WEAK &&
+             bind != STB_GNU_UNIQUE) ||
+            !static_symbol_string_equals(object, symbol.name, name)) {
+            continue;
+        }
+        if (object.load_bias > UINT64_MAX - symbol.value) {
+            return false;
+        }
+        out_value = object.load_bias + symbol.value;
+        return true;
+    }
+    return false;
+}
+
+bool resolve_symbol_in_object(const char* name,
+                              const LoadedObject& object,
+                              process::Task& proc,
+                              uint64_t& out_value) {
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+    for (size_t sym_index = 0;
+         sym_index < object.dynamic.dynsym_count;
+         ++sym_index) {
+        Elf64Sym sym{};
+        if (!read_dynsym(object, sym_index, proc, sym) ||
+            sym.shndx == SHN_UNDEF || sym.name == 0) {
+            continue;
+        }
+        uint32_t bind = elf_symbol_bind(sym);
+        if (bind != STB_GLOBAL && bind != STB_WEAK &&
+            bind != STB_GNU_UNIQUE) {
+            continue;
+        }
+        if (!dynamic_string_equals(object, sym.name, name, proc)) {
+            continue;
+        }
+        if (object.load_bias > UINT64_MAX - sym.value) {
+            return false;
+        }
+        out_value = object.load_bias + sym.value;
+        return true;
+    }
+    return false;
+}
+
 bool resolve_symbol(const char* name,
                     const LoadedObject* objects,
                     size_t object_count,
@@ -717,28 +918,19 @@ bool resolve_symbol(const char* name,
     if (name == nullptr || name[0] == '\0') {
         return false;
     }
-    for (size_t obj_index = 0; obj_index < object_count; ++obj_index) {
-        const LoadedObject& object = objects[obj_index];
-        for (size_t sym_index = 0;
-             sym_index < object.dynamic.dynsym_count;
-             ++sym_index) {
-            Elf64Sym sym{};
-            if (!read_dynsym(object, sym_index, proc, sym) ||
-                sym.shndx == SHN_UNDEF || sym.name == 0) {
-                continue;
-            }
-            uint32_t bind = elf_symbol_bind(sym);
-            if (bind != STB_GLOBAL && bind != STB_WEAK &&
-                bind != STB_GNU_UNIQUE) {
-                continue;
-            }
-            if (!dynamic_string_equals(object, sym.name, name, proc)) {
-                continue;
-            }
-            if (object.load_bias > UINT64_MAX - sym.value) {
-                return false;
-            }
-            out_value = object.load_bias + sym.value;
+    // The executable is part of the global lookup scope.  Check it first so
+    // symbols exported by the main image satisfy relocations in every DSO,
+    // including libraries loaded later through dlopen().
+    for (size_t i = 0; i < object_count; ++i) {
+        if (objects[i].main_object &&
+            (resolve_main_static_symbol(name, objects[i], out_value) ||
+             resolve_symbol_in_object(name, objects[i], proc, out_value))) {
+            return true;
+        }
+    }
+    for (size_t i = 0; i < object_count; ++i) {
+        if (!objects[i].main_object &&
+            resolve_symbol_in_object(name, objects[i], proc, out_value)) {
             return true;
         }
     }
@@ -893,6 +1085,10 @@ bool map_elf_object(const loader::ProgramImage& image,
         return false;
     }
     if (!parse_dynamic_info(image, *header, dynamic_phdr, object.dynamic)) {
+        return false;
+    }
+    if (main_object && !capture_main_static_symbols(image, *header, object)) {
+        release_static_symbols(object);
         return false;
     }
     return true;
@@ -1339,11 +1535,23 @@ bool apply_dynamic_relocations(const LoadedObject* objects,
     return true;
 }
 
+bool object_matches_name(const LoadedObject& object,
+                         const char* name,
+                         process::Task& proc) {
+    return cstring_equal(object.name, name) ||
+           (object.dynamic.has_soname &&
+            dynamic_string_equals(object,
+                                  object.dynamic.soname_offset,
+                                  name,
+                                  proc));
+}
+
 bool object_already_loaded(const LoadedObject* objects,
                            size_t object_count,
-                           const char* name) {
+                           const char* name,
+                           process::Task& proc) {
     for (size_t i = 0; i < object_count; ++i) {
-        if (cstring_equal(objects[i].name, name)) {
+        if (object_matches_name(objects[i], name, proc)) {
             return true;
         }
     }
@@ -1357,7 +1565,7 @@ bool load_needed_object(const char* name,
     if (name == nullptr || name[0] == '\0') {
         return false;
     }
-    if (object_already_loaded(objects, object_count, name)) {
+    if (object_already_loaded(objects, object_count, name, proc)) {
         return true;
     }
     if (object_count >= kMaxSharedObjects) {
@@ -1418,6 +1626,9 @@ bool remember_dynamic_objects(process::Task& proc,
     }
     sync::LockGuard guard(set->lock);
     if (set->objects != nullptr) {
+        for (size_t i = 0; i < set->object_count; ++i) {
+            release_static_symbols(set->objects[i]);
+        }
         memory::free_kernel(set->objects);
         set->objects = nullptr;
         set->object_count = 0;
@@ -1445,19 +1656,6 @@ void release_object_regions(LoadedObject* objects,
     }
 }
 
-bool object_name_from_path(const char* path, char* name, size_t name_size) {
-    if (path == nullptr || path[0] != '/') {
-        return false;
-    }
-    const char* base = path;
-    for (const char* it = path; *it != '\0'; ++it) {
-        if (*it == '/') {
-            base = it + 1;
-        }
-    }
-    return base[0] != '\0' && copy_cstring(name, name_size, base);
-}
-
 bool has_library_prefix(const char* path) {
     constexpr char prefix[] = "/library/";
     if (path == nullptr) {
@@ -1469,6 +1667,19 @@ bool has_library_prefix(const char* path) {
         }
     }
     return true;
+}
+
+bool library_name_from_path(const char* path, char* name, size_t name_size) {
+    constexpr const char* prefix = "/library/";
+    if (!has_library_prefix(path)) {
+        return false;
+    }
+    const char* relative = path + cstring_length(prefix);
+    char normalized[kMaxSharedObjectPath];
+    if (!build_library_path(relative, normalized, sizeof(normalized))) {
+        return false;
+    }
+    return copy_cstring(name, name_size, relative);
 }
 
 bool load_dynamic_elf_binary(const loader::ProgramImage& image,
@@ -2115,21 +2326,17 @@ uint64_t dynamic_load(process::Task& proc, const char* path) {
     char object_path[kMaxSharedObjectPath];
     char object_name[kMaxSharedObjectName];
     if (path[0] == '/') {
-        constexpr const char* library_prefix = "/library/";
-        size_t prefix_length = cstring_length(library_prefix);
-        if (cstring_length(path) >= sizeof(object_path) ||
-            cstring_length(path) <= prefix_length ||
-            !has_library_prefix(path)) {
+        if (!library_name_from_path(path,
+                                    object_name,
+                                    sizeof(object_name))) {
             return 0;
         }
-        if (!copy_cstring(object_path, sizeof(object_path), path)) {
+    } else {
+        if (!copy_cstring(object_name, sizeof(object_name), path)) {
             return 0;
         }
-    } else if (!build_library_path(path, object_path, sizeof(object_path))) {
-        return 0;
     }
-    if (!object_name_from_path(object_path, object_name, sizeof(object_name)) ||
-        !build_library_path(object_name, object_path, sizeof(object_path))) {
+    if (!build_library_path(object_name, object_path, sizeof(object_path))) {
         return 0;
     }
 
@@ -2139,7 +2346,7 @@ uint64_t dynamic_load(process::Task& proc, const char* path) {
     }
     sync::LockGuard guard(set->lock);
     for (size_t i = 0; i < set->object_count; ++i) {
-        if (cstring_equal(set->objects[i].name, object_name)) {
+        if (object_matches_name(set->objects[i], object_name, proc)) {
             return set->objects[i].load_bias;
         }
     }
@@ -2278,6 +2485,9 @@ void release_dynamic_objects(process::Task& proc) {
         return;
     }
     sync::LockGuard guard(set->lock);
+    for (size_t i = 0; i < set->object_count; ++i) {
+        release_static_symbols(set->objects[i]);
+    }
     memory::free_kernel(set->objects);
     set->objects = nullptr;
     set->object_count = 0;

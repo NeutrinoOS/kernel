@@ -576,6 +576,48 @@ extern "C" int getaddrinfo(const char* node, const char* service,
 }
 
 extern "C" void freeaddrinfo(addrinfo* info) { free(info); }
+extern "C" hostent* gethostbyname(const char* name) {
+    static hostent result;
+    static char canonical_name[256];
+    static char* aliases[1];
+    static in_addr address;
+    static char* addresses[2];
+
+    if (name == nullptr) {
+        errno = EINVAL;
+        return nullptr;
+    }
+    size_t name_length = strlen(name);
+    if (name_length >= sizeof(canonical_name)) {
+        errno = ENAMETOOLONG;
+        return nullptr;
+    }
+
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* info = nullptr;
+    int error = getaddrinfo(name, nullptr, &hints, &info);
+    if (error != 0 || info == nullptr || info->ai_addr == nullptr ||
+        info->ai_addrlen < sizeof(sockaddr_in)) {
+        freeaddrinfo(info);
+        return nullptr;
+    }
+
+    const auto* resolved = reinterpret_cast<const sockaddr_in*>(info->ai_addr);
+    address = resolved->sin_addr;
+    freeaddrinfo(info);
+    memcpy(canonical_name, name, name_length + 1);
+    aliases[0] = nullptr;
+    addresses[0] = reinterpret_cast<char*>(&address);
+    addresses[1] = nullptr;
+    result.h_name = canonical_name;
+    result.h_aliases = aliases;
+    result.h_addrtype = AF_INET;
+    result.h_length = sizeof(address);
+    result.h_addr_list = addresses;
+    return &result;
+}
 extern "C" const char* gai_strerror(int error) {
     switch (error) {
         case 0: return "success"; case EAI_NONAME: return "name not found";
