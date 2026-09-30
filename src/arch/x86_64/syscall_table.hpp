@@ -127,6 +127,7 @@ enum class SystemCall : uint64_t {
     DynamicLoad           = 100,
     DynamicSymbol         = 101,
     DynamicClose          = 102,
+    MemoryWriteExecuteEnable = 103,
 };
 
 Result handle_syscall(SyscallFrame& frame);

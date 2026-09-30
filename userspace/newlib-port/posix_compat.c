@@ -51,9 +51,8 @@ void* mmap(void* address,
            off_t offset) {
     if (length == 0 || offset < 0 || address != NULL ||
         (protection & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0 ||
-        (protection & (PROT_WRITE | PROT_EXEC)) ==
-            (PROT_WRITE | PROT_EXEC) ||
-        (flags & MAP_PRIVATE) == 0) {
+        (flags & MAP_PRIVATE) == 0 ||
+        ((flags & MAP_FIXED) != 0 && address == NULL)) {
         errno = EINVAL;
         return MAP_FAILED;
     }
@@ -96,9 +95,7 @@ int munmap(void* address, size_t length) {
 
 int mprotect(void* address, size_t length, int protection) {
     if (address == NULL || length == 0 ||
-        (protection & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0 ||
-        (protection & (PROT_WRITE | PROT_EXEC)) ==
-            (PROT_WRITE | PROT_EXEC)) {
+        (protection & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0) {
         errno = EINVAL;
         return -1;
     }
@@ -109,6 +106,14 @@ int mprotect(void* address, size_t length, int protection) {
                               (long)(uintptr_t)address,
                               (long)length,
                               map_flags) < 0) {
+        errno = EACCES;
+        return -1;
+    }
+    return 0;
+}
+
+int neutrino_enable_write_execute(void) {
+    if (neutrino_raw_syscall0(NEUTRINO_MEMORY_WRITE_EXECUTE_ENABLE) < 0) {
         errno = EACCES;
         return -1;
     }

@@ -266,6 +266,33 @@ bool mapping_within_limit(const process::Task& proc, size_t length) {
            static_cast<uint64_t>(length) <= limit - usage.virtual_bytes;
 }
 
+bool require_capability(process::Task& proc,
+                        capabilities::CapabilityKind kind,
+                        const syscall::SyscallFrame& frame);
+
+bool mapping_flags_allowed(process::Task& proc,
+                           uint64_t flags,
+                           const syscall::SyscallFrame& frame) {
+    constexpr uint64_t kKnownFlags = vm::kMapWrite | vm::kMapExecute;
+    if (proc.resources == nullptr || (flags & ~kKnownFlags) != 0) {
+        return false;
+    }
+    if ((flags & kKnownFlags) != kKnownFlags) {
+        return true;
+    }
+
+    bool explicitly_enabled = false;
+    {
+        sync::LockGuard guard(proc.resources->lock);
+        explicitly_enabled = proc.resources->write_execute_enabled;
+    }
+    return explicitly_enabled &&
+           require_capability(
+               proc,
+               capabilities::CapabilityKind::MemoryWriteExecute,
+               frame);
+}
+
 // Validate that all capability handles provided in user memory correspond to
 // tokens permitting the requested kind. r12: pointer to handles array in user
 // space, r13: number of handles. We cap the number to avoid large copies.
@@ -1980,15 +2007,25 @@ Result handle_syscall(SyscallFrame& frame) {
         }
         case SystemCall::MapAnonymous: {
             process::Task* proc = process::current();
-            if (proc == nullptr) {
+            uint64_t flags = frame.rsi;
+            if (proc == nullptr ||
+                !mapping_flags_allowed(*proc, flags, frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
             size_t length = static_cast<size_t>(frame.rdi);
             uint64_t addr =
                 mapping_within_limit(*proc, length)
-                    ? vm::map_anonymous(proc->cr3, length, frame.rsi)
+                    ? vm::map_anonymous(proc->cr3, length, flags)
                     : 0;
+            if ((flags & (vm::kMapWrite | vm::kMapExecute)) ==
+                (vm::kMapWrite | vm::kMapExecute)) {
+                log_message(LogLevel::Debug,
+                            "W+X: pid=%u anonymous len=%zu result=%llx",
+                            proc->pid,
+                            length,
+                            static_cast<unsigned long long>(addr));
+            }
             frame.rax = (addr == 0) ? static_cast<uint64_t>(-1) : addr;
             return Result::Continue;
         }
@@ -2029,7 +2066,9 @@ Result handle_syscall(SyscallFrame& frame) {
         }
         case SystemCall::MapAt: {
             process::Task* proc = process::current();
-            if (proc == nullptr) {
+            uint64_t flags = frame.rdx;
+            if (proc == nullptr ||
+                !mapping_flags_allowed(*proc, flags, frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -2037,7 +2076,7 @@ Result handle_syscall(SyscallFrame& frame) {
             uint64_t addr =
                 mapping_within_limit(*proc, length)
                     ? vm::map_at(
-                          proc->cr3, frame.rdi, length, frame.rdx)
+                          proc->cr3, frame.rdi, length, flags)
                     : 0;
             frame.rax = (addr == 0) ? static_cast<uint64_t>(-1) : addr;
             return Result::Continue;
@@ -2058,9 +2097,7 @@ Result handle_syscall(SyscallFrame& frame) {
             process::Task* proc = process::current();
             uint64_t flags = frame.rdx;
             if (proc == nullptr || frame.rsi == 0 ||
-                (flags & ~(vm::kMapWrite | vm::kMapExecute)) != 0 ||
-                (flags & (vm::kMapWrite | vm::kMapExecute)) ==
-                    (vm::kMapWrite | vm::kMapExecute) ||
+                !mapping_flags_allowed(*proc, flags, frame) ||
                 !vm::set_user_region_writable(
                     proc->cr3, frame.rdi, frame.rsi,
                     (flags & vm::kMapWrite) != 0) ||
@@ -2068,14 +2105,33 @@ Result handle_syscall(SyscallFrame& frame) {
                     proc->cr3, frame.rdi, frame.rsi,
                     (flags & vm::kMapExecute) != 0)) {
                 frame.rax = static_cast<uint64_t>(-1);
+                if (proc != nullptr &&
+                    (flags & (vm::kMapWrite | vm::kMapExecute)) ==
+                        (vm::kMapWrite | vm::kMapExecute)) {
+                    log_message(LogLevel::Error,
+                                "W+X: pid=%u protect addr=%llx len=%llu failed",
+                                proc->pid,
+                                static_cast<unsigned long long>(frame.rdi),
+                                static_cast<unsigned long long>(frame.rsi));
+                }
                 return Result::Continue;
+            }
+            if ((flags & (vm::kMapWrite | vm::kMapExecute)) ==
+                (vm::kMapWrite | vm::kMapExecute)) {
+                log_message(LogLevel::Debug,
+                            "W+X: pid=%u protect addr=%llx len=%llu succeeded",
+                            proc->pid,
+                            static_cast<unsigned long long>(frame.rdi),
+                            static_cast<unsigned long long>(frame.rsi));
             }
             frame.rax = 0;
             return Result::Continue;
         }
         case SystemCall::MapFilePrivate: {
             process::Task* proc = process::current();
-            if (proc == nullptr) {
+            uint64_t flags = frame.r10;
+            if (proc == nullptr ||
+                !mapping_flags_allowed(*proc, flags, frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -2087,9 +2143,26 @@ Result handle_syscall(SyscallFrame& frame) {
                           static_cast<uint32_t>(frame.rdi),
                           frame.rsi,
                           length,
-                          frame.r10)
+                          flags)
                     : 0;
             frame.rax = addr == 0 ? static_cast<uint64_t>(-1) : addr;
+            return Result::Continue;
+        }
+        case SystemCall::MemoryWriteExecuteEnable: {
+            process::Task* proc = process::current();
+            if (proc == nullptr ||
+                !require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::MemoryWriteExecute,
+                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            {
+                sync::LockGuard guard(proc->resources->lock);
+                proc->resources->write_execute_enabled = true;
+            }
+            frame.rax = 0;
             return Result::Continue;
         }
         case SystemCall::ThreadCreate: {

@@ -108,6 +108,11 @@ cache; writable private mappings copy an individual page on its first write.
 The current cache holds at most 256 pages and file mappings larger than that
 limit fail cleanly rather than falling back to unbounded allocation.
 
+Writable-and-executable mappings remain denied by default. A JIT process must
+hold `MemoryWriteExecute`, explicitly enable W+X for its process, and then
+request both permissions on the individual mapping. The opt-in is shared by
+threads but is not inherited by a newly spawned executable.
+
 `top` reports resident memory in KiB from the same VM-area accounting used by
 the kernel.
 
@@ -177,6 +182,7 @@ from pre-4.0 kernels must be recreated rather than reinterpreted.
 | 19–20 | `SystemMonitor`, `KernelLog` | System telemetry and kernel logs |
 | 21 | `FilesystemOverride` | Administrative ACL bypass |
 | 22 | `SystemReadSettings` | Read global console and kernel settings |
+| 23 | `MemoryWriteExecute` | Explicit opt-in for simultaneous writable/executable JIT mappings |
 
 Pipes, shared memory, access-controlled VTYs, and the service registry are
 ordinary process/session primitives and require no capability. Raw storage

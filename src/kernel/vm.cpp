@@ -257,7 +257,8 @@ bool materialize_anonymous_page_locked(AddressSpaceState& state,
                                        bool execute) {
     VmArea* area = find_area_locked(state, address);
     if (area == nullptr || area->kind != vm::MappingKind::Anonymous ||
-        execute || (write && (area->flags & vm::kMapWrite) == 0)) {
+        (write && (area->flags & vm::kMapWrite) == 0) ||
+        (execute && (area->flags & vm::kMapExecute) == 0)) {
         return false;
     }
 
@@ -267,7 +268,9 @@ bool materialize_anonymous_page_locked(AddressSpaceState& state,
         uint64_t existing_flags = 0;
         return paging_flags_cr3(state.cr3, page, existing_flags) &&
                (existing_flags & PAGE_FLAG_USER) != 0 &&
-               (!write || (existing_flags & PAGE_FLAG_WRITE) != 0);
+               (!write || (existing_flags & PAGE_FLAG_WRITE) != 0) &&
+               (!execute ||
+                (existing_flags & PAGE_FLAG_NO_EXECUTE) == 0);
     }
 
     uint64_t phys = memory::alloc_user_page();
@@ -277,10 +280,12 @@ bool materialize_anonymous_page_locked(AddressSpaceState& state,
     auto* page_data = static_cast<uint8_t*>(paging_phys_to_virt(phys));
     memset(page_data, 0, kPageSize);
 
-    uint64_t page_flags =
-        PAGE_FLAG_USER | PAGE_FLAG_MANAGED | PAGE_FLAG_NO_EXECUTE;
+    uint64_t page_flags = PAGE_FLAG_USER | PAGE_FLAG_MANAGED;
     if ((area->flags & vm::kMapWrite) != 0) {
         page_flags |= PAGE_FLAG_WRITE;
+    }
+    if ((area->flags & vm::kMapExecute) == 0) {
+        page_flags |= PAGE_FLAG_NO_EXECUTE;
     }
     if (!paging_map_page_cr3(state.cr3, page, phys, page_flags)) {
         memory::free_user_page(phys);
@@ -323,12 +328,14 @@ bool copy_private_file_page_locked(AddressSpaceState& state,
     uint64_t unmapped_phys = 0;
     if (!paging_unmap_page_cr3(state.cr3, page, unmapped_phys) ||
         unmapped_phys != align_down(source_phys, kPageSize) ||
-        !paging_map_page_cr3(state.cr3,
-                             page,
-                             private_phys,
-                             PAGE_FLAG_WRITE | PAGE_FLAG_USER |
-                                 PAGE_FLAG_MANAGED |
-                                 PAGE_FLAG_NO_EXECUTE)) {
+        !paging_map_page_cr3(
+            state.cr3,
+            page,
+            private_phys,
+            PAGE_FLAG_WRITE | PAGE_FLAG_USER | PAGE_FLAG_MANAGED |
+                ((area->flags & vm::kMapExecute) == 0
+                     ? PAGE_FLAG_NO_EXECUTE
+                     : 0))) {
         if (unmapped_phys != 0) {
             (void)paging_map_page_cr3(state.cr3,
                                       page,
@@ -468,6 +475,110 @@ uint64_t count_present_pages(uint64_t cr3,
         }
     }
     return count;
+}
+
+VmArea* split_area_locked(AddressSpaceState& state,
+                          VmArea& area,
+                          uint64_t split) {
+    const uint64_t area_end = area.base + area.length;
+    if (split <= area.base || split >= area_end ||
+        area.reservation_length != 0) {
+        return nullptr;
+    }
+    VmArea* tail = allocate_area_locked(state);
+    if (tail == nullptr) {
+        return nullptr;
+    }
+    *tail = area;
+    tail->base = split;
+    tail->length = area_end - split;
+    tail->resident_pages =
+        count_present_pages(state.cr3, tail->base, tail->length);
+    area.length = split - area.base;
+    area.resident_pages =
+        count_present_pages(state.cr3, area.base, area.length);
+    return tail;
+}
+
+bool area_permissions_apply_to_future_faults(const VmArea& area) {
+    return area.kind == vm::MappingKind::Anonymous ||
+           area.kind == vm::MappingKind::FilePrivate;
+}
+
+bool set_area_range_flag(uint64_t cr3,
+                         uint64_t base,
+                         uint64_t length,
+                         uint64_t flag,
+                         bool enabled) {
+    const uint64_t end = base + length;
+    AddressSpaceStateGuard guard;
+    AddressSpaceState* state =
+        find_address_space_state_locked(cr3, false);
+    if (state == nullptr || end < base) {
+        return false;
+    }
+
+    uint64_t cursor = base;
+    while (cursor < end) {
+        VmArea* area = find_area_locked(*state, cursor);
+        if (area == nullptr || area->length == 0 ||
+            area->base > UINT64_MAX - area->length) {
+            return false;
+        }
+        const uint64_t area_end = area->base + area->length;
+        cursor = area_end < end ? area_end : end;
+    }
+
+    size_t splits_needed = 0;
+    VmArea* boundary = find_area_locked(*state, base);
+    if (boundary != nullptr && base > boundary->base &&
+        area_permissions_apply_to_future_faults(*boundary)) {
+        ++splits_needed;
+    }
+    if (end > base) {
+        boundary = find_area_locked(*state, end - 1);
+        if (boundary != nullptr && end < boundary->base + boundary->length &&
+            area_permissions_apply_to_future_faults(*boundary)) {
+            ++splits_needed;
+        }
+    }
+    size_t free_areas = 0;
+    for (const auto& area : state->areas) {
+        if (!area.in_use) {
+            ++free_areas;
+        }
+    }
+    if (free_areas < splits_needed) {
+        return false;
+    }
+
+    boundary = find_area_locked(*state, base);
+    if (boundary != nullptr && base > boundary->base &&
+        area_permissions_apply_to_future_faults(*boundary) &&
+        split_area_locked(*state, *boundary, base) == nullptr) {
+        return false;
+    }
+    if (end > base) {
+        boundary = find_area_locked(*state, end - 1);
+        if (boundary != nullptr && end < boundary->base + boundary->length &&
+            area_permissions_apply_to_future_faults(*boundary) &&
+            split_area_locked(*state, *boundary, end) == nullptr) {
+            return false;
+        }
+    }
+
+    for (auto& area : state->areas) {
+        if (!area.in_use || area.base < base || area.base >= end ||
+            area.length > end - area.base) {
+            continue;
+        }
+        if (enabled) {
+            area.flags |= flag;
+        } else {
+            area.flags &= ~flag;
+        }
+    }
+    return true;
 }
 
 vm::Region reserve_private_region(uint64_t cr3, size_t length) {
@@ -955,7 +1066,7 @@ uint64_t map_file_private(uint64_t cr3,
     if (!register_area(cr3,
                        region.base,
                        region.length,
-                       flags & kMapWrite,
+                       flags,
                        MappingKind::FilePrivate)) {
         cancel_private_region(cr3, region);
         return 0;
@@ -966,6 +1077,10 @@ uint64_t map_file_private(uint64_t cr3,
         uint64_t phys = 0;
         uint64_t page_file_offset =
             file_offset + static_cast<uint64_t>(i) * kPageSize;
+        uint64_t page_flags = PAGE_FLAG_USER;
+        if ((flags & kMapExecute) == 0) {
+            page_flags |= PAGE_FLAG_NO_EXECUTE;
+        }
         if (!page_cache::acquire_private_page(cache_key,
                                               file,
                                               page_file_offset,
@@ -974,8 +1089,7 @@ uint64_t map_file_private(uint64_t cr3,
                                  region.base +
                                      static_cast<uint64_t>(i) * kPageSize,
                                  phys,
-                                 PAGE_FLAG_USER |
-                                     PAGE_FLAG_NO_EXECUTE)) {
+                                 page_flags)) {
             if (phys != 0) {
                 page_cache::release_private_page(phys);
             }
@@ -1155,8 +1269,20 @@ bool set_user_region_writable(uint64_t cr3,
         return false;
     }
 
+    if (!set_area_range_flag(cr3,
+                             base,
+                             end - base,
+                             kMapWrite,
+                             writable)) {
+        return false;
+    }
+
     bool defer_flush = !paging_address_space_has_run(cr3);
     for (uint64_t virt = base; virt < end; virt += kPageSize) {
+        uint64_t ignored_phys = 0;
+        if (!paging_resolve_cr3(cr3, virt, ignored_phys)) {
+            continue;
+        }
         bool updated = defer_flush
                            ? paging_set_writable_cr3_deferred(cr3,
                                                               virt,
@@ -1164,27 +1290,6 @@ bool set_user_region_writable(uint64_t cr3,
                            : paging_set_writable_cr3(cr3, virt, writable);
         if (!updated) {
             return false;
-        }
-    }
-    {
-        AddressSpaceStateGuard guard;
-        AddressSpaceState* state =
-            find_address_space_state_locked(cr3, false);
-        if (state != nullptr) {
-            for (auto& area : state->areas) {
-                if (!area.in_use ||
-                    !ranges_overlap(base,
-                                    end - base,
-                                    area.base,
-                                    area.length)) {
-                    continue;
-                }
-                if (writable) {
-                    area.flags |= kMapWrite;
-                } else {
-                    area.flags &= ~static_cast<uint64_t>(kMapWrite);
-                }
-            }
         }
     }
 
@@ -1208,8 +1313,20 @@ bool set_user_region_executable(uint64_t cr3,
         return false;
     }
 
+    if (!set_area_range_flag(cr3,
+                             base,
+                             end - base,
+                             kMapExecute,
+                             executable)) {
+        return false;
+    }
+
     bool defer_flush = !paging_address_space_has_run(cr3);
     for (uint64_t virt = base; virt < end; virt += kPageSize) {
+        uint64_t ignored_phys = 0;
+        if (!paging_resolve_cr3(cr3, virt, ignored_phys)) {
+            continue;
+        }
         bool updated = defer_flush
                            ? paging_set_executable_cr3_deferred(cr3,
                                                                 virt,
@@ -1219,27 +1336,6 @@ bool set_user_region_executable(uint64_t cr3,
                                                        executable);
         if (!updated) {
             return false;
-        }
-    }
-    {
-        AddressSpaceStateGuard guard;
-        AddressSpaceState* state =
-            find_address_space_state_locked(cr3, false);
-        if (state != nullptr) {
-            for (auto& area : state->areas) {
-                if (!area.in_use ||
-                    !ranges_overlap(base,
-                                    end - base,
-                                    area.base,
-                                    area.length)) {
-                    continue;
-                }
-                if (executable) {
-                    area.flags |= kMapExecute;
-                } else {
-                    area.flags &= ~static_cast<uint64_t>(kMapExecute);
-                }
-            }
         }
     }
     return true;

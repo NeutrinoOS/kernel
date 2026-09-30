@@ -36,6 +36,9 @@ enum class CapabilityKind : uint16_t {
     KernelLog = 20,
     FilesystemOverride = 21,
     SystemReadSettings = 22,
+    // Permits a process that has explicitly opted in to create mappings that
+    // are writable and executable at the same time (for JIT runtimes).
+    MemoryWriteExecute = 23,
     Count,
 };
 

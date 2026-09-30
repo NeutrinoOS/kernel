@@ -29,6 +29,11 @@ void* mmap(void* address, size_t length, int protection, int flags,
 int munmap(void* address, size_t length);
 int mprotect(void* address, size_t length, int protection);
 int madvise(void* address, size_t length, int advice);
+/*
+ * Opt this process into simultaneous writable/executable mappings. The call
+ * succeeds only for a principal with the MemoryWriteExecute capability.
+ */
+int neutrino_enable_write_execute(void);
 
 #ifdef __cplusplus
 }

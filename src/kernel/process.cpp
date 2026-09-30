@@ -102,6 +102,7 @@ void reset_task(process::Task& proc) {
 }
 
 void initialize_shared_resources(process::ProcessResources& resources) {
+    resources.write_execute_enabled = false;
     resources.vty_id = 0;
     resources.process_group_id = 0;
     resources.session_id = 0;

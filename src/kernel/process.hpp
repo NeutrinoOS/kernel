@@ -93,6 +93,7 @@ struct DirectoryHandle {
 struct ProcessResources {
     uint32_t refcount;
     bool in_use;
+    bool write_execute_enabled;
     sync::SpinLock lock;
     sync::SpinLock descriptor_lock;
     sync::SpinLock event_lock;
