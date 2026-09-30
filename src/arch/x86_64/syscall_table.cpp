@@ -1853,9 +1853,9 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
             const char* path = reinterpret_cast<const char*>(frame.rdi);
-            frame.rax = file_io::remove_file(*proc, path)
-                            ? 0
-                            : static_cast<uint64_t>(-1);
+            frame.rax = static_cast<uint64_t>(
+                static_cast<int64_t>(file_io::remove_file_with_error(
+                    *proc, path)));
             return Result::Continue;
         }
         case SystemCall::FileGetAcl: {
@@ -1893,9 +1893,9 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
             const char* path = reinterpret_cast<const char*>(frame.rdi);
-            frame.rax = file_io::remove_directory(*proc, path)
-                            ? 0
-                            : static_cast<uint64_t>(-1);
+            frame.rax = static_cast<uint64_t>(
+                static_cast<int64_t>(file_io::remove_directory_with_error(
+                    *proc, path)));
             return Result::Continue;
         }
         case SystemCall::TimeGet: {

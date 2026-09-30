@@ -474,9 +474,10 @@ int _kill(int pid, int signal_number) {
 }
 
 int _unlink(const char* path) {
-    if (neutrino_raw_syscall1(
-            NEUTRINO_FILE_REMOVE, (long)(uintptr_t)path) < 0) {
-        errno = ENOENT;
+    long result = neutrino_raw_syscall1(
+        NEUTRINO_FILE_REMOVE, (long)(uintptr_t)path);
+    if (result < 0) {
+        errno = (result >= -4095) ? (int)-result : EIO;
         return -1;
     }
     return 0;
@@ -493,9 +494,10 @@ int _mkdir(const char* path, mode_t mode) {
 }
 
 int _rmdir(const char* path) {
-    if (neutrino_raw_syscall1(
-            NEUTRINO_DIRECTORY_REMOVE, (long)(uintptr_t)path) < 0) {
-        errno = ENOENT;
+    long result = neutrino_raw_syscall1(
+        NEUTRINO_DIRECTORY_REMOVE, (long)(uintptr_t)path);
+    if (result < 0) {
+        errno = (result >= -4095) ? (int)-result : EIO;
         return -1;
     }
     return 0;

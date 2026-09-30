@@ -588,42 +588,50 @@ bool create_directory(const char* path) {
     return mount->ops->create_directory(mount->fs_context, relative);
 }
 
-bool remove_file(const char* path) {
+RemoveResult remove_file_with_result(const char* path) {
     const char* remainder = nullptr;
     MountEntry* mount = resolve_mount_for_path(path, remainder);
     if (mount == nullptr) {
         log_message(LogLevel::Warn,
                     "VFS: mount not found for path '%s'",
                     (path != nullptr) ? path : "(null)");
-        return false;
+        return RemoveResult::NotFound;
     }
     if (mount->ops == nullptr || mount->ops->remove_file == nullptr) {
-        return false;
+        return RemoveResult::IoError;
     }
     const char* relative = normalize_relative_path(remainder);
     if (relative == nullptr || *relative == '\0') {
-        return false;
+        return RemoveResult::InvalidPath;
     }
     return mount->ops->remove_file(mount->fs_context, relative);
 }
 
-bool remove_directory(const char* path) {
+bool remove_file(const char* path) {
+    return remove_file_with_result(path) == RemoveResult::Success;
+}
+
+RemoveResult remove_directory_with_result(const char* path) {
     const char* remainder = nullptr;
     MountEntry* mount = resolve_mount_for_path(path, remainder);
     if (mount == nullptr) {
         log_message(LogLevel::Warn,
                     "VFS: mount not found for path '%s'",
                     (path != nullptr) ? path : "(null)");
-        return false;
+        return RemoveResult::NotFound;
     }
     if (mount->ops == nullptr || mount->ops->remove_directory == nullptr) {
-        return false;
+        return RemoveResult::IoError;
     }
     const char* relative = normalize_relative_path(remainder);
     if (relative == nullptr || *relative == '\0') {
-        return false;
+        return RemoveResult::InvalidPath;
     }
     return mount->ops->remove_directory(mount->fs_context, relative);
+}
+
+bool remove_directory(const char* path) {
+    return remove_directory_with_result(path) == RemoveResult::Success;
 }
 
 void close_file(FileHandle& handle) {

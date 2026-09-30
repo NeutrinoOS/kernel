@@ -9,6 +9,21 @@ enum : uint32_t {
     kDirEntryFlagDirectory = 1u << 0,
 };
 
+// Filesystem removal failures need to survive the kernel/userspace boundary so
+// libc can report the POSIX error that actually occurred rather than treating
+// every failed removal as a missing path.
+enum class RemoveResult : uint8_t {
+    Success,
+    InvalidPath,
+    NotFound,
+    IsDirectory,
+    NotDirectory,
+    NotEmpty,
+    Busy,
+    PermissionDenied,
+    IoError,
+};
+
 constexpr size_t kMaxAclEntries = 32;
 
 enum class AclValue : uint8_t {
@@ -84,8 +99,8 @@ struct FilesystemOps {
                         void*& out_file_context,
                         DirEntry* out_metadata);
     bool (*create_directory)(void* fs_context, const char* path);
-    bool (*remove_file)(void* fs_context, const char* path);
-    bool (*remove_directory)(void* fs_context, const char* path);
+    RemoveResult (*remove_file)(void* fs_context, const char* path);
+    RemoveResult (*remove_directory)(void* fs_context, const char* path);
     bool (*read_file)(void* file_context,
                       uint64_t offset,
                       void* buffer,
@@ -149,6 +164,8 @@ bool create_file(const char* path, FileHandle& out_handle);
 bool create_directory(const char* path);
 bool remove_file(const char* path);
 bool remove_directory(const char* path);
+RemoveResult remove_file_with_result(const char* path);
+RemoveResult remove_directory_with_result(const char* path);
 void close_file(FileHandle& handle);
 bool read_file(FileHandle& handle,
                uint64_t offset,

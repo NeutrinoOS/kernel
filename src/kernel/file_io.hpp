@@ -64,6 +64,9 @@ int32_t open_directory_at(process::Task& proc,
 bool create_directory(process::Task& proc, const char* path);
 bool remove_file(process::Task& proc, const char* path);
 bool remove_directory(process::Task& proc, const char* path);
+// Returns zero on success or a negative POSIX errno value on failure.
+int32_t remove_file_with_error(process::Task& proc, const char* path);
+int32_t remove_directory_with_error(process::Task& proc, const char* path);
 bool close_directory(process::Task& proc, uint32_t handle);
 int64_t read_directory(process::Task& proc, uint32_t handle,
                        uint64_t user_addr);

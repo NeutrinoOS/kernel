@@ -87,6 +87,10 @@ constexpr size_t kMaxOpenFiles = 64;
 constexpr size_t kMaxOpenDirectories = 32;
 constexpr size_t kMaxPathLength = 512;
 constexpr size_t kSectorScratchSize = 4096;
+// AHCI has 32 PRDT entries, each covering at most one 4 KiB physical page.
+// 248 sectors (126,976 bytes) fits even when a caller's buffer begins at the
+// last byte of a page; 255 sectors requires a 33rd entry in that case.
+constexpr uint32_t kMaxBulkSectors = 248;
 
 struct NeufsFileContext {
     neufs::NeufsVolume* volume;
@@ -248,8 +252,8 @@ bool read_bytes(const fs::BlockDevice& device,
 
     while (size >= sector_size) {
         uint32_t sectors = static_cast<uint32_t>(size / sector_size);
-        if (sectors > 255) {
-            sectors = 255;
+        if (sectors > kMaxBulkSectors) {
+            sectors = kMaxBulkSectors;
         }
         if (!read_sectors(device, static_cast<uint32_t>(sector),
                           static_cast<uint8_t>(sectors), out)) {
@@ -309,8 +313,8 @@ bool write_bytes(const fs::BlockDevice& device,
 
     while (size >= sector_size) {
         uint32_t sectors = static_cast<uint32_t>(size / sector_size);
-        if (sectors > 255) {
-            sectors = 255;
+        if (sectors > kMaxBulkSectors) {
+            sectors = kMaxBulkSectors;
         }
         size_t bytes = static_cast<size_t>(sectors) * sector_size;
         if (!write_sectors(device, static_cast<uint32_t>(sector),
@@ -2029,27 +2033,27 @@ bool neufs_create_directory(void* fs_context, const char* path) {
     return add_entry_to_directory(*volume, parent_offset, dir_offset);
 }
 
-bool neufs_remove_file(void* fs_context, const char* path) {
+vfs::RemoveResult neufs_remove_file(void* fs_context, const char* path) {
     if (fs_context == nullptr || path == nullptr || *path == '\0') {
-        return false;
+        return vfs::RemoveResult::InvalidPath;
     }
 
     auto* volume = static_cast<neufs::NeufsVolume*>(fs_context);
     uint64_t entry_offset = 0;
     uint8_t entry_type = 0;
     if (!resolve_path(*volume, path, entry_offset, entry_type)) {
-        return false;
+        return vfs::RemoveResult::NotFound;
     }
     if (entry_type != kTypeFile) {
-        return false;
+        return vfs::RemoveResult::IsDirectory;
     }
 
     NeufsFile file{};
     if (!load_file(*volume, entry_offset, file)) {
-        return false;
+        return vfs::RemoveResult::IoError;
     }
     if (file.parent == 0) {
-        return false;
+        return vfs::RemoveResult::Busy;
     }
 
     if (!free_file_storage(*volume, file)) {
@@ -2070,37 +2074,40 @@ bool neufs_remove_file(void* fs_context, const char* path) {
         log_message(LogLevel::Warn, "NEUFS: failed to free file metadata at %llu", entry_offset);
     }
 
-    return remove_entry_from_directory(*volume, file.parent, entry_offset);
+    return remove_entry_from_directory(*volume, file.parent, entry_offset)
+               ? vfs::RemoveResult::Success
+               : vfs::RemoveResult::IoError;
 }
 
-bool neufs_remove_directory(void* fs_context, const char* path) {
+vfs::RemoveResult neufs_remove_directory(void* fs_context,
+                                          const char* path) {
     if (fs_context == nullptr || path == nullptr || *path == '\0') {
-        return false;
+        return vfs::RemoveResult::InvalidPath;
     }
 
     auto* volume = static_cast<neufs::NeufsVolume*>(fs_context);
     uint64_t entry_offset = 0;
     uint8_t entry_type = 0;
     if (!resolve_path(*volume, path, entry_offset, entry_type)) {
-        return false;
+        return vfs::RemoveResult::NotFound;
     }
     if (entry_type != kTypeNdir) {
-        return false;
+        return vfs::RemoveResult::NotDirectory;
     }
     if (entry_offset == volume->root_offset) {
-        return false;
+        return vfs::RemoveResult::Busy;
     }
 
     if (!directory_is_empty(*volume, entry_offset)) {
-        return false;
+        return vfs::RemoveResult::NotEmpty;
     }
 
     NeufsNdir dir{};
     if (!load_ndir(*volume, entry_offset, dir)) {
-        return false;
+        return vfs::RemoveResult::IoError;
     }
     if (dir.parent == 0) {
-        return false;
+        return vfs::RemoveResult::Busy;
     }
 
     for (uint64_t acl_offset : dir.acl) {
@@ -2116,7 +2123,9 @@ bool neufs_remove_directory(void* fs_context, const char* path) {
         log_message(LogLevel::Warn, "NEUFS: failed to free ndir metadata at %llu", entry_offset);
     }
 
-    return remove_entry_from_directory(*volume, dir.parent, entry_offset);
+    return remove_entry_from_directory(*volume, dir.parent, entry_offset)
+               ? vfs::RemoveResult::Success
+               : vfs::RemoveResult::IoError;
 }
 
 bool neufs_read_file(void* file_context,

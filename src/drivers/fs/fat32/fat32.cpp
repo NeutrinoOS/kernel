@@ -2246,20 +2246,41 @@ bool fat32_vfs_create_directory(void* fs_context, const char* path) {
     return true;
 }
 
-bool fat32_vfs_remove_file(void* fs_context, const char* path) {
+vfs::RemoveResult fat32_vfs_remove_file(void* fs_context, const char* path) {
     auto* volume = static_cast<Fat32Volume*>(fs_context);
     if (volume == nullptr || path == nullptr || *path == '\0') {
-        return false;
+        return vfs::RemoveResult::InvalidPath;
     }
-    return fat32_remove_file(*volume, path);
+    Fat32DirEntry entry{};
+    if (!resolve_entry(*volume, path, entry)) {
+        return vfs::RemoveResult::NotFound;
+    }
+    if ((entry.attributes & ATTR_DIRECTORY) != 0) {
+        return vfs::RemoveResult::IsDirectory;
+    }
+    return fat32_remove_file(*volume, path) ? vfs::RemoveResult::Success
+                                            : vfs::RemoveResult::IoError;
 }
 
-bool fat32_vfs_remove_directory(void* fs_context, const char* path) {
+vfs::RemoveResult fat32_vfs_remove_directory(void* fs_context,
+                                              const char* path) {
     auto* volume = static_cast<Fat32Volume*>(fs_context);
     if (volume == nullptr || path == nullptr || *path == '\0') {
-        return false;
+        return vfs::RemoveResult::InvalidPath;
     }
-    return fat32_remove_directory(*volume, path);
+    Fat32DirEntry entry{};
+    if (!resolve_entry(*volume, path, entry)) {
+        return vfs::RemoveResult::NotFound;
+    }
+    if ((entry.attributes & ATTR_DIRECTORY) == 0) {
+        return vfs::RemoveResult::NotDirectory;
+    }
+    if (!directory_is_empty(*volume, entry.first_cluster)) {
+        return vfs::RemoveResult::NotEmpty;
+    }
+    return fat32_remove_directory(*volume, path)
+               ? vfs::RemoveResult::Success
+               : vfs::RemoveResult::IoError;
 }
 
 bool fat32_vfs_read_file(void* file_context,

@@ -909,23 +909,61 @@ bool create_directory(process::Task& proc, const char* path) {
 }
 
 bool remove_file(process::Task& proc, const char* path) {
+    return remove_file_with_error(proc, path) == 0;
+}
+
+namespace {
+
+constexpr int32_t kErrIo = 5;
+constexpr int32_t kErrAccess = 13;
+constexpr int32_t kErrBusy = 16;
+constexpr int32_t kErrNotDirectory = 20;
+constexpr int32_t kErrIsDirectory = 21;
+constexpr int32_t kErrInvalid = 22;
+constexpr int32_t kErrNotFound = 2;
+constexpr int32_t kErrNotEmpty = 39;
+
+int32_t removal_error(vfs::RemoveResult result) {
+    switch (result) {
+        case vfs::RemoveResult::Success: return 0;
+        case vfs::RemoveResult::InvalidPath: return -kErrInvalid;
+        case vfs::RemoveResult::NotFound: return -kErrNotFound;
+        case vfs::RemoveResult::IsDirectory: return -kErrIsDirectory;
+        case vfs::RemoveResult::NotDirectory: return -kErrNotDirectory;
+        case vfs::RemoveResult::NotEmpty: return -kErrNotEmpty;
+        case vfs::RemoveResult::Busy: return -kErrBusy;
+        case vfs::RemoveResult::PermissionDenied: return -kErrAccess;
+        case vfs::RemoveResult::IoError: return -kErrIo;
+    }
+    return -kErrIo;
+}
+
+}  // namespace
+
+int32_t remove_file_with_error(process::Task& proc, const char* path) {
     char local_path[path_util::kMaxPathLength];
     if (!copy_path(proc, path, local_path)) {
-        return false;
+        return -kErrInvalid;
     }
     if (!acl_allows(proc, local_path, vfs::AclPermission::Delete)) {
-        return false;
+        return -kErrAccess;
     }
-    return vfs::remove_file(local_path);
+    return removal_error(vfs::remove_file_with_result(local_path));
 }
 
 bool remove_directory(process::Task& proc, const char* path) {
+    return remove_directory_with_error(proc, path) == 0;
+}
+
+int32_t remove_directory_with_error(process::Task& proc, const char* path) {
     char local_path[path_util::kMaxPathLength];
     if (!copy_path(proc, path, local_path)) {
-        return false;
+        return -kErrInvalid;
     }
-    return acl_allows(proc, local_path, vfs::AclPermission::Delete) &&
-           vfs::remove_directory(local_path);
+    if (!acl_allows(proc, local_path, vfs::AclPermission::Delete)) {
+        return -kErrAccess;
+    }
+    return removal_error(vfs::remove_directory_with_result(local_path));
 }
 
 int32_t open_file_at(process::Task& proc,
