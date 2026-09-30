@@ -402,8 +402,15 @@ bool open_console(process::Task& proc,
         alloc.ops = &kConsoleOps;
         return true;
     }
+    const bool owned_by_process =
+        g_console_owner == &proc ||
+        (g_console_owner != nullptr &&
+         g_console_owner->resources != nullptr &&
+         g_console_owner->resources == proc.resources);
+    const bool owned_by_another_process =
+        g_console_owner != nullptr && !owned_by_process;
     if ((kconsole == nullptr ||
-         (g_console_owner != nullptr && g_console_owner != &proc)) &&
+         owned_by_another_process) &&
         can_redirect_to_stdout(proc)) {
         fill_stdout_redirect(proc, alloc);
         return true;
@@ -411,10 +418,12 @@ bool open_console(process::Task& proc,
     if (kconsole == nullptr) {
         return false;
     }
-    if (g_console_owner != nullptr && g_console_owner != &proc) {
+    if (owned_by_another_process) {
         return false;
     }
-    g_console_owner = &proc;
+    if (g_console_owner == nullptr) {
+        g_console_owner = &proc;
+    }
     ++g_console_refcount;
     alloc.type = kTypeConsole;
     alloc.flags = static_cast<uint64_t>(Flag::Writable);
