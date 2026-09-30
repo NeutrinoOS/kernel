@@ -68,13 +68,15 @@ isr_common_stub:
     jnz .from_userspace
     lea rax, [rsp + 224]
     mov [rsp + 56], rax
-    mov qword [rsp + 168], 0
+    ; Same-privilege interrupts do not push SS:RSP.  Preserve the kernel
+    ; CS selector for iretq and normalize only the unavailable SS field.
+    mov qword [rsp + 176], 0
     jmp .context_ready
 .from_userspace:
     mov rax, [rsp + 224]
     mov [rsp + 56], rax
     mov rax, [rsp + 232]
-    mov [rsp + 168], rax
+    mov [rsp + 176], rax
 .context_ready:
 
     mov rdi, rsp
