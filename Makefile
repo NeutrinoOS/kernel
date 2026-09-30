@@ -1,4 +1,5 @@
 # === Build configuration ===
+SHELL      := /bin/bash
 ARCH       := x86_64
 CROSS      := x86_64-elf-
 CC         := $(CROSS)g++
@@ -6,8 +7,21 @@ C_CC       := $(CROSS)gcc
 LD         := $(CROSS)ld
 AS         := nasm -f elf64
 OBJCOPY    := $(CROSS)objcopy
+STRIP      := $(CROSS)strip
+READELF    := $(CROSS)readelf
 KERNEL_VERSION ?= 0.0.0-dev
 KERNEL_CMDLINE ?=
+NEUTRINO_RELEASE ?= 0
+
+ifeq ($(filter $(NEUTRINO_RELEASE),0 1),)
+$(error NEUTRINO_RELEASE must be 0 or 1)
+endif
+
+ifeq ($(NEUTRINO_RELEASE),1)
+DEBUG_CFLAGS :=
+else
+DEBUG_CFLAGS := -g
+endif
 
 OUT_DIR    := out
 BUILD_DIR  := build
@@ -18,8 +32,8 @@ TARGET_ISO := $(OUT_DIR)/neutrino.iso
 TARGET_DISK_IMG ?= hdd.img
 TARGET_DISK_SIZE ?= 4G
 
-CFLAGS     := -std=c++20 -g -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -fno-exceptions -fno-rtti -mcmodel=kernel $(EXTRA_CFLAGS) -Ishared/include -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH) -I$(SRC_DIR)/third_party/uacpi/include
-UACPI_CFLAGS := -std=c11 -g -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -mcmodel=kernel $(EXTRA_CFLAGS) -Ishared/include -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH) -I$(SRC_DIR)/third_party/uacpi/include
+CFLAGS     := -std=c++20 $(DEBUG_CFLAGS) -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -fno-exceptions -fno-rtti -mcmodel=kernel $(EXTRA_CFLAGS) -Ishared/include -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH) -I$(SRC_DIR)/third_party/uacpi/include
+UACPI_CFLAGS := -std=c11 $(DEBUG_CFLAGS) -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -mcmodel=kernel $(EXTRA_CFLAGS) -Ishared/include -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH) -I$(SRC_DIR)/third_party/uacpi/include
 LDFLAGS    := -T $(SRC_DIR)/linker.ld -nostdlib
 
 # === QEMU configuration ===
@@ -114,11 +128,33 @@ LOCAL_LIVE_PACKAGES := $(if $(wildcard $(NEUTRINO_PACKAGES_ROOT)/local-files/pac
 DEFAULT_LIVE_PACKAGES := neutrino-installer neutrino-live neutrino-drivers $(LOCAL_LIVE_PACKAGES)
 LIVE_PACKAGES ?= $(DEFAULT_LIVE_PACKAGES)
 LIVE_PACKAGE_NAMES = $(shell $(NEUTRINO_PACKAGES_ROOT)/resolve-package-deps.sh $(LIVE_PACKAGES))
-LIVE_PACKAGE_ZIPS = $(foreach package,$(LIVE_PACKAGE_NAMES),$(NEUTRINO_PACKAGES_ROOT)/$(package)/out/$(package).zip)
+LIVE_PACKAGE_ZIPS = $(foreach package,$(LIVE_PACKAGE_NAMES),$(NEUTRINO_PACKAGES_ROOT)/$(package)/$(PACKAGE_OUT_DIR)/$(package).zip)
 LIVE_REPO_DIR := $(OUT_DIR)/live-repo
 LIVE_ROOTFS_STAGE := $(BUILD_DIR)/live-rootfs
 LIVE_ESP_IMG ?= $(OUT_DIR)/esp.img
 LIVE_ESP_SIZE ?= 64M
+RELEASE_BUILD_DIR ?= build-release
+RELEASE_OUT_DIR ?= out-release
+RELEASE_LIVE_ROOTFS_SIZE ?= 64M
+PACKAGE_RELEASE_BUILD_DIR ?= build-release
+PACKAGE_RELEASE_OUT_DIR ?= out-release
+RELEASE_PACKAGE_SCRIPT := scripts/strip-package-archive.sh
+RELEASE_SYSROOT := $(abspath userspace/build-release/newlib-pie-sysroot)
+RELEASE_MAKE_ARGS := NEUTRINO_RELEASE=1 \
+	BUILD_DIR=$(RELEASE_BUILD_DIR) \
+	OUT_DIR=$(RELEASE_OUT_DIR) \
+	LIVE_ROOTFS_SIZE=$(RELEASE_LIVE_ROOTFS_SIZE)
+
+ifeq ($(NEUTRINO_RELEASE),1)
+PACKAGE_OUT_DIR := $(PACKAGE_RELEASE_OUT_DIR)
+LIVE_PACKAGE_MAKE_ARGS := BUILD_DIR=$(PACKAGE_RELEASE_BUILD_DIR) \
+	OUT_DIR=$(PACKAGE_RELEASE_OUT_DIR) \
+	NEUTRINO_RELEASE=1 \
+	NEUTRINO_SYSROOT="$(RELEASE_SYSROOT)" \
+	SDL2_ROOT=../sdl2/$(PACKAGE_RELEASE_OUT_DIR)/usr
+else
+PACKAGE_OUT_DIR := out
+endif
 
 # === Source discovery ===
 KERNEL_MODULE_NAMES := e1000e.ko virtio-net.ko intel-hda.ko intel-uhd-gemini-lake.ko
@@ -183,6 +219,10 @@ $(TARGET_ELF): $(KERNEL_VERSION_MARKER) $(OBJ)
 	@mkdir -p $(OUT_DIR)
 	@echo "[LD]   $@"
 	$(LD) $(LDFLAGS) -o $@ $(OBJ)
+ifeq ($(NEUTRINO_RELEASE),1)
+	@echo "[STRIP] $@"
+	$(STRIP) --strip-unneeded $@
+endif
 
 # === Grab Limine if it's missing ===
 LIMINE_DIR := limine
@@ -201,7 +241,7 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR) $(LIVE_ROOTFS_IMG) force-live-esp
 
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
-	cp -v out/kernel.elf $(ISO_ROOT)/boot/kernel.elf
+	cp -v $(TARGET_ELF) $(ISO_ROOT)/boot/kernel.elf
 	cp -v $(LIVE_ROOTFS_IMG) $(ISO_ROOT)/boot/rootfs.img
 	cp -v $(LIVE_ESP_IMG) $(ISO_ROOT)/boot/esp.img
 	mkdir -p $(ISO_ROOT)/boot/limine
@@ -236,7 +276,7 @@ $(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) $(LIVE_ROOTFS_IMG) force-live-e
 
 	rm -rf $(ISO_ROOT_RAMFS)
 	mkdir -p $(ISO_ROOT_RAMFS)/boot
-	cp -v out/kernel.elf $(ISO_ROOT_RAMFS)/boot/kernel.elf
+	cp -v $(TARGET_ELF) $(ISO_ROOT_RAMFS)/boot/kernel.elf
 	mkdir -p $(ISO_ROOT_RAMFS)/boot/limine
 	cp -v $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_ROOT_RAMFS)/boot/limine/
 
@@ -273,6 +313,10 @@ run: $(TARGET_ISO) target-disk
 
 run-live: run
 
+.PHONY: run-release
+run-release:
+	$(MAKE) $(RELEASE_MAKE_ARGS) run
+
 run-installed: target-disk
 	$(QEMU) $(QEMU_INSTALLED_ARGS) $(QEMU_INSTALLED_BOOT_ARGS)
 
@@ -293,6 +337,11 @@ debug-installed-nostop: target-disk
 # === Utility targets ===
 iso: $(TARGET_ISO)
 	@echo ISO created at $(TARGET_ISO)
+
+.PHONY: iso-release
+iso-release:
+	$(MAKE) $(RELEASE_MAKE_ARGS) iso
+	@echo Release ISO created at $(RELEASE_OUT_DIR)/neutrino.iso
 
 clean:
 	rm -rf $(BUILD_DIR) $(OUT_DIR)
@@ -316,7 +365,7 @@ force-live-esp: $(LIVE_ESP_IMG)
 
 .PHONY: userspace-sdk check-live-packages live-package-archives print-live-packages
 userspace-sdk:
-	$(MAKE) -C userspace newlib-sdk
+	$(MAKE) -C userspace NEUTRINO_RELEASE=$(NEUTRINO_RELEASE) newlib-sdk
 
 check-live-packages:
 	@$(NEUTRINO_PACKAGES_ROOT)/resolve-package-deps.sh $(LIVE_PACKAGES) >/dev/null
@@ -328,7 +377,13 @@ print-live-packages: check-live-packages
 live-package-archives: check-live-packages userspace-sdk $(KERNEL_MODULE_LOADS)
 	@set -euo pipefail; \
 	for package in $(LIVE_PACKAGE_NAMES); do \
-		$(MAKE) -C "$(NEUTRINO_PACKAGES_ROOT)/$$package" package; \
+		$(MAKE) -C "$(NEUTRINO_PACKAGES_ROOT)/$$package" \
+			$(LIVE_PACKAGE_MAKE_ARGS) package; \
+		if [[ "$(NEUTRINO_RELEASE)" == 1 ]]; then \
+			$(RELEASE_PACKAGE_SCRIPT) \
+				"$(NEUTRINO_PACKAGES_ROOT)/$$package/$(PACKAGE_OUT_DIR)/$$package.zip" \
+				"$(STRIP)" "$(READELF)"; \
+		fi; \
 	done
 
 $(LIVE_ROOTFS_IMG): live-package-archives $(NEUTRINO_PACKAGES_ROOT)/build-local-repo.sh $(NEUTRINO_PACKAGES_ROOT)/install-packages-root.sh
@@ -381,4 +436,4 @@ target-disk: $(TARGET_DISK_IMG)
 $(TARGET_DISK_IMG):
 	truncate -s $(TARGET_DISK_SIZE) $(TARGET_DISK_IMG)
 
-.PHONY: all clean iso iso-ramfs run run-live run-installed debug debug-installed debug-nostop debug-installed-nostop userspace-rootfs live-rootfs live-esp
+.PHONY: all clean iso iso-release iso-ramfs run run-live run-release run-installed debug debug-installed debug-nostop debug-installed-nostop userspace-rootfs live-rootfs live-esp

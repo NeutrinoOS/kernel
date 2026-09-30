@@ -46,8 +46,26 @@ if that protection cannot be applied, the incomplete dump is removed.
 Load the executable and dump in GDB with, for example,
 `gdb /path/to/program /cores/core.12.12.1`. Core dumping is disabled by default
 because dumps contain private memory and consume persistent storage.
-### Optimized builds
-There's no support right now for optimized builds out of the box, but you can run something like `make clean all EXTRA_CFLAGS="-O3 -DNDEBUG=1"` to pass -O3 -DNDEBUG=1 into CFLAGs.
+
+### Release ISO builds
+
+Run `make iso-release` to build an optimized live image in
+`out-release/neutrino.iso`. This uses separate kernel and SDK build directories,
+compiles the kernel and selected `LIVE_PACKAGES` with `-O2` and without debug
+information, and strips the kernel and ELF payloads in the package archives.
+Release root filesystems have a 64 MiB minimum and still grow automatically
+with the selected package set and configured headroom. The ordinary `make iso`
+build remains suitable for debugging.
+
+Run the release image directly in QEMU with `make run-release`. It accepts the
+same `LIVE_PACKAGES` and QEMU configuration overrides as `make run`.
+
+`LIVE_PACKAGES` works the same way for release images, for example:
+
+```sh
+make iso-release LIVE_PACKAGES="network-tools editor-tools"
+make run-release LIVE_PACKAGES="network-tools editor-tools"
+```
 
 ## Userspace SDK and packages
 

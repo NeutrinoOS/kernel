@@ -2,6 +2,12 @@
 !src/drivers/limine
 out/
 build/
+out-release/
+build-release/
+userspace/build-release/
+out-*/
+build-*/
+userspace/build-*/
 userspace/programs/**/**.elf
 userspace/binary/
 userspace/include/
